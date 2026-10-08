@@ -81,6 +81,7 @@ The Studio itself has no extra dependencies.
 Restart ComfyUI and open **http://127.0.0.1:8188/longshot**.
 
 ## Getting started
+<img width="1597" height="1386" alt="image" src="https://github.com/user-attachments/assets/0221f818-d717-4762-9ef8-5fa8c5778e24" />
 
 1. The first time you open the Studio it makes an empty **Untitled** project. Rename it
    from the project menu (click the name at the top).
