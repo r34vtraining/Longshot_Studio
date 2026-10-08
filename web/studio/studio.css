@@ -66,7 +66,7 @@ h2, .h2 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .08em; t
 .folder-btn { display: inline-flex; align-items: center; gap: 6px; }
 .primary { background: var(--amber); color: #1A1408; border: 0; border-radius: 8px; padding: 12px 16px; font-size: 15px; font-weight: 600; }
 .primary:hover:not(:disabled) { background: var(--amber-hi); }
-/* Go / Continue is green; Stop is red (Addendum C.2) */
+/* Go / Continue is green; Stop is red */
 .go { background: #4FBF8B; color: #0B1F15; }
 .go:hover:not(:disabled) { background: #66D3A0; }
 .stop { background: #C2453A; color: #fff; border: 0; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; }

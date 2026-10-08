@@ -17,11 +17,11 @@ PKG_DIR = os.path.dirname(HERE)
 sys.path.insert(0, os.path.dirname(PKG_DIR))
 gb = importlib.import_module(os.path.basename(PKG_DIR) + ".graph_builder")
 
-EXAMPLE = os.path.join(PKG_DIR, "examples", "mara_spaceport_chase.json")
+SAMPLE = os.path.join(HERE, "fixtures", "sample_project.json")
 
 
-def mara():
-    with open(EXAMPLE, encoding="utf-8") as fh:
+def sample():
+    with open(SAMPLE, encoding="utf-8") as fh:
         return json.load(fh)
 
 
@@ -77,11 +77,11 @@ def model_chain(prompt):
 
 
 # ---------------------------------------------------------------------------
-# The user's own project reproduces the user's own workflow
+# The sample project builds the reference Ref2V Long Shot workflow
 # ---------------------------------------------------------------------------
 
-def test_mara_matches_the_users_api_export():
-    b = build(mara())
+def test_sample_builds_the_reference_workflow():
+    b = build(sample())
     p = b.prompt
     check_wiring(p)
     assert model_chain(p) == ["UNETLoader", "PathchSageAttentionKJ", "MiniMaxH3SigmaShift",
@@ -109,7 +109,7 @@ def test_mara_matches_the_users_api_export():
     assert ls["model"] == ["turbo", 0]
     assert "song" not in ls and not any(k.startswith("ref_audios") for k in ls)
 
-    # 7 references, in order, each resized exactly as the user's subgraphs do
+    # 7 references, in order, each resized exactly as the reference workflow does
     for k in range(7):
         r = p[ls[f"ref_images.ref_image_{k}"][0]]
         assert r["class_type"] == "ImageResizeKJv2"
@@ -117,13 +117,13 @@ def test_mara_matches_the_users_api_export():
             width=1500, height=1500, upscale_method="nearest-exact", keep_proportion="resize",
             pad_color="0, 0, 0", crop_position="center", divisible_by=2, device="cpu")
     assert p[p[ls["ref_images.ref_image_0"][0]]["inputs"]["image"][0]]["inputs"]["image"] \
-        == "Actress_Headshots_8_Options 06 (1).png"
+        == "hero portrait (1).png"
     assert "ref_images.ref_image_7" not in ls
 
-    # subject chain: <Mara> first, cited as <Picture 1>; the builder gets the last
+    # subject chain: <hero> first, cited as <Picture 1>; the builder gets the last
     subs = of_class(p, "MiniMaxH3Subject")
     assert len(subs) == 7
-    assert p["subject1"]["inputs"]["label"] == "<Mara>"
+    assert p["subject1"]["inputs"]["label"] == "<hero>"
     assert p["subject1"]["inputs"]["reference"] == "<Picture 1>"
     assert "subjects" not in p["subject1"]["inputs"]
     assert p["subject7"]["inputs"]["reference"] == "<Picture 7>"
@@ -132,7 +132,7 @@ def test_mara_matches_the_users_api_export():
     assert p["builder"]["inputs"]["subject_definitions"] == ""
     assert p["builder"]["inputs"]["task_type"] == "reference generation"
 
-    # Shots: all six, chained, seeds as saved (Shot 3 carries the user's 0)
+    # Shots: all six, chained, seeds as saved (Shot 3 carries its saved 0)
     shots = of_class(p, "MiniMaxH3Shot")
     assert len(shots) == 6
     assert [p[f"shot{n}"]["inputs"]["seconds"] for n in range(1, 7)] == [5, 5, 5, 5, 9, 6]
@@ -141,7 +141,7 @@ def test_mara_matches_the_users_api_export():
     assert p["builder"]["inputs"]["shots"] == ["shot6", 0]
 
     c = p["combine"]["inputs"]
-    assert c["filename_prefix"] == "longshot/Mara — spaceport chase"
+    assert c["filename_prefix"] == "longshot/Sample project"
     assert c["format"] == "video/nvenc_h264-mp4" and c["frame_rate"] == 24
     assert c["audio"] == ["decode_audio", 0] and c["images"] == ["decode", 0]
     assert (c["pix_fmt"], c["bitrate"], c["megabit"], c["save_metadata"], c["pingpong"],
@@ -154,7 +154,7 @@ def test_mara_matches_the_users_api_export():
 
 
 def test_prompt_is_json_serialisable():
-    json.dumps(build(mara()).prompt)
+    json.dumps(build(sample()).prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +162,7 @@ def test_prompt_is_json_serialisable():
 # ---------------------------------------------------------------------------
 
 def test_start_renders_shot_1_only():
-    b = build(mara(), upto="s1")
+    b = build(sample(), upto="s1")
     assert b.chain == ["s1"]
     assert len(of_class(b.prompt, "MiniMaxH3Shot")) == 1
     assert b.prompt["builder"]["inputs"]["shots"] == ["shot1", 0]
@@ -171,13 +171,13 @@ def test_start_renders_shot_1_only():
 
 @pytest.mark.parametrize("upto,n", [("s2", 2), ("s4", 4), ("s6", 6)])
 def test_continue_queues_the_chain_up_to_the_target(upto, n):
-    b = build(mara(), upto=upto)
+    b = build(sample(), upto=upto)
     assert len(of_class(b.prompt, "MiniMaxH3Shot")) == n
     assert b.prompt["builder"]["inputs"]["shots"] == [f"shot{n}", 0]
 
 
 def test_reroll_changes_only_that_shots_seed():
-    a = mara()
+    a = sample()
     before = build(a, upto="s3").prompt
     a["shots"][2]["shot_seed"] = 4_000_000_000
     after = build(a, upto="s3").prompt
@@ -187,7 +187,7 @@ def test_reroll_changes_only_that_shots_seed():
 
 
 def test_unknown_or_bypassed_target_is_an_error():
-    p = mara()
+    p = sample()
     p["shots"][1]["bypassed"] = True
     with pytest.raises(gb.BuildError):
         build(p, upto="s2")
@@ -196,7 +196,7 @@ def test_unknown_or_bypassed_target_is_an_error():
 
 
 def test_dry_run_is_the_same_graph_with_dry_run_on():
-    real, dry = build(mara(), upto="s3").prompt, build(mara(), upto="s3", dry_run=True).prompt
+    real, dry = build(sample(), upto="s3").prompt, build(sample(), upto="s3", dry_run=True).prompt
     assert set(real) == set(dry)
     assert dry["longshot"]["inputs"]["dry_run"] is True
     dry["longshot"]["inputs"]["dry_run"] = False
@@ -209,7 +209,7 @@ def test_dry_run_is_the_same_graph_with_dry_run_on():
 
 @pytest.mark.parametrize("off", [set(), {0}, {1}, {6}, {0, 3}, {1, 2, 4, 5}])
 def test_bypassed_cast_renumbers_pictures(off):
-    p = mara()
+    p = sample()
     for i in off:
         p["cast"][i]["bypassed"] = True
     b = build(p)
@@ -228,7 +228,7 @@ def test_bypassed_cast_renumbers_pictures(off):
 
 
 def test_no_cast_means_no_reference_nodes():
-    p = mara()
+    p = sample()
     p["cast"] = []
     b = build(p)
     check_wiring(b.prompt)
@@ -238,17 +238,17 @@ def test_no_cast_means_no_reference_nodes():
 
 
 def test_all_cast_bypassed_is_the_same_as_none():
-    p = mara()
+    p = sample()
     for c in p["cast"]:
         c["bypassed"] = True
-    q = mara()
+    q = sample()
     q["cast"] = []
     assert build(p).prompt == build(q).prompt
 
 
 @pytest.mark.parametrize("off", [{0}, {2}, {5}, {1, 3}])
 def test_bypassed_shots_are_left_out_and_renumber(off):
-    p = mara()
+    p = sample()
     for i in off:
         p["shots"][i]["bypassed"] = True
     b = build(p)
@@ -263,7 +263,7 @@ def test_bypassed_shots_are_left_out_and_renumber(off):
 
 
 def test_all_shots_bypassed_is_an_error():
-    p = mara()
+    p = sample()
     for s in p["shots"]:
         s["bypassed"] = True
     with pytest.raises(gb.BuildError, match="No active Shots"):
@@ -271,7 +271,7 @@ def test_all_shots_bypassed_is_an_error():
 
 
 def test_reference_without_image_names_its_label():
-    p = mara()
+    p = sample()
     p["cast"][1]["image"] = None
     with pytest.raises(gb.BuildError, match=r"<outfit> \(<Picture 2>\)"):
         build(p)
@@ -280,7 +280,7 @@ def test_reference_without_image_names_its_label():
 
 
 def test_too_many_references():
-    p = mara()
+    p = sample()
     p["cast"] = [dict(p["cast"][0], id=f"x{i}") for i in range(10)]
     with pytest.raises(gb.BuildError, match="at most 9"):
         build(p)
@@ -293,7 +293,7 @@ def test_too_many_references():
 @pytest.mark.parametrize("turbo", [True, False])
 @pytest.mark.parametrize("on", list(itertools.product([False, True], repeat=3)))
 def test_turbo_and_lora_combinations(turbo, on):
-    p = mara()
+    p = sample()
     p["settings"]["turbo"]["on"] = turbo
     p["settings"]["loras"] = [{"on": o, "name": f"style_{i}.safetensors", "strength": 0.5 + i}
                               for i, o in enumerate(on, 1)]
@@ -313,7 +313,7 @@ def test_turbo_and_lora_combinations(turbo, on):
 
 
 def test_turbo_off_with_few_steps_warns():
-    p = mara()
+    p = sample()
     p["settings"]["turbo"]["on"] = False
     assert any("Turbo is off" in w for w in build(p).warnings)
     p["settings"]["steps"] = 20
@@ -321,28 +321,28 @@ def test_turbo_off_with_few_steps_warns():
 
 
 def test_turbo_strength_and_low_vram():
-    p = mara()
+    p = sample()
     p["settings"]["turbo"]["strength"] = 0.75
     t = build(p).prompt["turbo"]["inputs"]
     assert t["strength"] == 0.75 and t["low_vram"] is False
 
 
 def test_lora_on_without_a_file_is_an_error():
-    p = mara()
+    p = sample()
     p["settings"]["loras"][1] = {"on": True, "name": None, "strength": 1}
     with pytest.raises(gb.BuildError, match="LoRA 2"):
         build(p)
 
 
 def test_lora_off_without_a_file_is_fine():
-    p = mara()
+    p = sample()
     p["settings"]["loras"][1] = {"on": False, "name": None, "strength": 1}
     build(p)
 
 
 def test_sage_is_skipped_when_kjnodes_lacks_it():
-    env = gb.Env(classes=set(gb.required_classes(mara())) - {"PathchSageAttentionKJ"})
-    b = build(mara(), env=env)
+    env = gb.Env(classes=set(gb.required_classes(sample())) - {"PathchSageAttentionKJ"})
+    b = build(sample(), env=env)
     assert "sage" not in b.prompt
     assert model_chain(b.prompt)[:2] == ["UNETLoader", "MiniMaxH3SigmaShift"]
     assert any("SageAttention" in w for w in b.warnings)
@@ -351,13 +351,13 @@ def test_sage_is_skipped_when_kjnodes_lacks_it():
 
 @pytest.mark.parametrize("mode", ["disabled", "off", None, ""])
 def test_sage_can_be_turned_off(mode):
-    p = mara()
+    p = sample()
     p["settings"]["sage_attention"] = mode
     assert "sage" not in build(p).prompt
 
 
 def test_model_settings_flow_through():
-    p = mara()
+    p = sample()
     s = p["settings"]
     s.update(model="other.safetensors", sampler="euler", scheduler="simple", steps=20,
              seed=99, seed_mode="same", overlap=39, ref_image_size="max", ref_resize_px=1024,
@@ -379,7 +379,7 @@ def test_model_settings_flow_through():
     ("ref_image_size", "big", "Reference image size"), ("aspect", "5:4", "aspect"),
     ("steps", 0, "Steps"), ("model", "", "model"), ("megapixels", 0, "MP")])
 def test_bad_settings_are_reported(field, value, match):
-    p = mara()
+    p = sample()
     p["settings"][field] = value
     with pytest.raises(gb.BuildError, match=match):
         build(p)
@@ -389,7 +389,7 @@ def test_bad_settings_are_reported(field, value, match):
                                      (2**64 - 1, True), (2**64, False), (-2, False),
                                      ("", True), (None, True), ("abc", False)])
 def test_shot_seed_range(seed, ok):
-    p = mara()
+    p = sample()
     p["shots"][0]["shot_seed"] = seed
     if ok:
         got = build(p).prompt["shot1"]["inputs"]["shot_seed"]
@@ -409,7 +409,7 @@ AUDIO_CLASSES = {"VHS_LoadAudioUpload", "MiniMaxH3SongTrack", "MelBandRoFormerMo
 
 @pytest.mark.parametrize("lip,voice,final", list(itertools.product([False, True], repeat=3)))
 def test_audio_route_combinations(lip, voice, final):
-    p = mara()
+    p = sample()
     p["audio"].update(lip_sync=lip, voice_ref=voice, final_override=final)
     b = build(p)
     g = b.prompt
@@ -420,7 +420,7 @@ def test_audio_route_combinations(lip, voice, final):
         assert not classes & AUDIO_CLASSES, "all routes off: no audio nodes at all"
     else:
         loader = g["audio"]["inputs"]
-        assert loader == {"audio": "Is it a Dream_.mp3", "start_time": 15.0, "duration": 15.1}
+        assert loader == {"audio": "song.mp3", "start_time": 15.0, "duration": 15.1}
     assert ("song" in ls) == lip
     if lip:
         assert g[ls["song"][0]]["class_type"] == "MiniMaxH3SongTrack"
@@ -439,26 +439,26 @@ def test_audio_route_combinations(lip, voice, final):
 
 
 def test_audio_route_without_a_file_is_an_error():
-    p = mara()
+    p = sample()
     p["audio"].update(file=None, lip_sync=True)
     with pytest.raises(gb.BuildError, match="audio file"):
         build(p)
 
 
 def test_audio_file_with_routes_off_adds_nothing():
-    p = mara()
+    p = sample()
     p["audio"].update(lip_sync=False, voice_ref=False, final_override=False)
     assert "audio" not in build(p).prompt
 
 
 def test_melband_model_is_selectable():
-    p = mara()
+    p = sample()
     p["audio"].update(voice_ref=True, melband_model="MelBand\\other.safetensors")
     assert build(p).prompt["melband"]["inputs"]["model_name"] == "MelBand\\other.safetensors"
 
 
 def test_short_song_warns():
-    p = mara()
+    p = sample()
     p["audio"].update(lip_sync=True, length=10)
     assert any("song clip" in w for w in build(p, upto="s3").warnings)
     assert not any("song clip" in w for w in build(p, upto="s2").warnings)
@@ -469,17 +469,17 @@ def test_short_song_warns():
 # ---------------------------------------------------------------------------
 
 def test_missing_node_classes_are_named_with_their_pack():
-    env = gb.Env(classes=set(gb.required_classes(mara())) - {"VHS_VideoCombine",
+    env = gb.Env(classes=set(gb.required_classes(sample())) - {"VHS_VideoCombine",
                                                               "MiniMaxH3LongShot"})
     with pytest.raises(gb.BuildError) as err:
-        build(mara(), env=env)
+        build(sample(), env=env)
     msg = str(err.value)
     assert "VHS_VideoCombine — from ComfyUI-VideoHelperSuite" in msg
     assert "MiniMaxH3LongShot — from H3 Long Shot" in msg
 
 
 def test_turbo_node_only_required_when_turbo_is_on():
-    p = mara()
+    p = sample()
     env = gb.Env(classes=set(gb.required_classes(p)) - {"MiniMaxH3TurboLoRA"})
     with pytest.raises(gb.BuildError, match="MiniMaxH3TurboLoRA"):
         build(p, env=env)
@@ -488,7 +488,7 @@ def test_turbo_node_only_required_when_turbo_is_on():
 
 
 def test_melband_only_required_for_voice_reference():
-    p = mara()
+    p = sample()
     env = gb.Env(classes=set(gb.required_classes(p)) | {"VHS_LoadAudioUpload",
                                                          "MiniMaxH3SongTrack"})
     p["audio"].update(lip_sync=True, final_override=True)
@@ -502,7 +502,7 @@ def test_melband_only_required_for_voice_reference():
     (None, gb.NVENC), (["video/nvenc_h264-mp4", "video/h264-mp4"], gb.NVENC),
     (["video/h264-mp4", "video/webm"], gb.H264)])
 def test_nvenc_falls_back_to_h264(formats, want):
-    b = build(mara(), env=gb.Env(video_formats=formats))
+    b = build(sample(), env=gb.Env(video_formats=formats))
     c = b.prompt["combine"]["inputs"]
     assert c["format"] == want == b.video_format
     if want == gb.H264:
@@ -514,7 +514,7 @@ def test_nvenc_falls_back_to_h264(formats, want):
 
 def test_no_mp4_format_is_an_error():
     with pytest.raises(gb.BuildError):
-        build(mara(), env=gb.Env(video_formats=["video/webm"]))
+        build(sample(), env=gb.Env(video_formats=["video/webm"]))
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +541,7 @@ def test_output_size_is_on_the_32_grid_for_every_preset():
 
 
 def test_size_flows_into_long_shot():
-    p = mara()
+    p = sample()
     p["settings"].update(megapixels=0.98, aspect="16:9")
     b = build(p)
     ls = b.prompt["longshot"]["inputs"]
@@ -549,7 +549,7 @@ def test_size_flows_into_long_shot():
 
 
 @pytest.mark.parametrize("name,want", [
-    ("Mara — spaceport chase", "Mara — spaceport chase"),
+    ("Sample project", "Sample project"),
     ("../../etc/passwd", "_etc_passwd"), ('a:b*c?"d<e>f|g', "a_b_c_d_e_f_g"),
     ("  ..hidden  ", "hidden"), ("", "untitled"), (None, "untitled"),
     ("C:\\Windows\\x", "C_Windows_x")])
@@ -558,7 +558,7 @@ def test_safe_name(name, want):
 
 
 def test_output_prefix_stays_in_the_longshot_folder():
-    p = mara()
+    p = sample()
     p["name"] = "../../escape/me"
     prefix = build(p).prompt["combine"]["inputs"]["filename_prefix"]
     assert prefix == "longshot/_escape_me"
@@ -566,7 +566,7 @@ def test_output_prefix_stays_in_the_longshot_folder():
 
 
 def test_task_types_map_to_the_three_slots():
-    p = mara()
+    p = sample()
     p["style"]["task_types"] = ["reference generation", "audio reference"]
     i = build(p).prompt["builder"]["inputs"]
     assert (i["task_type"], i["task_type_2"], i["task_type_3"]) == \
@@ -578,7 +578,7 @@ def test_task_types_map_to_the_three_slots():
 
 
 def test_style_fields_reach_the_builder():
-    p = mara()
+    p = sample()
     p["style"].update(summary="S", retention="R", style_line="L", soundscape="A", music="M")
     i = build(p).prompt["builder"]["inputs"]
     assert (i["summary"], i["retention_analysis"], i["style_line"], i["overall_soundscape"],
@@ -586,7 +586,7 @@ def test_style_fields_reach_the_builder():
 
 
 def test_builder_does_not_mutate_the_project():
-    p = mara()
+    p = sample()
     before = copy.deepcopy(p)
     build(p, upto="s2", dry_run=True)
     assert p == before
@@ -597,36 +597,36 @@ def test_builder_does_not_mutate_the_project():
 # ---------------------------------------------------------------------------
 
 def test_long_shot_gets_the_project_slug_as_cache_name():
-    ls = build(mara()).prompt["longshot"]["inputs"]
-    assert ls["cache_name"] == "mara-spaceport-chase" and ls["save_to_disk"] is True
-    p = mara()
+    ls = build(sample()).prompt["longshot"]["inputs"]
+    assert ls["cache_name"] == "sample-project" and ls["save_to_disk"] is True
+    p = sample()
     p["name"] = "Renamed later"          # renaming keeps the slug
-    assert build(p).prompt["longshot"]["inputs"]["cache_name"] == "mara-spaceport-chase"
+    assert build(p).prompt["longshot"]["inputs"]["cache_name"] == "sample-project"
     del p["slug"]
     assert build(p).prompt["longshot"]["inputs"]["cache_name"] == "renamed-later"
 
 
 def test_saving_segments_can_be_turned_off():
-    p = mara()
+    p = sample()
     p["settings"]["save_segments"] = False
     assert build(p).prompt["longshot"]["inputs"]["save_to_disk"] is False
 
 
 def test_references_and_audio_in_a_project_subfolder():
-    p = mara()
-    p["cast"][0].update(image="actress.png", subfolder="longshot/mara-spaceport-chase")
-    p["audio"].update(file="song (1).mp3", subfolder="longshot/mara-spaceport-chase",
+    p = sample()
+    p["cast"][0].update(image="portrait.png", subfolder="longshot/sample-project")
+    p["audio"].update(file="song (1).mp3", subfolder="longshot/sample-project",
                       lip_sync=True)
     g = build(p).prompt
-    assert g["img1"]["inputs"]["image"] == "longshot/mara-spaceport-chase/actress.png"
-    assert g["img2"]["inputs"]["image"] == "Ten futuristic outfits in a clean catalo 01g.png"
-    assert g["audio"]["inputs"]["audio"] == "longshot/mara-spaceport-chase/song (1).mp3"
+    assert g["img1"]["inputs"]["image"] == "longshot/sample-project/portrait.png"
+    assert g["img2"]["inputs"]["image"] == "outfit.png"
+    assert g["audio"]["inputs"]["audio"] == "longshot/sample-project/song (1).mp3"
 
 
 @pytest.mark.parametrize("sub,name", [("../secret", "a.png"), ("/etc", "a.png"),
                                       ("longshot", "../a.png"), ("C:\\x", "a.png")])
 def test_bad_reference_paths_are_refused(sub, name):
-    p = mara()
+    p = sample()
     p["cast"][0].update(image=name, subfolder=sub)
     with pytest.raises(gb.BuildError):
         build(p)
@@ -638,12 +638,12 @@ def test_bad_reference_paths_are_refused(sub, name):
 # ---------------------------------------------------------------------------
 
 def test_rtx_vsr_off_by_default_adds_nothing():
-    assert "vsr" not in build(mara()).prompt
+    assert "vsr" not in build(sample()).prompt
 
 
 @pytest.mark.parametrize("final", [False, True])
 def test_rtx_vsr_sits_between_decode_and_video_combine(final):
-    p = mara()
+    p = sample()
     p["settings"]["rtx_vsr"] = {"on": True, "scale": 2.0, "quality": "ULTRA"}
     p["audio"]["final_override"] = final
     g = build(p).prompt
@@ -657,8 +657,8 @@ def test_rtx_vsr_sits_between_decode_and_video_combine(final):
 
 
 def test_rtx_vsr_does_not_touch_long_shot():
-    off = build(mara()).prompt
-    p = mara()
+    off = build(sample()).prompt
+    p = sample()
     p["settings"]["rtx_vsr"] = {"on": True, "scale": 3, "quality": "HIGH"}
     on = build(p).prompt
     assert on["longshot"] == off["longshot"], "segments stay reusable when toggling it"
@@ -668,14 +668,14 @@ def test_rtx_vsr_does_not_touch_long_shot():
                                        ({"on": True, "scale": 0.5}, "factor"),
                                        ({"on": True, "quality": "MAX"}, "quality")])
 def test_rtx_vsr_bad_values(vsr, match):
-    p = mara()
+    p = sample()
     p["settings"]["rtx_vsr"] = vsr
     with pytest.raises(gb.BuildError, match=match):
         build(p)
 
 
 def test_rtx_vsr_needs_its_pack_only_when_on():
-    p = mara()
+    p = sample()
     env = gb.Env(classes=set(gb.required_classes(p)))
     build(p, env=env)
     p["settings"]["rtx_vsr"] = {"on": True}
@@ -685,7 +685,7 @@ def test_rtx_vsr_needs_its_pack_only_when_on():
 
 
 def test_upscale_final_forces_rtx_and_names_the_file():
-    p = mara()
+    p = sample()
     p["settings"]["rtx_vsr"] = {"on": False, "scale": 3, "quality": "HIGH"}
     preview = build(p).prompt
     final = build(p, final=True).prompt
@@ -693,13 +693,13 @@ def test_upscale_final_forces_rtx_and_names_the_file():
     assert "vsr" not in preview
     assert final["vsr"]["inputs"]["resize_type.scale"] == 3 and final["vsr"]["inputs"]["quality"] == "HIGH"
     assert final["combine"]["inputs"]["images"] == ["vsr", 0]
-    assert final["combine"]["inputs"]["filename_prefix"] == "longshot/Mara — spaceport chase_final"
-    assert preview["combine"]["inputs"]["filename_prefix"] == "longshot/Mara — spaceport chase"
+    assert final["combine"]["inputs"]["filename_prefix"] == "longshot/Sample project_final"
+    assert preview["combine"]["inputs"]["filename_prefix"] == "longshot/Sample project"
     assert final["longshot"] == preview["longshot"], "the final reuses every segment"
 
 
 def test_upscale_final_needs_the_rtx_pack():
-    p = mara()
+    p = sample()
     env = gb.Env(classes=set(gb.required_classes(p)))
     with pytest.raises(gb.BuildError, match="RTX-VSR"):
         build(p, final=True, env=env)

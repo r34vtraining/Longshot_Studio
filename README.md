@@ -1,58 +1,98 @@
 # H3 Long Shot Studio
 
-A browser front end for MiniMax H3 Long Shot, served by ComfyUI itself at
-**http://127.0.0.1:8188/longshot** (or whatever address your ComfyUI uses).
-You build a continuous long shot one approved Shot at a time:
+A browser front end for [MiniMax H3 Long Shot](https://github.com/r34vtraining/H3_Longshot),
+served by ComfyUI itself at **http://127.0.0.1:8188/longshot** (or whatever address your
+ComfyUI uses). You build a continuous long shot one approved Shot at a time:
 
 - **▶ Render Shot 1** starts. A one-Shot project works the same way.
 - **✓ Continue** approves the Shot under review and renders the next one.
   Earlier Shots come from Long Shot's segment memory, so each step costs one segment.
 - **⟳ Reroll** gives the Shot under review a new seed and renders it again.
-- **Stop** interrupts. Finished segments stay in memory, so the next render picks up from there.
+- **Stop** interrupts. Finished segments are kept, so the next render picks up from there.
 
-The pack adds no nodes. It builds a graph and queues it on ComfyUI.
+The pack adds no nodes. It builds a workflow from your project and queues it on ComfyUI.
 
-**This build (0.3.0):**
-- the Stage 1 core loop, viewer, plan, and basic Cast, Settings and Audio editors;
-- Addendum A: saved segments, so a crash or restart costs no finished Shots;
-- Addendum B: projects with fixed slugs, a project menu, autosave, two-tab protection
-  and reference checks;
-- Addendum C: a visible fixed seed, green Go / red Stop, the reference editor and
-  lightbox, theater and full-screen views, and rerolling an approved Shot.
-- Since then: drag-and-drop reference images, audio preview, Advanced as its own
-  section under Settings, and Settings / Advanced / Audio fold away (a closed section
-  shows a one-line summary of its values).
-
-Stage 2 adds "Upload again" for missing files and the "⚠ all shots" confirm dialogs.
-Stage 3 adds audio upload, plus polish.
-Export / import (B.6) is still to come.
+**Features**
+- Projects with autosave, a project menu, and protection against two tabs overwriting each other.
+- Cast & Scenes references with drag and drop, a label/description editor and a lightbox.
+- Shot-by-shot review: approve, reroll (including an already-approved Shot), and
+  re-render the Shots after it in one go.
+- Saved segments on disk, so a crash or restart costs no finished Shots.
+- A viewer with frame stepping, loop-the-seam, theater and full-screen views, and volume.
+- Audio routes (lip sync, voice reference, song in the final video) with a clip preview.
+- Optional RTX Video Super Resolution for previews or the final video.
+- Restart ComfyUI from the page.
 
 ## Requirements
 
-Install these in `ComfyUI/custom_nodes` (the Studio checks for them and names any that are missing):
+- A ComfyUI version with native MiniMax H3 support, and the MiniMax H3 model files.
+- These custom node packs. The Studio checks for them and names any that are missing.
 
-| Pack | For |
+| Pack | Needed for |
 |---|---|
-| H3 Prompt Compiler (`comfyui-minimax-h3`) | Shot, Subject, Ref Prompt Builder r2v |
-| H3 Long Shot (`comfyui-minimax-h3-longshot`) **— the version shipped alongside this pack** | Long Shot; this version adds the plan and progress hooks the Studio reads |
-| ComfyUI-KJNodes | Resize Image v2 (references), Patch Sage Attention (optional) |
-| ComfyUI-VideoHelperSuite | Video Combine, Load Audio |
-| ComfyUI-MiniMax-H3-Turbo | only when Turbo is on |
-| ComfyUI-MelBandRoFormer | only for the voice-reference route |
+| [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) | Shot, Subject, Ref Prompt Builder r2v (always) |
+| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.3.0 or later** | rendering; 1.3.0 adds the plan and progress hooks and the saved segments the Studio uses (always) |
+| [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) | resizing references, optional Sage attention (always) |
+| [ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) | saving the video, loading audio (always) |
+| [ComfyUI-MiniMax-H3-Turbo](https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo) | only when Turbo is on |
+| [ComfyUI-MelBandRoFormer](https://github.com/kijai/ComfyUI-MelBandRoFormer) | only for the voice-reference audio route |
+| [ComfyUI-NVIDIA-RTX-VSR-Pro](https://github.com/whmc76/ComfyUI-NVIDIA-RTX-VSR-Pro) | only for RTX upscaling (needs an RTX GPU) |
 
-You also need a ComfyUI build with native MiniMax H3 (the same one Long Shot needs). The
-`beta57` scheduler comes from RES4LYF; pick another scheduler if you don't have it.
+The default scheduler, `beta57`, comes from [RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF).
+If you don't have it, pick another scheduler under **Advanced**.
 
 ## Install
 
-1. Copy the `comfyui-h3-longshot-studio` folder into `ComfyUI/custom_nodes/`.
-2. Replace your `comfyui-minimax-h3-longshot` folder with the updated one.
-3. Restart ComfyUI and open `http://127.0.0.1:8188/longshot`.
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/r34vtraining/H3_Longshot_Studio
+git clone https://github.com/r34vtraining/H3_Prompt_Compiler
+git clone https://github.com/r34vtraining/H3_Longshot
+git clone https://github.com/kijai/ComfyUI-KJNodes
+git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
+```
 
-On first open the Studio makes a starter project, **Mara — spaceport chase**, from your
-H3_Ref2V_Longshot workflow. It has the same references, Shots and settings, and every Shot
-starts as Queued. Projects from the Stage 1 test build are moved to the new location
-automatically.
+Skip any you already have. If you already have H3 Long Shot, update it to 1.3.0 or
+later with `git pull` in its folder.
+
+Optional packs:
+
+```bash
+git clone https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo      # Turbo LoRA
+git clone https://github.com/kijai/ComfyUI-MelBandRoFormer          # voice-reference route
+git clone https://github.com/whmc76/ComfyUI-NVIDIA-RTX-VSR-Pro      # RTX upscaling
+```
+
+KJNodes, VideoHelperSuite and some optional packs have Python requirements. Install
+them with ComfyUI's Python from each pack's folder:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+For the Windows portable build, run this from the `ComfyUI_windows_portable` folder instead:
+
+```bat
+python_embeded\python.exe -m pip install -r ComfyUI\custom_nodes\ComfyUI-KJNodes\requirements.txt
+```
+
+The Studio itself has no extra dependencies.
+
+Restart ComfyUI and open **http://127.0.0.1:8188/longshot**.
+
+## Getting started
+
+1. The first time you open the Studio it makes an empty **Untitled** project. Rename it
+   from the project menu (click the name at the top).
+2. In **Settings**, check the model, text encoder, VAEs and Turbo LoRA. The Studio
+   fills any it can identify from your model folders; choose the rest yourself.
+3. Drop reference images on **Cast & Scenes** and give each a label (for example
+   `<hero>`, `<scene1>`) and a short description.
+4. Fill in **Style & Sound**, then write your Shots, referring to references by label.
+5. Press **▶ Render Shot 1**, review it, then **✓ Continue** or **⟳ Reroll**.
+
+Updating: run `git pull` in the Studio's folder (and in H3 Long Shot's), then restart
+ComfyUI and hard-refresh the page (Ctrl+Shift+R).
 
 ## How it works
 
@@ -73,7 +113,7 @@ automatically.
 ### Projects
 
 - **Slug.** Each project has a fixed slug: its name lower-cased, with other characters
-  turned into `-` (for example `mara-spaceport-chase`). Names with no Latin letters or
+  turned into `-` (for example `my-chase-scene` for "My chase scene"). Names with no Latin letters or
   digits get `project-<hash>`. **Rename** changes only the display name, so the
   project's saved segments (`output/longshot/<slug>/segments`) and input folder
   (`input/longshot/<slug>`) stay attached.
@@ -170,8 +210,7 @@ about 4–5 MB at 0.6 MP.
 ### RTX Super Resolution (upscale previews / upscale final)
 
 Two controls use NVIDIA's RTX Video Super Resolution node (`RTXVideoSuperResolution`,
-"scale by multiplier"), which runs between VAE Decode and Video Combine, as in your
-original workflow. Neither ever re-renders a Shot: the upscale runs after Long Shot,
+"scale by multiplier"), which runs between VAE Decode and Video Combine. Neither ever re-renders a Shot: the upscale runs after Long Shot,
 so segments are reused and only the decode, upscale and save run again.
 
 - **Upscale previews** (switch in Settings, under the resolution settings). When it's
@@ -230,12 +269,11 @@ no proxy headers). From another device, such as over Tailscale, the buttons are 
     Shot, the prompt nodes, LoadImage, KJ resize and VHS are real, and VHS writes a real mp4.
   - Also covers the HTTP routes.
 - `test_studio_server.py`: who counts as local, open-folder path safety, portable model names.
-- `test_projects.py` (B.7):
+- `test_projects.py`:
   - slugs, including non-Latin names;
   - save → reload gives identical state;
   - the slug survives a rename;
   - two-tab conflicts;
-  - migration;
   - missing / changed / relinked references;
   - `check-inputs` path refusal;
   - Delete and Clear touch only the chosen files.
@@ -244,9 +282,9 @@ no proxy headers). From another device, such as over Tailscale, the buttons are 
 
 ```
 set COMFYUI_ROOT=C:\path\to\ComfyUI
-set MMH3_PROMPT_PACK=%COMFYUI_ROOT%\custom_nodes\comfyui-minimax-h3
-set MMH3_LONGSHOT_PACK=%COMFYUI_ROOT%\custom_nodes\comfyui-minimax-h3-longshot
-set STUDIO_EXTRA_NODES=%COMFYUI_ROOT%\custom_nodes\ComfyUI-KJNodes;%COMFYUI_ROOT%\custom_nodes\ComfyUI-VideoHelperSuite;%COMFYUI_ROOT%\custom_nodes\ComfyUI-MiniMax-H3-Turbo;%COMFYUI_ROOT%\custom_nodes\ComfyUI-MelBandRoFormer
+set MMH3_PROMPT_PACK=%COMFYUI_ROOT%\custom_nodes\H3_Prompt_Compiler
+set MMH3_LONGSHOT_PACK=%COMFYUI_ROOT%\custom_nodes\H3_Longshot
+set STUDIO_EXTRA_NODES=%COMFYUI_ROOT%\custom_nodes\ComfyUI-KJNodes;%COMFYUI_ROOT%\custom_nodes\ComfyUI-VideoHelperSuite;%COMFYUI_ROOT%\custom_nodes\ComfyUI-MiniMax-H3-Turbo;%COMFYUI_ROOT%\custom_nodes\ComfyUI-MelBandRoFormer;%COMFYUI_ROOT%\custom_nodes\ComfyUI-NVIDIA-RTX-VSR-Pro
 python -m pytest tests -q
 ```
 

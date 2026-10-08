@@ -40,8 +40,7 @@ logger = logging.getLogger("H3LongShotStudio")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(HERE, "web", "studio")
-EXAMPLES_DIR = os.path.join(HERE, "examples")
-OLD_PROJECTS_SUBDIR = "h3_longshot_studio"          # Stage 1 location, migrated
+OLD_PROJECTS_SUBDIR = "h3_longshot_studio"          # early test builds' location, migrated
 PROJECTS_SUBDIR = os.path.join("default", "longshot-studio", "projects")
 VERSION = pj.STUDIO_VERSION
 
@@ -226,7 +225,7 @@ _READY = set()
 
 
 def project_store():
-    """The project store, migrating Stage 1 files and seeding the example once."""
+    """The project store, moving projects from early test builds over once."""
     import folder_paths
     user = folder_paths.get_user_directory()
     store = pj.ProjectStore(os.path.join(user, PROJECTS_SUBDIR))
@@ -235,7 +234,6 @@ def project_store():
         moved = pj.migrate(os.path.join(user, OLD_PROJECTS_SUBDIR), store)
         if moved:
             logger.info("H3 Long Shot Studio: moved %d project(s) to %s", moved, store.folder)
-        pj.seed_examples(store, EXAMPLES_DIR)
     return store
 
 

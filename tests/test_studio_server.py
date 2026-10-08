@@ -37,12 +37,12 @@ def test_folder_for_only_knows_two_folders(tmp_path):
 def test_selectable_rejects_anything_but_a_file_in_the_folder(tmp_path):
     folder = tmp_path / "longshot"
     folder.mkdir()
-    (folder / "Mara_00001.mp4").write_bytes(b"x")
+    (folder / "Sample_00001.mp4").write_bytes(b"x")
     (folder / "sub").mkdir()
     (tmp_path / "secret.txt").write_text("x")
-    assert srv.selectable(str(folder), "Mara_00001.mp4") == str(folder / "Mara_00001.mp4")
+    assert srv.selectable(str(folder), "Sample_00001.mp4") == str(folder / "Sample_00001.mp4")
     for bad in ("../secret.txt", "..", ".", "sub", "missing.mp4", "", None, 3,
-                str(tmp_path / "secret.txt"), "sub/../Mara_00001.mp4", "..\\secret.txt"):
+                str(tmp_path / "secret.txt"), "sub/../Sample_00001.mp4", "..\\secret.txt"):
         assert srv.selectable(str(folder), bad) is None, bad
 
 
@@ -66,8 +66,8 @@ def test_open_commands():
     assert srv.open_command("/o", "/o/a.mp4", "linux") == ["xdg-open", "/o"]
 
 
-def test_example_project_shape():
-    with open(os.path.join(PKG_DIR, "examples", "mara_spaceport_chase.json"),
+def test_sample_project_shape():
+    with open(os.path.join(HERE, "fixtures", "sample_project.json"),
               encoding="utf-8") as fh:
         p = json.load(fh)
     assert p["version"] == 1 and len(p["cast"]) == 7 and len(p["shots"]) == 6

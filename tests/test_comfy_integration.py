@@ -43,7 +43,7 @@ PKG = os.path.basename(PKG_DIR)
 gb = importlib.import_module(PKG + ".graph_builder")
 srv = importlib.import_module(PKG + ".studio_server")
 
-EXAMPLE = os.path.join(PKG_DIR, "examples", "mara_spaceport_chase.json")
+SAMPLE = os.path.join(HERE, "fixtures", "sample_project.json")
 FULL_SET = (set(gb.PACKS) - {"RTXVideoSuperResolution"}) | {"UNETLoader", "LoraLoaderModelOnly", "LoadImage"}  # RTX VSR needs an NVIDIA GPU
 
 
@@ -71,7 +71,7 @@ MODEL_FILES = {
     "loras": ["H3/Speed/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
               "style_a.safetensors", "style_b.safetensors", "style_c.safetensors"],
 }
-SONG = "Is it a Dream_.mp3"
+SONG = "song.mp3"
 
 
 def listed(kind, rel):
@@ -102,9 +102,10 @@ def install(tmp_path_factory):
     folder_paths.set_user_directory(str(user))
 
     from PIL import Image
-    project = json.load(open(EXAMPLE, encoding="utf-8"))
+    project = json.load(open(SAMPLE, encoding="utf-8"))
     for k, c in enumerate(project["cast"]):
         Image.new("RGB", (96 + 8 * k, 64), (40 * k % 255, 90, 160)).save(inp / c["image"])
+    srv.project_store().create(project["name"], project)     # what a user would have saved
     ffmpeg = srv._ffmpeg_path()
     subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i",
                     "sine=frequency=440:duration=40", "-ac", "2", str(inp / SONG)], check=True)
@@ -119,8 +120,8 @@ def install(tmp_path_factory):
 
 
 def project(**settings):
-    """The user's Mara project, with model names as this OS lists them."""
-    p = json.load(open(EXAMPLE, encoding="utf-8"))
+    """The sample project, with model names as this OS lists them."""
+    p = json.load(open(SAMPLE, encoding="utf-8"))
     s = p["settings"]
     s["model"] = listed("diffusion_models", "H3/minimax_h3_fl2va_pruned_bf16.safetensors")
     s["clip"] = listed("text_encoders", "H3/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors")
@@ -168,7 +169,7 @@ def _variant(name):
     return p
 
 
-VARIANTS = ["Mara as saved", "turbo off + 3 LoRAs", "turbo + LoRA 2 only", "bypassed cast + shots",
+VARIANTS = ["sample as saved", "turbo off + 3 LoRAs", "turbo + LoRA 2 only", "bypassed cast + shots",
             "no references", "max refs, other settings", "sage disabled"] + \
     [f"audio {a}{b}{c}" for a in "01" for b in "01" for c in "01"]
 
@@ -374,7 +375,7 @@ def loop(install, monkeypatch, tmp_path):
 
 
 def small(**kw):
-    """The Mara project at a size a CPU can stitch quickly."""
+    """The sample project at a size a CPU can stitch quickly."""
     p = project(megapixels=0.2, ref_resize_px=64, **kw)
     return p
 
@@ -397,7 +398,7 @@ def test_core_loop_start_continue_reroll_edit(loop):
     assert sampled == 1 and progress == [(1, "rendering"), (1, "done")]
     video = out["combine"]["gifs"][0]
     assert video["subfolder"] == "longshot" and video["type"] == "output"
-    assert video["filename"].startswith("Mara — spaceport chase_")
+    assert video["filename"].startswith("Sample project_")
     assert os.path.isfile(os.path.join(folder_paths.get_output_directory(), "longshot",
                                        video["filename"]))
     # nvenc when this machine's ffmpeg can actually use it, software h264 otherwise
@@ -412,7 +413,7 @@ def test_core_loop_start_continue_reroll_edit(loop):
     assert [r["status"] for r in rows] == ["reused", "render"]
     assert [r["seed"] for r in rows] == [1722, 1723]
 
-    # Continue again: Shot 3 carries the user's saved shot_seed 0
+    # Continue again: Shot 3 carries its saved shot_seed 0
     out, progress, sampled = loop(p, "s3")
     assert progress == [(1, "reused"), (2, "reused"), (3, "rendering"), (3, "done")]
     assert out["longshot"]["plan_json"][2]["seed"] == 0
@@ -494,49 +495,49 @@ def test_routes_build_projects_options(install, monkeypatch):
     status, opts = _client_call("GET", "/longshot/options")
     assert status == 200
     assert listed("diffusion_models", "H3/minimax_h3_fl2va_pruned_bf16.safetensors") in opts["models"]
-    assert "Actress_Headshots_8_Options 06 (1).png" in opts["images"]
+    assert "hero portrait (1).png" in opts["images"]
     assert SONG in opts["audio"]
     assert "er_sde" in opts["samplers"] and "beta57" in opts["schedulers"]
     assert opts["sizes"]["0.6|16:9"] == [1056, 608]
     assert opts["nodes"]["MiniMaxH3LongShot"] is True
 
     status, projects = _client_call("GET", "/longshot/projects")
-    assert status == 200 and projects[0]["name"] == "Mara — spaceport chase"
-    assert projects[0]["slug"] == "mara-spaceport-chase"
-    status, mara = _client_call("GET", "/longshot/projects/mara-spaceport-chase")
-    assert status == 200 and len(mara["shots"]) == 6 and mara["saved_at"]
+    assert status == 200 and projects[0]["name"] == "Sample project"
+    assert projects[0]["slug"] == "sample-project"
+    status, proj = _client_call("GET", "/longshot/projects/sample-project")
+    assert status == 200 and len(proj["shots"]) == 6 and proj["saved_at"]
 
     # save with the version we loaded; a second tab's stale save is refused
-    mara["name"] = "Mara — renamed"
-    status, saved = _client_call("PUT", "/longshot/projects/mara-spaceport-chase?base="
-                                 + mara["saved_at"], json=mara)
-    assert status == 200 and saved["slug"] == "mara-spaceport-chase"
-    status, back = _client_call("GET", "/longshot/projects/mara-spaceport-chase")
-    assert back["name"] == "Mara — renamed" and back["saved_at"] == saved["saved_at"]
-    status, conflict = _client_call("PUT", "/longshot/projects/mara-spaceport-chase?base="
-                                    + mara["saved_at"], json=dict(mara, name="stale tab"))
-    assert status == 409 and conflict["current"]["name"] == "Mara — renamed"
-    assert _client_call("PUT", "/longshot/projects/mara-spaceport-chase?force=1&base=x",
-                        json=dict(mara, name="Mara — spaceport chase"))[0] == 200
+    proj["name"] = "Sample — renamed"
+    status, saved = _client_call("PUT", "/longshot/projects/sample-project?base="
+                                 + proj["saved_at"], json=proj)
+    assert status == 200 and saved["slug"] == "sample-project"
+    status, back = _client_call("GET", "/longshot/projects/sample-project")
+    assert back["name"] == "Sample — renamed" and back["saved_at"] == saved["saved_at"]
+    status, conflict = _client_call("PUT", "/longshot/projects/sample-project?base="
+                                    + proj["saved_at"], json=dict(proj, name="stale tab"))
+    assert status == 409 and conflict["current"]["name"] == "Sample — renamed"
+    assert _client_call("PUT", "/longshot/projects/sample-project?force=1&base=x",
+                        json=dict(proj, name="Sample project"))[0] == 200
 
-    status, made = _client_call("POST", "/longshot/projects", json={"name": "Mara — spaceport chase",
+    status, made = _client_call("POST", "/longshot/projects", json={"name": "Sample project",
                                                                     "project": {"shots": []}})
-    assert status == 200 and made["slug"] == "mara-spaceport-chase-2"
+    assert status == 200 and made["slug"] == "sample-project-2"
     assert _client_call("GET", "/longshot/projects/nope")[0] == 404
     assert _client_call("GET", "/longshot/projects/..%2F..%2Fsecret")[0] in (400, 404)
     assert _client_call("PUT", "/longshot/projects/Bad Slug", json={})[0] == 400
-    status, gone = _client_call("DELETE", "/longshot/projects/mara-spaceport-chase-2")
+    status, gone = _client_call("DELETE", "/longshot/projects/sample-project-2")
     assert status == 200 and gone["project"] is True
-    assert [p["slug"] for p in _client_call("GET", "/longshot/projects")[1]] == ["mara-spaceport-chase"]
+    assert [p["slug"] for p in _client_call("GET", "/longshot/projects")[1]] == ["sample-project"]
 
     # inputs and reference checks
     status, listing = _client_call("GET", "/longshot/inputs")
-    assert "Untitled.png" in listing["images"] and SONG in listing["audio"]
+    assert "scene1.png" in listing["images"] and SONG in listing["audio"]
     assert _client_call("GET", "/longshot/inputs?subfolder=../..")[0] == 400
     status, checked = _client_call("POST", "/longshot/check-inputs", json={"files": [
-        {"key": "c1", "name": "Untitled.png", "subfolder": ""},
+        {"key": "c1", "name": "scene1.png", "subfolder": ""},
         {"key": "c2", "name": "gone.png", "subfolder": ""},
-        {"key": "c3", "name": "Untitled.png", "subfolder": "", "sha256": "0" * 64},
+        {"key": "c3", "name": "scene1.png", "subfolder": "", "sha256": "0" * 64},
         {"key": "c4", "name": "../../etc/passwd", "subfolder": ""}]})
     states = {f["key"]: f["state"] for f in checked["files"]}
     assert states == {"c1": "ok", "c2": "missing", "c3": "changed", "c4": "invalid"}
@@ -548,7 +549,7 @@ def test_routes_build_projects_options(install, monkeypatch):
     buf = io.BytesIO()
     Image.new("RGB", (16, 16), (10, 120, 200)).save(buf, "PNG")
 
-    def form(name="dropped face.png", data=None, slug="mara-spaceport-chase"):
+    def form(name="dropped face.png", data=None, slug="sample-project"):
         from aiohttp import FormData
         fd = FormData(quote_fields=False)      # browsers send file names unescaped
         fd.add_field("project", slug)
@@ -558,8 +559,8 @@ def test_routes_build_projects_options(install, monkeypatch):
 
     status, up = _client_call("POST", "/longshot/upload", data=form())
     assert status == 200 and up == dict(up, name="dropped face.png",
-                                        subfolder="longshot/mara-spaceport-chase", reused=False)
-    status, mine = _client_call("GET", "/longshot/inputs?subfolder=longshot/mara-spaceport-chase")
+                                        subfolder="longshot/sample-project", reused=False)
+    status, mine = _client_call("GET", "/longshot/inputs?subfolder=longshot/sample-project")
     assert "dropped face.png" in mine["images"]
     assert _client_call("POST", "/longshot/upload", data=form())[1]["reused"] is True
     assert _client_call("POST", "/longshot/upload", data=form(slug="nope"))[0] == 404
@@ -598,9 +599,9 @@ def test_open_folder_is_local_only(install, monkeypatch):
 
     out_dir = os.path.join(folder_paths.get_output_directory(), "longshot")
     os.makedirs(out_dir, exist_ok=True)
-    open(os.path.join(out_dir, "Mara_00001.mp4"), "wb").close()
+    open(os.path.join(out_dir, "Sample_00001.mp4"), "wb").close()
     status, body = _client_call("POST", "/longshot/open-folder",
-                                json={"which": "output", "select": "Mara_00001.mp4"})
+                                json={"which": "output", "select": "Sample_00001.mp4"})
     assert status == 200 and body["selected"] is True
     assert body["opened"] == out_dir
     status, body = _client_call("POST", "/longshot/open-folder",
@@ -609,10 +610,10 @@ def test_open_folder_is_local_only(install, monkeypatch):
     assert _client_call("POST", "/longshot/open-folder", json={"which": "/etc"})[0] == 400
     # input: this project's subfolder when it exists, the input folder otherwise
     inp = folder_paths.get_input_directory()
-    os.makedirs(os.path.join(inp, "longshot", "mara-spaceport-chase"), exist_ok=True)
+    os.makedirs(os.path.join(inp, "longshot", "sample-project"), exist_ok=True)
     body = _client_call("POST", "/longshot/open-folder",
-                        json={"which": "input", "project": "mara-spaceport-chase"})[1]
-    assert body["opened"] == os.path.join(inp, "longshot", "mara-spaceport-chase")
+                        json={"which": "input", "project": "sample-project"})[1]
+    assert body["opened"] == os.path.join(inp, "longshot", "sample-project")
     for bad in ("no-such-project", "../..", None):
         body = _client_call("POST", "/longshot/open-folder", json={"which": "input", "project": bad})[1]
         assert body["opened"] == inp
@@ -622,19 +623,19 @@ def test_open_folder_is_local_only(install, monkeypatch):
 @ALL_PACKS
 def test_segment_routes_are_local_only(install, monkeypatch):
     out = folder_paths.get_output_directory()
-    seg = os.path.join(out, "longshot", "mara-spaceport-chase", "segments")
+    seg = os.path.join(out, "longshot", "sample-project", "segments")
     os.makedirs(seg, exist_ok=True)
     for f in ("a" * 32 + ".safetensors", "b" * 32 + ".safetensors"):
         with open(os.path.join(seg, f), "wb") as fh:
             fh.write(b"x" * 10)
-    status, stats = _client_call("GET", "/longshot/segments/mara-spaceport-chase")
+    status, stats = _client_call("GET", "/longshot/segments/sample-project")
     assert status == 200 and stats == {"files": 2, "bytes": 20}
     fwd = {"X-Forwarded-For": "100.64.0.7"}
     assert _client_call("POST", "/longshot/clear-segments", headers=fwd,
-                        json={"project": "mara-spaceport-chase"})[0] == 403
+                        json={"project": "sample-project"})[0] == 403
     assert _client_call("POST", "/longshot/clear-segments", json={"project": "../x"})[0] == 400
     status, cleared = _client_call("POST", "/longshot/clear-segments",
-                                   json={"project": "mara-spaceport-chase"})
+                                   json={"project": "sample-project"})
     assert status == 200 and cleared["removed"] == 2 and cleared["files"] == 0
     # deleting a project's files is local-only too
     _client_call("POST", "/longshot/projects", json={"name": "Scratch", "project": {}})
@@ -663,7 +664,7 @@ def test_crash_resume_from_saved_segments(loop):
     assert sampled == 0 and "unet" not in RAN
     assert progress == [(1, "reused"), (2, "reused"), (3, "reused")]
     assert loop.sources == ["disk"] * 3
-    assert out["combine"]["gifs"][0]["filename"].startswith("Mara — spaceport chase_")
+    assert out["combine"]["gifs"][0]["filename"].startswith("Sample project_")
 
     RAN.clear()
     out, progress, sampled = loop(p, "s4", restart=True)     # Continue after the crash
@@ -676,13 +677,13 @@ def test_crash_resume_from_saved_segments(loop):
 def test_references_and_audio_load_from_a_project_subfolder(loop):
     """B.3: LoadImage and VHS Load Audio both accept input/longshot/<slug>/…"""
     inp = folder_paths.get_input_directory()
-    sub = os.path.join(inp, "longshot", "mara-spaceport-chase")
+    sub = os.path.join(inp, "longshot", "sample-project")
     os.makedirs(sub, exist_ok=True)
     p = small()
-    shutil.copy(os.path.join(inp, p["cast"][0]["image"]), os.path.join(sub, "actress (1).png"))
+    shutil.copy(os.path.join(inp, p["cast"][0]["image"]), os.path.join(sub, "hero (1).png"))
     shutil.copy(os.path.join(inp, SONG), os.path.join(sub, "song.mp3"))
-    p["cast"][0].update(image="actress (1).png", subfolder="longshot/mara-spaceport-chase")
-    p["audio"].update(file="song.mp3", subfolder="longshot/mara-spaceport-chase", start=1.0,
+    p["cast"][0].update(image="hero (1).png", subfolder="longshot/sample-project")
+    p["audio"].update(file="song.mp3", subfolder="longshot/sample-project", start=1.0,
                       length=12.0, lip_sync=True, final_override=True)
     built = gb.build_prompt(p, upto="s2", env=srv.current_env())
     ok, err, _, node_errors = validate(built.prompt)
@@ -765,7 +766,7 @@ def test_rtx_vsr_validates_and_runs(loop, monkeypatch):
     # nothing re-samples: ComfyUI serves Long Shot from its cache (or memory reuses it)
     assert sampled == 0 and progress in ([], [(1, "reused")])
     assert not [r for r in RAN if isinstance(r, tuple) and r[0] == "vsr"]
-    assert out["combine"]["gifs"][0]["filename"].startswith("Mara")
+    assert out["combine"]["gifs"][0]["filename"].startswith("Sample project")
 
 
 
@@ -780,4 +781,4 @@ def test_upscale_final_reuses_every_segment(loop, monkeypatch):
     out, progress, sampled = loop(p, "s2", final=True, restart=True)   # even after a restart
     assert sampled == 0 and progress == [(1, "reused"), (2, "reused")]
     assert ("vsr", "scale by multiplier", 2.0, "ULTRA") in RAN and "unet" not in RAN
-    assert out["combine"]["gifs"][0]["filename"].startswith("Mara — spaceport chase_final_")
+    assert out["combine"]["gifs"][0]["filename"].startswith("Sample project_final_")

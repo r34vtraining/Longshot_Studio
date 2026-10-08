@@ -1,4 +1,4 @@
-"""Projects on disk and reference checks (Addendum B). Pure Python, no ComfyUI.
+"""Projects on disk and reference checks. Pure Python, no ComfyUI.
 
 Projects are JSON files named by slug:
     <ComfyUI user dir>/default/longshot-studio/projects/<slug>.json
@@ -156,7 +156,7 @@ class ProjectStore:
 
 
 def migrate(old_folder, store):
-    """Stage 1 kept projects as <user>/h3_longshot_studio/<name>.json. Move them
+    """Early test builds kept projects as <user>/h3_longshot_studio/<name>.json. Move them
     in once, giving each a slug; the old folder is renamed, never deleted."""
     if not os.path.isdir(old_folder):
         return 0
@@ -180,23 +180,6 @@ def migrate(old_folder, store):
     except OSError:
         pass
     return n
-
-
-def seed_examples(store, examples_dir):
-    """First run: put the bundled example project(s) in."""
-    if store.list() or not os.path.isdir(examples_dir):
-        return
-    for f in sorted(os.listdir(examples_dir)):
-        if not f.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(examples_dir, f), encoding="utf-8") as fh:
-                project = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        slug = project.get("slug") if is_slug(project.get("slug")) else slugify(project.get("name"))
-        if not store.exists(slug):
-            store.save(slug, project)
 
 
 # ---------------------------------------------------------------------------

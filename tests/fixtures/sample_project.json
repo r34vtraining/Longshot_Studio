@@ -1,0 +1,214 @@
+{
+  "version": 1,
+  "slug": "sample-project",
+  "name": "Sample project",
+  "cast": [
+    {
+      "id": "c1",
+      "label": "<hero>",
+      "desc": "a person wearing <outfit>",
+      "role": "appearance",
+      "image": "hero portrait (1).png",
+      "bypassed": false,
+      "subfolder": "",
+      "type": "input",
+      "original_name": "hero portrait (1).png",
+      "size_bytes": null,
+      "sha256": null
+    },
+    {
+      "id": "c2",
+      "label": "<outfit>",
+      "desc": "a plain jacket, trousers and sneakers",
+      "role": "appearance",
+      "image": "outfit.png",
+      "bypassed": false,
+      "subfolder": "",
+      "type": "input",
+      "original_name": "outfit.png",
+      "size_bytes": null,
+      "sha256": null
+    },
+    {
+      "id": "c3",
+      "label": "<scene1>",
+      "desc": "an empty courtyard",
+      "role": "appearance",
+      "image": "scene1.png",
+      "bypassed": false,
+      "subfolder": "",
+      "type": "input",
+      "original_name": "scene1.png",
+      "size_bytes": null,
+      "sha256": null
+    },
+    {
+      "id": "c4",
+      "label": "<scene2>",
+      "desc": "a narrow street",
+      "role": "appearance",
+      "image": "scene2.png",
+      "bypassed": false,
+      "subfolder": "",
+      "type": "input",
+      "original_name": "scene2.png",
+      "size_bytes": null,
+      "sha256": null
+    },
+    {
+      "id": "c5",
+      "label": "<scene3>",
+      "desc": "a quiet workshop",
+      "role": "appearance",
+      "image": "scene3.png",
+      "bypassed": false,
+      "subfolder": "",
+      "type": "input",
+      "original_name": "scene3.png",
+      "size_bytes": null,
+      "sha256": null
+    },
+    {
+      "id": "c6",
+      "label": "<scene4>",
+      "desc": "an open plaza",
+      "role": "appearance",
+      "image": "scene4.png",
+      "bypassed": false,
+      "subfolder": "",
+      "type": "input",
+      "original_name": "scene4.png",
+      "size_bytes": null,
+      "sha256": null
+    },
+    {
+      "id": "c7",
+      "label": "<scene5>",
+      "desc": "a large glass hall",
+      "role": "appearance",
+      "image": "scene5.png",
+      "bypassed": false,
+      "subfolder": "",
+      "type": "input",
+      "original_name": "scene5.png",
+      "size_bytes": null,
+      "sha256": null
+    }
+  ],
+  "style": {
+    "summary": "The target video shows <hero> walking through a chain of connected places in one continuous shot.",
+    "retention": "<hero> (appears in [Shot 1]): fully_preserved.",
+    "style_line": "Single continuous take, no cuts. Tracking shot from behind <hero>.",
+    "soundscape": "Footsteps and ambient sound that changes with each place.",
+    "music": "N/A",
+    "task_types": [
+      "reference generation"
+    ]
+  },
+  "shots": [
+    {
+      "id": "s1",
+      "text": "Tracking shot behind <hero> crossing the courtyard from <scene1>.",
+      "seconds": 5,
+      "shot_seed": -1,
+      "bypassed": false,
+      "status": "queued"
+    },
+    {
+      "id": "s2",
+      "text": "Tracking shot behind <hero> walking down the street from <scene2>.",
+      "seconds": 5,
+      "shot_seed": -1,
+      "bypassed": false,
+      "status": "queued"
+    },
+    {
+      "id": "s3",
+      "text": "Tracking shot behind <hero> passing through the workshop from <scene3>.",
+      "seconds": 5,
+      "shot_seed": 0,
+      "bypassed": false,
+      "status": "queued"
+    },
+    {
+      "id": "s4",
+      "text": "Tracking shot behind <hero> stepping out into the plaza from <scene4>.",
+      "seconds": 5,
+      "shot_seed": -1,
+      "bypassed": false,
+      "status": "queued"
+    },
+    {
+      "id": "s5",
+      "text": "Tracking shot behind <hero> crossing the plaza from <scene4> toward a doorway.",
+      "seconds": 9,
+      "shot_seed": -1,
+      "bypassed": false,
+      "status": "queued"
+    },
+    {
+      "id": "s6",
+      "text": "Tracking shot behind <hero> entering the glass hall from <scene5>.",
+      "seconds": 6,
+      "shot_seed": -1,
+      "bypassed": false,
+      "status": "queued"
+    }
+  ],
+  "audio": {
+    "file": "song.mp3",
+    "start": 15.0,
+    "length": 15.1,
+    "lip_sync": false,
+    "voice_ref": false,
+    "final_override": false,
+    "melband_model": "Infinite Talk\\MelBandRoformer_fp16.safetensors",
+    "subfolder": "",
+    "original_name": "song.mp3",
+    "size_bytes": null,
+    "sha256": null
+  },
+  "settings": {
+    "model": "H3\\minimax_h3_fl2va_pruned_bf16.safetensors",
+    "clip": "H3\\qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    "video_vae": "H3\\minimax_h3_video_vae_fp16.safetensors",
+    "audio_vae": "H3\\minimax_h3_audio_vae_fp32.safetensors",
+    "turbo": {
+      "on": true,
+      "lora": "H3\\Speed\\minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+      "strength": 1
+    },
+    "loras": [
+      {
+        "on": false,
+        "name": null,
+        "strength": 1.0
+      },
+      {
+        "on": false,
+        "name": null,
+        "strength": 1.0
+      },
+      {
+        "on": false,
+        "name": null,
+        "strength": 1.0
+      }
+    ],
+    "steps": 8,
+    "megapixels": 0.6,
+    "aspect": "16:9",
+    "ref_image_size": "match",
+    "ref_resize_px": 1500,
+    "sampler": "er_sde",
+    "scheduler": "beta57",
+    "overlap": 22,
+    "seed": 1722,
+    "seed_mode": "increment",
+    "shift_video": 12,
+    "shift_audio": 3,
+    "sage_attention": "auto",
+    "save_segments": true
+  },
+  "last_output": null
+}

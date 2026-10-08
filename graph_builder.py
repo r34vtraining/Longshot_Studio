@@ -4,8 +4,8 @@ Pure Python: no torch, no ComfyUI imports, so every rule is unit-testable
 without a GPU. What ComfyUI has installed (node classes, VHS video formats)
 comes in through `Env`, which the server fills from the live registry.
 
-The graph is built from scratch every time, mirroring the user's own
-H3_Ref2V_Longshot workflow (spec section 4):
+The graph is built from scratch every time, mirroring the reference
+H3 Ref2V Long Shot workflow:
 
     UNETLoader -> [Sage] -> SigmaShift -> [Turbo LoRA] -> [LoRA x3] -> BasicScheduler
     LoadImage -> ImageResizeKJv2 -> Long Shot ref_images.ref_image_k
@@ -32,8 +32,7 @@ NVENC = "video/nvenc_h264-mp4"
 H264 = "video/h264-mp4"
 
 # Same table and maths as ComfyUI's ResolutionSelector (1 MP = 1024 x 1024 px,
-# rounded to multiples of 32), so sizes match the user's existing renders and
-# MiniMax's published size table.
+# rounded to multiples of 32), so sizes match MiniMax's published size table.
 ASPECTS = {
     "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:3": (4, 3), "3:4": (3, 4),
     "3:2": (3, 2), "2:3": (2, 3), "21:9": (21, 9),
@@ -42,11 +41,11 @@ MEGAPIXELS = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.98, 1.0, 1.2, 1.5, 1.8, 
 
 # Which pack provides each node class, for "missing node" errors.
 PACKS = {
-    "MiniMaxH3Shot": "H3 Prompt Compiler (comfyui-minimax-h3)",
-    "MiniMaxH3Subject": "H3 Prompt Compiler (comfyui-minimax-h3)",
-    "MiniMaxH3RefPromptBuilder": "H3 Prompt Compiler (comfyui-minimax-h3)",
-    "MiniMaxH3LongShot": "H3 Long Shot (comfyui-minimax-h3-longshot)",
-    "MiniMaxH3SongTrack": "H3 Long Shot (comfyui-minimax-h3-longshot)",
+    "MiniMaxH3Shot": "H3 Prompt Compiler (github.com/r34vtraining/H3_Prompt_Compiler)",
+    "MiniMaxH3Subject": "H3 Prompt Compiler (github.com/r34vtraining/H3_Prompt_Compiler)",
+    "MiniMaxH3RefPromptBuilder": "H3 Prompt Compiler (github.com/r34vtraining/H3_Prompt_Compiler)",
+    "MiniMaxH3LongShot": "H3 Long Shot 1.3.0+ (github.com/r34vtraining/H3_Longshot)",
+    "MiniMaxH3SongTrack": "H3 Long Shot 1.3.0+ (github.com/r34vtraining/H3_Longshot)",
     "MiniMaxH3SigmaShift": "ComfyUI core (update ComfyUI)",
     "MiniMaxH3TurboLoRA": "ComfyUI-MiniMax-H3-Turbo",
     "PathchSageAttentionKJ": "ComfyUI-KJNodes",
@@ -130,7 +129,7 @@ def safe_name(name: str, fallback: str = "untitled") -> str:
 
 
 def project_slug(project: dict) -> str:
-    """The project's fixed slug (Addendum B.1); also Long Shot's cache_name."""
+    """The project's fixed slug; also Long Shot's cache_name."""
     slug = project.get("slug")
     return slug if pj.is_slug(slug) else pj.slugify(project.get("name"))
 

@@ -182,10 +182,39 @@ async function refreshProjects() {
   try { S.projects = await api("/longshot/projects"); } catch (e) { S.projects = []; }
 }
 
+/** A new project starts with empty model fields. Fill each one that has exactly
+ *  one obvious MiniMax H3 file in ComfyUI's lists; leave the rest for Settings. */
+function autoPickModels(p) {
+  const o = S.opts;
+  if (!o) return false;
+  const s = p.settings;
+  const only = (list, ...words) => {
+    const hits = (list || []).filter((n) => words.every((w) => n.toLowerCase().includes(w)));
+    return hits.length === 1 ? hits[0] : "";
+  };
+  const picks = {
+    model: () => (o.models || []).filter((n) => /minimax_h3/i.test(n) && !/vae|lora|turbo/i.test(n)),
+    clip: () => (o.clips || []).filter((n) => /minimax/i.test(n)),
+    video_vae: () => [only(o.vaes, "minimax", "video")],
+    audio_vae: () => [only(o.vaes, "minimax", "audio")],
+  };
+  let changed = false;
+  for (const [k, f] of Object.entries(picks)) {
+    const hits = f().filter(Boolean);
+    if (!s[k] && hits.length === 1) { s[k] = hits[0]; changed = true; }
+  }
+  if (!s.turbo.lora) {
+    const t = only(o.loras, "minimax", "turbo");
+    if (t) { s.turbo.lora = t; changed = true; }
+  }
+  return changed;
+}
+
 async function loadProject(slug) {
   stopPreview();
   const p = await api("/longshot/projects/" + encodeURIComponent(slug));
   S.project = normalize(p);
+  if (autoPickModels(S.project)) scheduleSave();
   Object.assign(S, { dry: null, error: null, loop: false, conflict: null, refState: {}, refInfo: {},
     segStats: null, checkedFor: null });
   $("conflict").hidden = true;
@@ -274,7 +303,7 @@ async function autoCheck() {
 }
 
 // ---------------------------------------------------------------------------
-// Invalidation rules (spec §2)
+// Invalidation rules
 // ---------------------------------------------------------------------------
 
 /** Editing a Shot: it and every Shot after it are queued again. */
@@ -1141,7 +1170,7 @@ function renderAudio() {
       <div style="display:flex;flex-direction:column;gap:2px;margin-top:14px">
       ${ROUTES.map(([k, t, r, badge]) => `<div class="route">${switchHTML(a[k], `data-action="audio-route" data-key="${k}" aria-label="${t}"`)}
         <span class="route-text"><b>${t}</b><i>${r}</i></span><span class="badge">${badge}</span></div>`).join("")}
-      </div><div class="muted small" style="margin-top:8px">Upload and the full audio panel arrive in Stage 3.</div></div>`;
+      </div><div class="muted small" style="margin-top:8px">Pick from audio files in ComfyUI's input folder, or this project's input/longshot/${esc(P().slug)} folder.</div></div>`;
 }
 
 function sizeOf(s) {
