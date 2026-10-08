@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>H3 Long Shot Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="/longshot/static/studio.css">
+</head>
+<body>
+<div class="app">
+
+<header class="top">
+  <div class="top-left">
+    <div class="brand">H3 Long Shot Studio</div>
+    <div class="project-pick">
+      <div class="project-menu">
+        <button id="project-btn" class="proj-btn" data-action="menu" aria-haspopup="true" aria-expanded="false">
+          <span id="project-title">…</span><span class="muted">▾</span></button>
+        <div id="menu" class="menu" role="menu" hidden>
+          <button role="menuitem" data-action="new-project">New project</button>
+          <button role="menuitem" data-action="open-list">Open…</button>
+          <button role="menuitem" data-action="save">Save <kbd id="save-key">Ctrl S</kbd></button>
+          <button role="menuitem" data-action="save-as">Save as…</button>
+          <button role="menuitem" data-action="rename">Rename…</button>
+          <button role="menuitem" data-action="duplicate">Duplicate</button>
+          <button role="menuitem" data-action="delete-project" class="danger">Delete…</button>
+        </div>
+      </div>
+      <span id="save-state" class="muted small"></span>
+    </div>
+  </div>
+  <div class="top-right">
+    <button class="ghost sm restart-btn" data-action="restart" id="restart-btn" title="Restart ComfyUI (finished segments are kept on disk)">
+      <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7a5 5 0 1 1-1.5-3.6"/><path d="M12 1.8v2.6H9.4"/></svg>
+      Restart
+    </button>
+    <div class="conn"><span id="conn-dot" class="dot"></span><span id="conn-label">Connecting…</span></div>
+    <div id="header-stats" class="mono muted"></div>
+  </div>
+</header>
+
+<div id="banner" class="banner" hidden></div>
+<div id="conflict" class="banner conflict" role="alert" hidden>
+  <span>This project was changed in another tab.</span>
+  <button class="ghost sm" data-action="conflict-reload">Reload</button>
+  <button class="ghost sm" data-action="conflict-keep">Keep mine</button>
+</div>
+
+<div id="theater-slot" class="theater-slot"></div>
+
+<main class="cols">
+
+  <section class="col-left">
+
+    <div class="panel" id="cast-panel">
+      <div class="panel-head">
+        <div class="head-left">
+          <h2>Cast &amp; Scenes</h2>
+          <span class="muted small">labels renumber when you bypass or remove one</span>
+        </div>
+        <div class="head-right">
+          <button class="ghost sm folder-btn local-only" data-action="open-folder" data-which="input" title="Open ComfyUI's input folder, where references and audio live">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M1.5 4.5v8h13v-6.5h-7l-1.5-1.5z"/></svg>
+            Open input folder
+          </button>
+          <span class="warn-tag" title="Changing these re-renders every shot">⚠ all shots</span>
+        </div>
+      </div>
+      <div id="cast" class="cast-grid"></div>
+    </div>
+
+    <div class="panel" id="style-panel">
+      <button class="fold" data-action="toggle" data-key="styleOpen" id="style-toggle">
+        <span class="head-left"><span class="h2">Style &amp; Sound</span><span class="warn-tag">⚠ all shots</span></span>
+        <span class="muted chev" id="style-chev">Show ▾</span>
+      </button>
+      <div id="style" class="form-grid" hidden></div>
+    </div>
+
+    <div class="panel" id="shots-panel">
+      <div class="panel-head">
+        <h2>Shots</h2>
+        <span class="muted small">editing, bypassing or removing a shot re-renders the shots after it</span>
+      </div>
+      <div id="shots" class="shot-list"></div>
+      <button class="addtile wide" data-action="add-shot" id="add-shot"></button>
+    </div>
+  </section>
+
+  <aside class="col-right">
+
+    <div id="stage" class="stage">
+    <div class="stage-bar-bg" aria-hidden="true"></div>
+    <div class="panel viewer">
+      <div class="screen" id="screen">
+        <video id="video" playsinline preload="auto"></video>
+        <div class="placeholder" id="placeholder">
+          <div class="ph-label">[ Video preview ]</div>
+          <div class="ph-shot" id="ph-shot">Nothing rendered yet</div>
+        </div>
+        <div class="tc" id="tc-overlay">00:00.00</div>
+      </div>
+      <div class="vcontrols" id="vcontrols">
+      <div class="scrub" id="scrub-wrap">
+        <div id="loop-band" class="loop-band" hidden></div>
+        <div id="ticks"></div>
+        <input type="range" id="scrub" aria-label="Scrub" min="0" max="0" step="0.01" value="0">
+      </div>
+      <div class="controls">
+        <button class="ctl icon-ctl" id="play" data-action="play" aria-label="Play">
+          <svg id="play-icon" width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 2l9 5-9 5z"/></svg>
+        </button>
+        <button class="ctl" data-action="step" data-dir="-1" aria-label="Previous frame">◀ frame</button>
+        <button class="ctl" data-action="step" data-dir="1" aria-label="Next frame">frame ▶</button>
+        <button class="ctl" data-action="jump" id="jump">Jump to —</button>
+        <button class="ctl" data-action="loop" id="loop" aria-pressed="false" title="Loops the shot under review, starting halfway through the shot before it so you see the seam">⟲ Loop shot + seam</button>
+        <button class="ctl folder-btn local-only" data-action="open-folder" data-which="output" title="Open the output folder with this video selected">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M1.5 4.5v8h13v-6.5h-7l-1.5-1.5z"/></svg>
+          Open output folder
+        </button>
+        <a class="ctl remote-only" id="download" download hidden>Download video</a>
+        <span class="mono muted small push" id="tc-label">00:00.00 / 00:00.00</span>
+        <div class="volume">
+          <button class="ctl icon-ctl" data-action="mute" id="mute-btn" aria-label="Mute (M)" title="Mute (M)" aria-pressed="false">
+            <svg id="vol-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"></svg>
+          </button>
+          <input type="range" id="volume" min="0" max="1" step="0.05" value="1" aria-label="Volume">
+        </div>
+        <button class="ctl icon-ctl" data-action="theater" id="theater-btn" aria-pressed="false" title="Theater view (T)" aria-label="Theater view">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="3.5" width="13" height="9" rx="1"/></svg>
+        </button>
+        <button class="ctl icon-ctl" data-action="fullscreen" id="fs-btn" aria-pressed="false" title="Full screen (F)" aria-label="Full screen">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4"/></svg>
+        </button>
+      </div>
+      <div class="loop-note" id="loop-note" hidden></div>
+      </div>
+    </div>
+
+    <div class="panel decision" id="decision"></div>
+    </div>
+
+    <div class="panel" id="audio-panel">
+      <button class="fold" data-action="toggle" data-key="audioOpen">
+        <span class="head-left"><span class="h2">Audio</span><span class="muted small" id="audio-summary"></span></span>
+        <span class="muted chev" id="audio-chev">Show ▾</span>
+      </button>
+      <div id="audio" hidden></div>
+    </div>
+
+    <div class="panel" id="settings-panel">
+      <button class="fold" data-action="toggle" data-key="settingsOpen" id="settings-toggle" aria-expanded="true" aria-controls="settings">
+        <span class="head-left"><span class="h2">Settings</span><span class="warn-tag">⚠ all shots</span><span class="muted small" id="settings-summary"></span></span>
+        <span class="muted chev" id="settings-chev">Hide ▴</span>
+      </button>
+      <div id="settings"></div>
+    </div>
+
+    <div class="panel" id="advanced-panel">
+      <button class="fold" data-action="toggle" data-key="advOpen" id="adv-toggle" aria-expanded="false" aria-controls="advanced">
+        <span class="head-left"><span class="h2">Advanced</span><span class="warn-tag">⚠ all shots</span><span class="muted small" id="adv-summary"></span></span>
+        <span class="muted chev" id="adv-chev">Show ▾</span>
+      </button>
+      <div id="advanced" hidden></div>
+    </div>
+
+    <div class="panel" id="plan-panel">
+      <div class="panel-head">
+        <h2>Plan</h2>
+        <button class="ghost sm" data-action="dry-run" id="dry-btn">Dry run · full prompts</button>
+      </div>
+      <div id="plan" class="plan"></div>
+    </div>
+  </aside>
+</main>
+
+<div id="modal" class="modal" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="dialog-head">
+      <h3 id="modal-title"></h3>
+      <button class="ghost close" data-action="close-modal" aria-label="Close">
+        <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg>
+      </button>
+    </div>
+    <div id="modal-body" class="modal-body"></div>
+  </div>
+</div>
+
+<div id="editor" class="modal editor-wrap" hidden>
+  <div class="dialog editor" role="dialog" aria-modal="true" aria-labelledby="editor-title">
+    <div class="dialog-head">
+      <h3 id="editor-title">Edit reference</h3>
+      <button class="ghost close" data-action="editor-cancel" aria-label="Cancel">
+        <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg>
+      </button>
+    </div>
+    <div class="editor-grid">
+      <button class="editor-img" id="editor-img" data-action="editor-zoom" title="Enlarge"></button>
+      <div class="editor-fields">
+        <div><span class="pic" id="editor-pic"></span> <span class="muted small">set automatically from the order of active references</span></div>
+        <label class="lbl">Label <input class="field" id="editor-label" spellcheck="false"></label>
+        <label class="lbl editor-desc-lbl">Description
+          <textarea class="field" id="editor-desc" rows="8"></textarea></label>
+        <div class="muted small" id="editor-file"></div>
+      </div>
+    </div>
+    <div class="dialog-actions">
+      <span class="muted small push-left">Esc cancels · <span id="editor-key">Ctrl+Enter</span> saves</span>
+      <button class="ghost" data-action="editor-cancel">Cancel</button>
+      <button class="primary sm-primary" data-action="editor-save">Save</button>
+    </div>
+  </div>
+</div>
+
+<div id="lightbox" class="lightbox" hidden>
+  <div class="lb-head">
+    <span class="pic" id="lb-pic"></span><b id="lb-title"></b><span class="muted small" id="lb-file"></span>
+    <button class="ghost close" data-action="lb-close" aria-label="Close">
+      <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg>
+    </button>
+  </div>
+  <div class="lb-stage" id="lb-stage"><img id="lb-img" alt="" draggable="false"></div>
+  <div class="lb-foot muted small">Scroll to zoom · drag to pan · double-click to reset · ← → other references · Esc closes</div>
+</div>
+
+<div id="confirm" class="modal confirm-wrap" hidden>
+  <div class="dialog confirm" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
+    <h3 id="confirm-title"></h3>
+    <p id="confirm-body"></p>
+    <div class="dialog-actions">
+      <button class="ghost" id="confirm-no"></button>
+      <button class="primary sm-primary" id="confirm-yes"></button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+</div>
+<script src="/longshot/static/studio.js"></script>
+</body>
+</html>
