@@ -51,7 +51,7 @@ const uid = (p) => p + Date.now().toString(36) + (uidN++).toString(36);
 
 const S = {
   project: null, projects: [], opts: null, local: false,
-  conn: "connecting", open: null, styleOpen: false, audioOpen: false, advOpen: false, settingsOpen: true, uploading: {},
+  conn: "connecting", open: null, takes: {}, styleOpen: false, audioOpen: false, advOpen: false, settingsOpen: true, uploading: {},
   busy: null, error: null, loop: false, dry: null, saveState: "",
   refState: {}, refInfo: {}, inputs: null, segStats: null, conflict: null, checkedFor: null,
 };
@@ -80,7 +80,14 @@ function normalize(p) {
     seconds: Number(s.seconds) || 5, shot_seed: s.shot_seed ?? -1, bypassed: !!s.bypassed,
     status: ["approved", "review", "queued"].includes(s.status) ? s.status : "queued",
     was_approved: !!s.was_approved, was_rendered: !!s.was_rendered,
-    prev_seeds: Array.isArray(s.prev_seeds) ? s.prev_seeds.slice(-10) : [] }));
+    prev_seeds: Array.isArray(s.prev_seeds) ? s.prev_seeds.slice(-10) : [],
+    take: s.take || null, window: s.window || null, take_seconds: s.take_seconds ?? null,
+    join: s.join === "cut" ? "cut" : "bridge",
+    kind: s.kind === "clip" ? "clip" : "shot",
+    clip: s.kind === "clip" ? Object.assign({ file: "", subfolder: "", original_name: "", sha256: null,
+      size_bytes: null, trim_in: 0, frames: 0, duration: null, fps: null, width: null, height: null,
+      has_audio: false, audio: "mute" }, s.clip || {}) : null }));
+  for (const s of p.shots) if (s.kind === "clip") s.status = "approved";   // clips are never sampled
   p.audio = Object.assign({ file: null, subfolder: "", type: "input", size_bytes: null, sha256: null,
     original_name: null, start: 0, length: 0, lip_sync: false, voice_ref: false,
     final_override: false, melband_model: "Infinite Talk\\MelBandRoformer_fp16.safetensors" }, p.audio || {});
@@ -106,7 +113,10 @@ const clock = (iso) => (iso || "").slice(11, 16);
 
 /** Non-bypassed references whose file is gone (or never chosen). */
 function missingRefs() {
-  return liveCast().filter((c) => !c.image || ["missing", "invalid"].includes(S.refState[c.id]));
+  const clips = active().filter((s) => s.kind === "clip" &&
+    (!s.clip.file || ["missing", "invalid"].includes(S.refState["clip:" + s.id])))
+    .map((s) => ({ label: titleOf(s) + "'s clip" }));
+  return liveCast().filter((c) => !c.image || ["missing", "invalid"].includes(S.refState[c.id])).concat(clips);
 }
 const audioMissing = () => !!P().audio.file && ["missing", "invalid"].includes(S.refState.audio);
 
@@ -215,8 +225,13 @@ async function loadProject(slug) {
   const p = await api("/longshot/projects/" + encodeURIComponent(slug));
   S.project = normalize(p);
   if (autoPickModels(S.project)) scheduleSave();
+  const relinked = relinkModels(S.project);
+  if (relinked) {
+    scheduleSave();
+    toast(`Found ${relinked} model file${relinked > 1 ? "s" : ""} by name in this machine's model folders.`);
+  }
   Object.assign(S, { dry: null, error: null, loop: false, conflict: null, refState: {}, refInfo: {},
-    segStats: null, checkedFor: null });
+    segStats: null, checkedFor: null, takes: {} });
   $("conflict").hidden = true;
   S.saveState = p.saved_at ? "Saved · " + clock(p.saved_at) : "";
   S.open = (reviewShot() || nextQueued() || {}).id || null;
@@ -244,6 +259,11 @@ async function checkInputs() {
   const files = p.cast.filter((c) => c.image).map((c) =>
     ({ key: c.id, name: c.image, subfolder: c.subfolder, sha256: c.sha256 }));
   if (p.audio.file) files.push({ key: "audio", name: p.audio.file, subfolder: p.audio.subfolder, sha256: p.audio.sha256 });
+  for (const sh of p.shots) {
+    if (sh.kind === "clip" && sh.clip.file) {
+      files.push({ key: "clip:" + sh.id, name: sh.clip.file, subfolder: sh.clip.subfolder, sha256: sh.clip.sha256 });
+    }
+  }
   if (!files.length) { S.refState = {}; return; }
   let res;
   try { res = await api("/longshot/check-inputs", { method: "POST", body: { files } }); } catch (e) { return; }
@@ -252,12 +272,18 @@ async function checkInputs() {
   for (const f of res.files) {
     state[f.key] = f.state;
     S.refInfo[f.key] = f;
-    const item = f.key === "audio" ? p.audio : p.cast.find((c) => c.id === f.key);
+    const item = f.key === "audio" ? p.audio : f.key.startsWith("clip:") ? refItem(f.key) : p.cast.find((c) => c.id === f.key);
     if (!item) continue;
     if (f.state === "ok" && f.sha256 && !item.sha256) {      // first check: remember the hash
       item.sha256 = f.sha256;
       item.size_bytes = f.size_bytes;
       adopted = true;
+    }
+    if (f.state === "changed" && f.key.startsWith("clip:")) {
+      const sh = p.shots.find((x) => x.id === f.key.slice(5));
+      item.sha256 = f.sha256;
+      if (sh && !sh.bypassed) { bridgeAround(sh); p.preview_dirty = true; adopted = true; }
+      continue;
     }
     if (f.state === "changed" && !(f.key === "audio" ? false : item.bypassed)) changed.push(f.key);
   }
@@ -267,6 +293,77 @@ async function checkInputs() {
     sharedChanged("A reference file");
   }
   if (adopted) scheduleSave();
+  await relinkMissing();
+}
+
+/** A missing reference copied back into the project's input folder (or the
+ *  input folder) relinks by itself: silently when it's the same file, after
+ *  asking when only the name matches (a different picture re-renders). */
+let relinking = false;
+async function relinkMissing() {
+  const p = P();
+  if (!p || relinking) return;
+  const lost = [];
+  for (const [key, st] of Object.entries(S.refState)) {
+    if (st !== "missing" && st !== "invalid") continue;
+    const item = refItem(key);
+    if (item) lost.push({ key, name: item.original_name || refName(key), sha256: item.sha256 });
+  }
+  if (!lost.length) return;
+  relinking = true;
+  try {
+    let res;
+    try { res = await api("/longshot/find-inputs", { method: "POST", body: { project: p.slug, files: lost } }); }
+    catch (e) { return; }
+    let quiet = 0;
+    for (const f of res.files) {
+      const item = refItem(f.key);
+      if (!item || P() !== p) continue;
+      if (f.match === "name") {
+        const ok = await confirmBox({ title: `Use ${f.name}?`,
+          body: `${refLabel(f.key)} is missing. A file with the same name is in ${f.subfolder ? "input/" + f.subfolder : "the input folder"}, ` +
+            "but it isn't the same file that was saved, so every Shot will render again.",
+          yes: "Use it", no: "Not now" });
+        if (!ok) continue;
+      }
+      setRefFile(f.key, f);
+      S.refState[f.key] = "ok";
+      S.refInfo[f.key] = Object.assign({ state: "ok" }, f);
+      if (f.match === "name" && refMatters(f.key)) sharedChanged(f.key === "audio" ? "Audio" : "Cast & Scenes");
+      else quiet++;
+    }
+    if (quiet) toast(`Found ${quiet} missing file${quiet > 1 ? "s" : ""} again — relinked, nothing re-renders.`);
+    await loadInputs();
+    commit();
+  } finally { relinking = false; }
+}
+
+function refItem(key) {
+  const p = P();
+  if (key === "audio") return p.audio;
+  if (key.startsWith("clip:")) { const sh = p.shots.find((x) => x.id === key.slice(5)); return sh && sh.clip; }
+  return p.cast.find((c) => c.id === key);
+}
+function refName(key) { const it = refItem(key); return key === "audio" ? it.file : key.startsWith("clip:") ? it.file : it.image; }
+function refLabel(key) {
+  if (key === "audio") return "The song";
+  if (key.startsWith("clip:")) { const sh = P().shots.find((x) => x.id === key.slice(5)); return sh ? `${titleOf(sh)}'s clip` : "A clip"; }
+  const c = refItem(key);
+  return c && c.label ? c.label : "A reference";
+}
+function refMatters(key) {
+  const p = P();
+  if (key === "audio") return p.audio.lip_sync || p.audio.voice_ref;
+  if (key.startsWith("clip:")) return true;
+  const c = refItem(key);
+  return c && !c.bypassed;
+}
+function setRefFile(key, f) {
+  const it = refItem(key);
+  if (key === "audio") it.file = f.name;
+  else if (key.startsWith("clip:")) it.file = f.name;
+  else it.image = f.name;
+  Object.assign(it, { subfolder: f.subfolder, sha256: f.sha256, size_bytes: f.size_bytes, original_name: f.name });
 }
 
 /** After a successful render, the files it used become the saved versions. */
@@ -298,13 +395,41 @@ async function autoCheck() {
   } catch (e) { return; }
   S.checkedFor = p.slug;
   const upto = done[done.length - 1].id;
-  queue({ upto, dry: true, kind: "check", label: "Checking saved segments…", note: "Nothing is sampled",
+  queue({ upto, dry: true, kind: "check", label: "Checking saved takes…", note: "Nothing is sampled",
     onDone: ({ rows, built }) => { S.dry = { rows, text: "", chain: built.chain }; } });
 }
 
 // ---------------------------------------------------------------------------
 // Invalidation rules
 // ---------------------------------------------------------------------------
+
+/** With lip sync, anything that moves later Shots on the timeline moves them
+ *  against the song: they render again to stay in sync (spec 2.4). */
+function syncAfter(s, what) {
+  const a = P().audio;
+  if (!a.lip_sync || !a.file) return false;
+  const after = renderedAfter(s);
+  if (!after.length) return false;
+  rippleAfter(s);
+  const n0 = numOf(after[0].id), n1 = numOf(after[after.length - 1].id);
+  toast(`${what} — ${after.length > 1 ? `Shots ${n0}–${n1}` : `Shot ${n0}`} will re-render to stay in sync with the song.`);
+  return true;
+}
+
+/** Editing a rendered Shot re-renders it in place; the Shots after it keep their takes. */
+function editInPlace(s, field) {
+  const wasRendered = s.status !== "queued";
+  s.status = "queued";
+  S.dry = null;
+  if (field === "seconds" && syncAfter(s, `${titleOf(s)} changed length`)) return;
+  const after = renderedAfter(s);
+  if (wasRendered && after.length) {
+    const n0 = numOf(after[0].id), n1 = numOf(after[after.length - 1].id);
+    const range = after.length > 1 ? `Shots ${n0}–${n1}` : `Shot ${n0}`;
+    toast(`${titleOf(s)} will re-render in place; ${range} keep${after.length > 1 ? "" : "s"} ${after.length > 1 ? "their takes" : "its take"}.`,
+      { label: `Re-render ${range} too`, fn: () => { rippleAfter(s); commit(); } });
+  }
+}
 
 /** Editing a Shot: it and every Shot after it are queued again. */
 function queueFrom(id, includeSelf = true) {
@@ -334,6 +459,41 @@ function sharedChanged(what, quiet = false) {
 // Rendering a step: build → /prompt → /ws progress → /history
 // ---------------------------------------------------------------------------
 
+/** Round 2: Shots under review or approved load their take (locked); a Shot
+ *  re-rendered without changing its length keeps its exact window. */
+function sendable(project) {
+  const p = JSON.parse(JSON.stringify(project));
+  // Auto seeds follow base + position - 1, but never repeat a seed another Shot
+  // already froze (a Shot added before Shot 1 would otherwise get Shot 1's).
+  const used = new Set(p.shots.filter((s) => Number(s.shot_seed) >= 0).map((s) => Number(s.shot_seed)));
+  const base = Number(p.settings.seed) || 0;
+  p.shots.filter((s) => !s.bypassed).forEach((s, i) => {
+    if (s.kind === "clip" || Number(s.shot_seed) >= 0) return;
+    if (p.settings.seed_mode === "same") { s.shot_seed = base; return; }
+    let seed = (base + i) % (SEED_MAX + 1);
+    while (used.has(seed)) seed = (seed + 1) % (SEED_MAX + 1);
+    used.add(seed);
+    s.shot_seed = seed;
+  });
+  for (const s of p.shots) {
+    if (s.kind === "clip") { s.lock = null; s.frames = null; continue; }
+    s.lock = (s.status === "approved" || s.status === "review") && s.take ? s.take : null;
+    s.frames = s.window && Number(s.take_seconds) === Number(s.seconds) ? s.window : null;
+  }
+  return p;
+}
+
+const isRendered = (s) => s.kind === "clip" || (s.status !== "queued" && !!s.take);
+
+/** The chain reaches past the target to the last rendered Shot, so the target
+ *  is pinned to what follows it and the preview shows the whole film. */
+function chainEnd(targetId) {
+  const act = active();
+  let end = act.findIndex((s) => s.id === targetId);
+  act.forEach((s, i) => { if (isRendered(s) && i > end) end = i; });
+  return end >= 0 ? act[end].id : targetId;
+}
+
 async function queue({ upto, dry, kind, label, note, onDone, final = false }) {
   if (S.busy) return;
   if (Object.keys(S.uploading).length) { toast("Wait for the image upload to finish."); return; }
@@ -344,7 +504,20 @@ async function queue({ upto, dry, kind, label, note, onDone, final = false }) {
     render();
     return;
   }
-  let project = P();
+  const lost = missingModels(P());
+  if (lost.length) {
+    S.error = `Model file${lost.length > 1 ? "s" : ""} not found in ComfyUI's model folders: ${lost.join(", ")}. ` +
+      `Choose ${lost.length > 1 ? "them" : "it"} under Advanced (Browse… can also add a folder ComfyUI doesn't know about).`;
+    if (!lost.every((x) => x.startsWith("Vocal"))) S.advOpen = true;
+    else S.audioOpen = true;
+    render();
+    const first = document.querySelector(".pick.missing-file");
+    if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
+    return;
+  }
+  let project = sendable(P());
+  const target = upto;
+  if (kind === "render" || kind === "reroll" || kind === "refresh") upto = chainEnd(upto);
   if (audioMissing() && (project.audio.lip_sync || project.audio.voice_ref || project.audio.final_override)) {
     project = Object.assign({}, project, { audio: Object.assign({}, project.audio,
       { lip_sync: false, voice_ref: false, final_override: false }) });
@@ -369,12 +542,12 @@ async function queue({ upto, dry, kind, label, note, onDone, final = false }) {
     render();
     return;
   }
-  if (kind === "render" || kind === "reroll" || kind === "final") saveNow();   // approvals / new seed survive a closed tab
+  if (kind === "render" || kind === "reroll" || kind === "final" || kind === "refresh") saveNow();   // approvals / new seed survive a closed tab
   S.busy = {
-    promptId: res.prompt_id, kind, target: upto, label, note, baseNote: note, built, onDone,
+    promptId: res.prompt_id, kind, target, label, note, baseNote: note, built, onDone,
     of: built.chain.length, segs: {}, segT0: {}, step: 0, phase: "queued", started: Date.now(),
   };
-  if (kind === "render" || kind === "reroll") S.open = upto;
+  if (kind === "render" || kind === "reroll") S.open = target;
   render();
   pollLater();
 }
@@ -422,6 +595,7 @@ async function finish(promptId, entry) {
     }
   }
   S.busy = null;
+  if (b.kind === "render" || b.kind === "reroll" || b.kind === "refresh") S.takes = {};   // take lists changed
   const status = (entry && entry.status) || {};
   const msgs = status.messages || [];
   const failed = msgs.find((m) => m[0] === "execution_error");
@@ -458,11 +632,24 @@ async function finish(promptId, entry) {
     }
   }
   render();
-  if (b.kind === "render" || b.kind === "reroll" || b.kind === "final") {
+  if (b.kind === "render" || b.kind === "reroll" || b.kind === "final" || b.kind === "refresh") {
     if (!S.error) adoptCurrentFiles();
     loadSegStats().then(renderSettings);
     saveNow();                       // save right after every finished render
   } else scheduleSave();
+}
+
+/** Every rendered piece keeps its take, window and (frozen) seed. */
+function adoptRows(rows) {
+  const byId = new Map(P().shots.map((x) => [x.id, x]));
+  for (const r of rows) {
+    const sh = r.id && byId.get(r.id);
+    if (!sh || !r.take || sh.kind === "clip") continue;
+    sh.take = r.take;
+    sh.window = r.window_frames;
+    sh.take_seconds = Number(sh.seconds);
+    if (!(Number(sh.shot_seed) >= 0) && r.seed !== null && r.seed !== undefined) sh.shot_seed = r.seed;
+  }
 }
 
 function onRendered(targetId) {
@@ -470,42 +657,72 @@ function onRendered(targetId) {
     const combine = outputs[built.nodes.combine] || {};
     const video = (combine.gifs || combine.videos || [])[0];
     if (!video) throw new Error("Video Combine saved no file.");
+    adoptRows(rows);
     for (const s of P().shots) {
       if (built.chain.includes(s.id) && s.id !== targetId && s.status === "queued") {
-        s.status = "approved";
+        // rendered on the way to the target (or past it, to the last rendered Shot)
+        s.status = s.was_approved ? "approved" : "review";
         s.was_approved = s.was_rendered = false;
       }
     }
-    const target = P().shots.find((s) => s.id === targetId);
-    if (target) { target.status = "review"; target.was_rendered = false; }
+    const target = targetId && P().shots.find((s) => s.id === targetId);
+    if (target) { target.status = "review"; target.was_rendered = false; target.was_approved = false; }
     const at = new Date().toISOString();
     P().last_output = { video, plan: rows, chain: built.chain, text,
       size: [built.width, built.height], at, source_at: at };
+    P().preview_dirty = false;
     S.dry = null;
-    S.open = targetId;
-    const row = rows[built.chain.indexOf(targetId)];
-    loadVideo(row ? row.start + 0.04 : 0);
+    if (targetId) S.open = targetId;
+    const row = targetId ? rows[built.chain.indexOf(targetId)] : null;
+    loadVideo(row ? row.start + 0.04 : video.currentTime || 0);
+    const cuts = rows.filter((r) => r.seam === "mismatch").map((r) => r.index);
+    if (cuts.length) {
+      toast(`Hard cut before Shot ${cuts.join(", ")}: it was continued from a different take. ` +
+            "Reroll that Shot to bridge the join.");
+    }
   };
+}
+
+/** The preview no longer shows the timeline: a Shot was removed, bypassed,
+ *  moved or switched to another take. Updating it samples nothing. */
+function previewStale() {
+  const lo = last();
+  const done = active().filter(isRendered);
+  if (!lo || !done.length || active().some((s) => s.status === "queued")) return false;
+  if (P().preview_dirty) return true;
+  const shown = lo.plan.map((r) => r.kind === "clip" ? `${r.id}:clip` : `${r.id || ""}:${r.take || ""}`).join("|");
+  return shown !== done.map((s) => s.kind === "clip" ? `${s.id}:clip` : `${s.id}:${s.take}`).join("|");
+}
+
+function refreshPreview() {
+  const done = active().filter(isRendered);
+  if (!done.length || S.busy) return;
+  queue({ upto: done[done.length - 1].id, kind: "refresh", label: "Updating the preview",
+    note: "Every Shot loads its take · nothing is sampled", onDone: onRendered(null) });
 }
 
 function primary() {
   const rv = reviewShot(), nx = nextQueued();
   if (rv) { rv.status = "approved"; rv.was_approved = false; }
+  if (!nx && previewStale()) { refreshPreview(); return; }
   if (!nx) { scheduleSave(); render(); return; }
   const n = numOf(nx.id);
-  const reused = n > 1 ? `Shots 1–${n - 1} reused from memory · only Shot ${n} renders` : "Rendering Shot 1";
+  const others = active().filter((x) => x !== nx && isRendered(x)).length;
   queue({ upto: nx.id, kind: "render", label: "Rendering Shot " + n,
-    note: n === 2 ? "Shot 1 reused from memory · only Shot 2 renders" : reused, onDone: onRendered(nx.id) });
+    note: others ? `${others} Shot${others > 1 ? "s" : ""} load${others > 1 ? "" : "s"} ${others > 1 ? "their" : "its"} take · only Shot ${n} renders`
+      : n > 1 ? `Shots 1–${n - 1} reused · only Shot ${n} renders` : "Rendering Shot 1",
+    onDone: onRendered(nx.id) });
 }
 
 function reroll() {
   const rv = reviewShot();
   if (!rv || S.busy) return;
+  rememberTake(rv);
   rv.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
+  rv.status = "queued";
   const n = numOf(rv.id);
   queue({ upto: rv.id, kind: "reroll", label: `Re-rolling Shot ${n} · seed ${rv.shot_seed}`,
-    note: n > 1 ? (n === 2 ? "Shot 1 reused from memory" : `Shots 1–${n - 1} reused from memory`) : "",
-    onDone: onRendered(rv.id) });
+    note: "Every other Shot keeps its take", onDone: onRendered(rv.id) });
 }
 
 function dryRun() {
@@ -540,6 +757,7 @@ function connect() {
     S.conn = "ok";
     if (S.restarting) afterRestart();
     renderHeader(); renderDecision();
+    pollStats();
     if (S.busy) pollLater(); else autoCheck();
   };
   ws.onclose = () => { S.conn = S.restarting ? "restarting" : "down"; renderHeader(); renderDecision(); retry(); };
@@ -589,7 +807,8 @@ function onSegment(b, d) {
   const cur = b.current && b.segs[b.current.segment] === "rendering" ? b.current.segment : null;
   if (cur) {
     const srcs = [...new Set(reused.map((k) => (b.sources || {})[k] || "memory"))];
-    const from = srcs.length === 1 ? srcs[0] : "memory and disk";
+    const word = (x) => (x === "take" ? "saved takes" : x);
+    const from = srcs.length === 1 ? word(srcs[0]) : "takes, memory and disk";
     const r = reused.length ? (reused.length === 1 ? `Shot ${reused[0]} reused from ${from} · `
       : `Shots ${reused[0]}–${reused[reused.length - 1]} reused from ${from} · `) : "";
     b.note = `${r}Shot ${cur} of ${b.of} rendering`;
@@ -919,11 +1138,30 @@ const LOOK = {
   rendering: { icon: "◌", label: "Rendering…", dot: "#3A3D44", fg: "#E9E7E2", chipBg: "#2A2C31", chipFg: "#E9E7E2" },
   queued: { icon: "○", label: "Queued", dot: "#24262B", fg: "#8E9198", chipBg: "transparent", chipFg: "#A3A6AD" },
   bypassed: { icon: "⏻", label: "Bypassed", dot: "#2B2240", fg: "#C9B6FF", chipBg: "#2B2240", chipFg: "#C9B6FF" },
+  clip: { icon: "▶", label: "Clip", dot: "#1E3A4A", fg: "#8FD3F0", chipBg: "#16303D", chipFg: "#8FD3F0" },
 };
+
+/** The marker between two pieces when one of them is a clip: Bridge ↔ / Cut |. */
+function joinMark(prev, s) {
+  const both = prev.kind === "clip" && s.kind === "clip";
+  const cut = both || s.join === "cut";
+  const why = both ? "Two clips always meet with a cut." : cut
+    ? "Hard cut: the Shots keep their takes." : "Bridge: the generated Shot flows into / out of the clip.";
+  return `<div class="join-mark${cut ? " cut" : ""}" data-shot="${esc(s.id)}">
+    <button class="join-btn" data-action="toggle-join"${both ? " disabled" : ""} title="${esc(why)} Click to switch.">${cut ? "Cut |" : "Bridge ↔"}</button>
+    <span class="muted small">${esc(why)}</span></div>`;
+}
 
 function renderShots() {
   const rid = renderingId();
+  let prevActive = null;
   $("shots").innerHTML = P().shots.map((s) => {
+    let mark = "";
+    if (!s.bypassed) {
+      if (prevActive && (prevActive.kind === "clip" || s.kind === "clip")) mark = joinMark(prevActive, s);
+      prevActive = s;
+    }
+    if (s.kind === "clip") return mark + clipCard(s);
     const state = s.bypassed ? "bypassed" : s.id === rid ? "rendering" : s.status;
     const L = LOOK[state];
     const title = s.bypassed ? "Bypassed" : "Shot " + numOf(s.id);
@@ -932,8 +1170,12 @@ function renderShots() {
     const chipBorder = state === "queued" ? "#33363C" : "transparent";
     const flag = s.was_approved && s.status !== "approved" ? '<span class="flag" title="Approved before; re-renders with its seed">was ✓</span>'
       : s.was_rendered && s.status === "queued" ? '<span class="flag" title="Rendered before; re-renders with its seed">was ●</span>' : "";
-    const canReroll = !s.bypassed && s.status === "approved" && !!lastRowFor(s.id);
-    const prev = (s.prev_seeds || []).slice(-3).reverse();
+    const canReroll = !s.bypassed && s.status === "approved" && (!!s.take || !!lastRowFor(s.id));
+    const row = lastRowFor(s.id);
+    const cut = !s.bypassed && s.status !== "queued" && row && row.seam === "mismatch"
+      ? '<span class="flag cut" title="This Shot was continued from a different take of the Shot before it, so the join is a hard cut.">↯ hard cut</span>' : "";
+    const bridge = cut ? `<button class="ghost sm bridge" data-action="bridge" title="Re-render ${title} in place so it flows from the Shot before it; the Shots after it stay">Bridge</button>` : "";
+    const takes = !s.bypassed && s.status !== "queued" ? takeNav(s) : "";
     const body = open ? `<div class="shot-body">
         <textarea class="field" data-shot-field="text" rows="6" aria-label="${title} text">${esc(s.text)}</textarea>
         <div class="shot-opts">
@@ -943,19 +1185,27 @@ function renderShots() {
           <button class="ghost sm" data-action="wrap" data-before="&quot;" data-after="&quot;">Wrap "on-screen text"</button>
           ${canReroll ? '<button class="ghost sm" data-action="reroll-shot">⟳ Reroll this Shot</button>' : ""}
         </div>
-        ${prev.length ? `<div class="prev-seed">Earlier takes: ${prev.map((x) => `<button data-action="use-seed" data-seed="${esc(x)}" title="Set this seed (re-renders this Shot and the ones after it)">${esc(x)}</button>`).join(" · ")}</div>` : ""}
+        <div class="shot-opts shot-more">
+          ${takes}
+          <span class="push"></span>
+          <button class="ghost sm" data-action="insert-before" title="Insert a new Shot before this one">⊕ Shot before</button>
+          <button class="ghost sm" data-action="insert-after" title="Insert a new Shot after this one">⊕ Shot after</button>
+          <button class="ghost sm" data-action="insert-clip-after" title="Insert a video clip after this Shot">⊕ Clip after</button>
+          <button class="ghost sm" data-action="replace-clip" title="Put a video clip in this Shot's place (the Shot is kept, bypassed)">Replace with clip</button>
+        </div>
         </div>` : "";
-    return `<div class="shot${state === "review" ? " review" : ""}${s.bypassed ? " off" : ""}" data-shot="${esc(s.id)}">
+    return mark + `<div class="shot${state === "review" ? " review" : ""}${s.bypassed ? " off" : ""}" data-shot="${esc(s.id)}">
       <div class="shot-row">
         <button class="shot-head" data-action="toggle-shot" aria-expanded="${open}">
           <span class="sdot" style="background:${L.dot};color:${L.fg}">${L.icon}</span>
           <span class="stitle">${title}</span>
           <span class="smeta">${esc(s.seconds)}s · seed ${esc(seed)}</span>
           <span class="sprev">${esc(s.text) || '<i class="muted">empty</i>'}</span>
-          ${flag}
+          ${flag}${cut}
           <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span>
         </button>
         <div class="shot-tools">
+          ${bridge}
           ${canReroll ? `<button class="icon lg reroll" data-action="reroll-shot" title="Reroll ${title} (new seed)" aria-label="Reroll ${title}">⟳</button>` : ""}
           <button class="icon lg${s.bypassed ? " on" : ""}" data-action="bypass-shot" aria-pressed="${s.bypassed}" title="${s.bypassed ? "Turn shot back on" : "Bypass shot"}">${POWER}</button>
           <button class="icon lg x" data-action="remove-shot" title="Remove" aria-label="Remove ${title}">${CROSS}</button>
@@ -963,6 +1213,36 @@ function renderShots() {
       </div>${body}</div>`;
   }).join("");
   $("add-shot").innerHTML = `${PLUS} Add Shot ${active().length + 1}`;
+  const first = $("add-first");
+  first.hidden = !P().shots.length;
+  first.innerHTML = `${PLUS} Add shot before Shot 1`;
+  $("add-first-clip").hidden = !P().shots.length;
+}
+
+function clipCard(s) {
+  const state = s.bypassed ? "bypassed" : "clip";
+  const L = LOOK[state];
+  const title = s.bypassed ? "Bypassed" : "Shot " + numOf(s.id);
+  const open = S.open === s.id;
+  const missing = ["missing", "invalid"].includes(S.refState["clip:" + s.id]);
+  const row = lastRowFor(s.id);
+  const cut = !s.bypassed && row && row.seam === "mismatch"
+    ? '<span class="flag cut" title="The Shot before this clip doesn\'t lead into it yet. Render it (or switch this join to Cut).">↯ not bridged</span>' : "";
+  return `<div class="shot clip${s.bypassed ? " off" : ""}${missing ? " missing" : ""}" data-shot="${esc(s.id)}">
+    <div class="shot-row">
+      <button class="shot-head" data-action="toggle-shot" aria-expanded="${open}">
+        <span class="sdot" style="background:${L.dot};color:${L.fg}">${L.icon}</span>
+        <span class="stitle">${title}</span>
+        <span class="smeta">${(s.clip.frames / 24).toFixed(2)}s · clip</span>
+        <span class="sprev">${missing ? '<span class="missing">Missing: </span>' : ""}${esc(s.clip.original_name || s.clip.file) || '<i class="muted">no video</i>'}</span>
+        ${cut}
+        <span class="chip" style="background:${L.chipBg};color:${L.chipFg}">${L.label}</span>
+      </button>
+      <div class="shot-tools">
+        <button class="icon lg${s.bypassed ? " on" : ""}" data-action="bypass-shot" aria-pressed="${s.bypassed}" title="${s.bypassed ? "Turn the clip back on" : "Bypass clip"}">${POWER}</button>
+        <button class="icon lg x" data-action="remove-shot" title="Remove" aria-label="Remove ${title}">${CROSS}</button>
+      </div>
+    </div>${open ? clipCardBody(s, title) : ""}</div>`;
 }
 
 function renderViewer() {
@@ -977,8 +1257,10 @@ function renderViewer() {
   // ticks
   $("ticks").innerHTML = lo && total ? lo.plan.map((r, i) => {
     const pct = (r.start / total) * 100;
-    return `<div class="tick" style="left:calc(${pct}% - .5px)"><div></div></div>` +
-      `<div class="tick-label" style="left:calc(${pct}% + 4px)">S${i + 1}</div>`;
+    const band = r.kind === "clip"
+      ? `<div class="clip-band" style="left:${pct}%;width:${((r.end - r.start) / total) * 100}%" title="Clip"></div>` : "";
+    return band + `<div class="tick${r.kind === "clip" ? " clip" : ""}" style="left:calc(${pct}% - .5px)"><div></div></div>` +
+      `<div class="tick-label${r.kind === "clip" ? " clip" : ""}" style="left:calc(${pct}% + 4px)">${r.kind === "clip" ? "▶" : "S"}${i + 1}</div>`;
   }).join("") : "";
   // loop band + note
   const L = loopRange();
@@ -1025,6 +1307,7 @@ function renderDecision() {
   const rv = reviewShot(), nx = nextQueued(), lo = last();
   let line;
   if (rv && nx) line = `Happy with ${titleOf(rv)}? Continue approves it and renders ${titleOf(nx)}.`;
+  else if (rv && renderedAfter(rv).length) line = `Happy with this take of ${titleOf(rv)}? Approve keeps it; the Shots after it are unchanged.`;
   else if (rv) line = `${titleOf(rv)} is the last shot. Approve it to finish the chain.`;
   else if (nx && numOf(nx.id) === 1 && !active().some((s) => s.status === "approved")) {
     line = nx.was_approved ? "A shared change needs every shot rendered again. Render Shot 1 to start."
@@ -1048,15 +1331,28 @@ function renderDecision() {
         : "All shots approved. Install ComfyUI-NVIDIA-RTX-VSR-Pro to upscale the final video.";
   }
   const v = P().settings.rtx_vsr;
-  const label = nx ? (rv ? "✓ Continue → " : "▶ Render ") + titleOf(nx) : rv ? "✓ Approve & finish"
-    : allDone && vsrOk ? `⤢ Upscale final video (${v.scale}× ${v.quality})${fin ? " again" : ""}` : "All done";
-  const primaryAction = allDone && vsrOk ? "final" : "primary";
+  const stale = !nx && previewStale();
+  if (stale && !rv) line = "The timeline changed since the last preview. Update it: every Shot loads its take, nothing is sampled.";
+  // [ ✓ Approve 25% ][ main action 50% ][ ⟳ Reroll 25% ]
+  let mainLabel, mainAction, mainOff = false;
+  if (rv && nx) { mainLabel = `✓ Approve & render ${titleOf(nx)}`; mainAction = "primary"; }
+  else if (rv && stale) { mainLabel = "✓ Approve & update preview"; mainAction = "primary"; }
+  else if (rv && vsrOk) { mainLabel = `✓ Approve & upscale final (${v.scale}×)`; mainAction = "approve-final"; }
+  else if (rv) { mainLabel = "✓ Approve & finish"; mainAction = "primary"; }
+  else if (nx) { mainLabel = "▶ Render " + titleOf(nx); mainAction = "primary"; }
+  else if (stale) { mainLabel = "▶ Update preview"; mainAction = "primary"; }
+  else if (allDone && vsrOk) { mainLabel = `⤢ Upscale final video (${v.scale}× ${v.quality})${fin ? " again" : ""}`; mainAction = "final"; }
+  else { mainLabel = "All done"; mainAction = "primary"; mainOff = true; }
   const off = S.conn !== "ok" || missing.length > 0;
   if (S.conn !== "ok") line = "ComfyUI isn't connected. Rendering waits until it's back.";
-  el.innerHTML = `${errBox}<div class="dec-line">${esc(line)}</div><div class="dec-btns">
-    <button class="primary go" data-action="${primaryAction}"${(!rv && !nx && primaryAction !== "final") || off ? " disabled" : ""}>${esc(label)}</button>
-    <button class="ghost" data-action="reroll"${!rv || off ? " disabled" : ""}>⟳ Reroll ${esc(titleOf(rv))}</button>
-    ${thr ? `<button class="ghost through" data-action="render-through"${off ? " disabled" : ""}>⟳ Re-render through ${esc(titleOf(thr))}</button>` : ""}</div>`;
+  const sub = [rv ? takeNav(rv) : "",
+    thr ? `<button class="ghost sm through" data-action="render-through"${off ? " disabled" : ""}>⟳ Re-render through ${esc(titleOf(thr))}</button>` : ""].filter(Boolean).join("");
+  el.innerHTML = `${errBox}<div class="dec-line">${esc(line)}</div>
+    <div class="dec-row3">
+      <button class="ghost approve" data-action="approve" title="Approve ${esc(titleOf(rv))} without rendering anything"${!rv || off ? " disabled" : ""}>✓ Approve</button>
+      <button class="primary go" data-action="${mainAction}"${mainOff || off ? " disabled" : ""}>${esc(mainLabel)}</button>
+      <button class="ghost" data-action="reroll" title="Reroll ${esc(titleOf(rv))}"${!rv || off ? " disabled" : ""}>⟳ Reroll</button>
+    </div>${sub ? `<div class="dec-sub">${sub}</div>` : ""}`;
   layoutStage();
 }
 
@@ -1155,8 +1451,9 @@ function renderAudio() {
   $("audio").hidden = !S.audioOpen;
   if (!S.audioOpen) { stopPreview(); return; }
   $("audio").innerHTML = `<div style="margin-top:12px">
-      <label class="lbl">Audio file (from ComfyUI's input folder)
-        <select class="field" data-relink="audio">${inputOptions("audio", a.subfolder, a.file, "No audio")}</select></label>
+      <div class="lbl">Audio file <span class="muted small">· drop a song anywhere on this panel</span>
+        <div class="pick"><select class="field" data-relink="audio" aria-label="Audio file">${inputOptions("audio", a.subfolder, a.file, "No audio")}</select>
+          <button class="ghost sm browse" data-action="pick-audio"${S.uploading.audio ? " disabled" : ""}>${S.uploading.audio ? "Uploading…" : "Upload…"}</button></div></div>
       ${audioMissing() ? `<div class="err" style="margin-top:8px"><span>Missing: ${esc(a.original_name || a.file)}. Renders run without the audio routes until you pick the file again.</span></div>`
         : S.refState.audio === "changed" ? '<div class="warnbox" style="margin-top:8px"><span>The audio file changed since it was saved.</span></div>' : ""}
       <div class="shot-opts" style="margin-top:10px">
@@ -1170,7 +1467,9 @@ function renderAudio() {
       <div style="display:flex;flex-direction:column;gap:2px;margin-top:14px">
       ${ROUTES.map(([k, t, r, badge]) => `<div class="route">${switchHTML(a[k], `data-action="audio-route" data-key="${k}" aria-label="${t}"`)}
         <span class="route-text"><b>${t}</b><i>${r}</i></span><span class="badge">${badge}</span></div>`).join("")}
-      </div><div class="muted small" style="margin-top:8px">Pick from audio files in ComfyUI's input folder, or this project's input/longshot/${esc(P().slug)} folder.</div></div>`;
+      </div>
+      ${a.voice_ref ? `<div style="margin-top:10px">${modelField("Vocal separation model (MelBand RoFormer)", "diffusion_models", "melband",
+        `<select data-melband aria-label="Vocal separation model">${fileOptions((S.opts || {}).melband, a.melband_model, "Choose…")}</select>`)}</div>` : ""}<div class="muted small" style="margin-top:8px">Pick from audio files in ComfyUI's input folder, or this project's input/longshot/${esc(P().slug)} folder.</div></div>`;
 }
 
 function sizeOf(s) {
@@ -1193,48 +1492,56 @@ function vsrRamNote(size, scale) {
   return `Needs about ${gb < 10 ? gb.toFixed(1) : Math.round(gb)} GB of system RAM for the full ${secs.toFixed(0)} s at ${scale}×.`;
 }
 
+function browseBtn(kind, target, disabled) {
+  return `<button class="ghost sm browse" data-action="browse-model" data-kind="${kind}" data-target="${esc(target)}"` +
+    ` title="Find the file, or add the folder it's in"${disabled ? " disabled" : ""}>Browse…</button>`;
+}
+
+const OPT_LIST = { diffusion_models: "models", text_encoders: "clips", vae: "vaes", loras: "loras" };
+
+/** True when a chosen model file isn't among ComfyUI's files on this machine. */
+function modelMissing(kind, target) {
+  if (!S.opts) return false;
+  const v = currentFor(target);
+  return !!v && !matchModel(v, S.opts[target === "melband" ? "melband" : OPT_LIST[kind]]);
+}
+
+function modelField(label, kind, target, selectHTML) {
+  const miss = modelMissing(kind, target);
+  return `<div class="lbl" data-model-field="${esc(target)}">${esc(label)}${miss ? ' <span class="missing small">· not found on this machine</span>' : ""}` +
+    `<div class="pick${miss ? " missing-file" : ""}">${selectHTML}${browseBtn(kind, target)}</div></div>`;
+}
+
 function renderSettings() {
   const s = P().settings, o = S.opts || {};
   const vsr = s.rtx_vsr;
   const vsrOk = !S.opts || !S.opts.nodes || S.opts.nodes.RTXVideoSuperResolution !== false;
   const size = sizeOf(s);
   const t = s.turbo;
-  const modelName = (s.model || "no model").split(/[\\/]/).pop().replace(/\.(safetensors|gguf|ckpt|pt)$/i, "");
-  $("settings-summary").textContent = S.settingsOpen ? "" : [modelName, t.on ? "Turbo" : "no Turbo",
+  $("settings-summary").textContent = S.settingsOpen ? "" : [`seed ${s.seed}`,
     `${s.steps} steps`, size ? `${size[0]}×${size[1]}` : `${s.megapixels} MP ${s.aspect}`,
     vsr.on && vsrOk ? `RTX ${vsr.scale}×` : ""].filter(Boolean).join(" · ");
   $("settings-chev").textContent = S.settingsOpen ? "Hide ▴" : "Show ▾";
   $("settings-toggle").setAttribute("aria-expanded", String(!!S.settingsOpen));
   $("settings").hidden = !S.settingsOpen;
   if (!S.settingsOpen) return;
-  const loras = s.loras.map((l, i) => `<div class="lora${l.on ? "" : " off"}">
-      ${switchHTML(l.on, `data-action="lora-on" data-i="${i}" aria-label="LoRA ${i + 1}"`, true)}
-      <select data-lora="${i}" data-k="name" aria-label="LoRA ${i + 1} file"${l.on ? "" : " disabled"} style="flex:1 1 160px">${fileOptions(o.loras, l.name, "Choose a LoRA…")}</select>
-      <label class="strength"><input type="range" min="0" max="2" step="0.05" data-lora="${i}" data-k="strength" value="${esc(l.strength)}"${l.on ? "" : " disabled"} aria-label="LoRA ${i + 1} strength"><output>${Number(l.strength).toFixed(2)}</output></label>
-    </div>`).join("");
-  const warn = !t.on && s.steps < 20 ? `<div class="warnbox" role="alert" style="margin-top:12px">
-      <span style="flex:1">Turbo is off and steps are at ${esc(s.steps)}. Without Turbo, H3 needs about 20 steps or more. Expect a soft, unfinished result.</span>
+  const t2 = s.turbo;
+  const warn = !t2.on && s.steps < 20 ? `<div class="warnbox" role="alert" style="margin-top:12px">
+      <span style="flex:1">Turbo is off (Advanced) and steps are at ${esc(s.steps)}. Without Turbo, H3 needs about 20 steps or more. Expect a soft, unfinished result.</span>
       <button class="ghost sm" data-action="steps20">Set 20 steps</button></div>` : "";
   const mp = (o.megapixels || [0.4, 0.6, 0.9, 1.2]).map((m) =>
     `<option value="${m}"${Number(m) === Number(s.megapixels) ? " selected" : ""}>${m} MP</option>`).join("");
   const asp = (o.aspects || ["16:9"]).map((a) => `<option${a === s.aspect ? " selected" : ""}>${a}</option>`).join("");
   $("settings").innerHTML = `
-    <label class="lbl settings-model">Model ${select('data-set="model"', o.models, s.model, "Choose a model…")}</label>
-    <div class="box">
-      <div class="box-row">
-        ${switchHTML(t.on, 'data-action="turbo-on" aria-label="Turbo LoRA"')}
-        <div style="flex:1;min-width:140px"><div>Turbo LoRA</div>
-          <select data-turbo="lora" aria-label="Turbo LoRA file"${t.on ? "" : " disabled"} style="margin-top:4px;max-width:100%">${fileOptions(o.loras, t.lora, "Choose…")}</select></div>
-        <label class="strength" style="flex:1 1 180px">Strength
-          <input type="range" min="0" max="2" step="0.05" data-turbo="strength" value="${esc(t.strength)}"${t.on ? "" : " disabled"}><output>${Number(t.strength).toFixed(2)}</output></label>
-      </div>${warn}
+    <div class="seed-row">
+      <label class="lbl">Seed · fixed <input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-describedby="seed-help"></label>
+      <span class="muted small" id="seed-help">Feeds every Shot left on auto. Type a seed to go back to it; use Reroll for new takes.</span>
     </div>
-    <div class="loras">${loras}</div>
     <div class="grid3">
       <label class="lbl">Steps <input type="number" min="1" max="200" data-set="steps" data-num value="${esc(s.steps)}"></label>
       <label class="lbl">Resolution <select data-set="megapixels" data-num>${mp}</select></label>
       <label class="lbl">Aspect <select data-set="aspect">${asp}</select></label>
-    </div>
+    </div>${warn}
     <div class="size-out">${size ? `→ ${size[0]} × ${size[1]} output` : "→ size unknown"}${size && vsr.on && vsrOk
       ? ` · <span class="vsr-size">${even(size[0] * vsr.scale)} × ${even(size[1] * vsr.scale)} after RTX Super Resolution</span>` : ""}</div>
     <div class="vsr-row${vsr.on && vsrOk ? "" : " off"}">
@@ -1249,47 +1556,81 @@ function renderSettings() {
       <label class="lbl-row">Quality <select data-vsr="quality"${vsrOk ? "" : " disabled"}>${["LOW", "MEDIUM", "HIGH", "ULTRA"].map((q) =>
         `<option${vsr.quality === q ? " selected" : ""}>${q}</option>`).join("")}</select></label>
     </div>
-    <div class="seed-row">
-      <label class="lbl">Seed · fixed <input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-describedby="seed-help"></label>
-      <span class="muted small" id="seed-help">Feeds every Shot left on auto. Type a seed to go back to it; use Reroll for new takes.</span>
-    </div>
+    ${P().shots.some((x) => x.kind === "clip" && !x.bypassed) ? `<div class="vsr-row${s.clip_pixels ? "" : " off"}">
+      ${switchHTML(!!s.clip_pixels, 'data-action="clip-pixels" aria-label="Original clip pixels in the final video"', true)}
+      <div class="vsr-text"><div>Final video: original clip pixels</div>
+        <div class="muted small">${s.clip_pixels ? "Upscale final video puts each clip's original frames back: sharper clips, with a possible faint seam at their edges."
+          : "Off: clips come out of the decoder like everything else (seamless joins, slightly softer clips)."}</div></div></div>` : ""}
     <div style="margin-top:14px"><div class="muted small" style="margin-bottom:6px">Reference image size</div>
       <div class="seg" role="group" aria-label="Reference image size">
         <button data-action="ref-size" data-v="match" aria-pressed="${s.ref_image_size === "match"}">Match · lighter on VRAM</button>
         <button data-action="ref-size" data-v="max" aria-pressed="${s.ref_image_size === "max"}">Max · best identity</button>
       </div></div>
     <div class="seg-store">
-      ${switchHTML(s.save_segments !== false, 'data-action="save-segments" aria-label="Save segments to disk"', true)}
-      <span class="grow">Saved segments: ${S.segStats ? `${S.segStats.files} file${S.segStats.files === 1 ? "" : "s"} · ${(S.segStats.bytes / 1048576).toFixed(1)} MB` : "—"}
-        <span class="muted"> · output/longshot/${esc(P().slug)}/segments</span></span>
-      <button class="ghost sm local-only" data-action="clear-segments"${S.segStats && S.segStats.files ? "" : " disabled"}>Clear saved segments</button>
+      <span class="grow">Saved takes: ${S.segStats ? `${S.segStats.files} file${S.segStats.files === 1 ? "" : "s"} · ${(S.segStats.bytes / 1048576).toFixed(1)} MB` : "—"}
+        <span class="muted"> · output/longshot/${esc(P().slug)}/takes</span></span>
+      <button class="ghost sm local-only" data-action="clear-segments"${S.segStats && S.segStats.files ? "" : " disabled"}>Delete all takes</button>
     </div>`;
 }
 
 /** Sampler, scheduler, overlap… — its own section under Settings. */
 function renderAdvanced() {
   const s = P().settings, o = S.opts || {};
-  $("adv-summary").textContent = [s.sampler, s.scheduler, `overlap ${s.overlap}`, `seed ${s.seed_mode}`]
+  const modelShort = (s.model || "no model").split(/[\\/]/).pop().replace(/\.(safetensors|gguf|ckpt|pt)$/i, "");
+  $("adv-summary").textContent = [modelShort, s.turbo.on ? "Turbo" : "no Turbo", s.sampler, s.scheduler, `overlap ${s.overlap}`]
     .filter(Boolean).join(" · ");
   $("adv-chev").textContent = S.advOpen ? "Hide ▴" : "Show ▾";
   $("adv-toggle").setAttribute("aria-expanded", String(!!S.advOpen));
   $("advanced").hidden = !S.advOpen;
   if (!S.advOpen) return;
+  const t = s.turbo;
+  const loras = s.loras.map((l, i) => `<div class="lora${l.on ? "" : " off"}">
+      ${switchHTML(l.on, `data-action="lora-on" data-i="${i}" aria-label="LoRA ${i + 1}"`, true)}
+      <div class="pick" style="flex:1 1 160px"><select data-lora="${i}" data-k="name" aria-label="LoRA ${i + 1} file"${l.on ? "" : " disabled"}>${fileOptions(o.loras, l.name, "Choose a LoRA…")}</select>${browseBtn("loras", "lora:" + i, !l.on)}</div>
+      <label class="strength"><input type="range" min="0" max="2" step="0.05" data-lora="${i}" data-k="strength" value="${esc(l.strength)}"${l.on ? "" : " disabled"} aria-label="LoRA ${i + 1} strength"><output>${Number(l.strength).toFixed(2)}</output></label>
+    </div>`).join("");
   const overlaps = [5, 22, 39, 56, 73].map((v) => `<option value="${v}"${v === Number(s.overlap) ? " selected" : ""}>${v}</option>`).join("");
   const sage = (o.sage_modes && o.sage_modes.length ? o.sage_modes : ["disabled", "auto"]);
-  $("advanced").innerHTML = `<div class="grid2">
+  $("advanced").innerHTML = `    <div class="model-files">
+      ${modelField("Model", "diffusion_models", "model", select('data-set="model" aria-label="Model"', o.models, s.model, "Choose a model…"))}
+      <div class="model-grid">
+        ${modelField("Text encoder", "text_encoders", "clip", select('data-set="clip" aria-label="Text encoder"', o.clips, s.clip, "Choose…"))}
+        ${modelField("Video VAE", "vae", "video_vae", select('data-set="video_vae" aria-label="Video VAE"', o.vaes, s.video_vae, "Choose…"))}
+        ${modelField("Audio VAE", "vae", "audio_vae", select('data-set="audio_vae" aria-label="Audio VAE"', o.vaes, s.audio_vae, "Choose…"))}
+      </div>
+    </div>
+    <div class="box">
+      <div class="box-row">
+        ${switchHTML(t.on, 'data-action="turbo-on" aria-label="Turbo LoRA"')}
+        <div style="flex:1;min-width:140px"><div>Turbo LoRA</div>
+          <div class="pick" style="margin-top:4px"><select data-turbo="lora" aria-label="Turbo LoRA file"${t.on ? "" : " disabled"}>${fileOptions(o.loras, t.lora, "Choose…")}</select>${browseBtn("loras", "turbo", !t.on)}</div></div>
+        <label class="strength" style="flex:1 1 180px">Strength
+          <input type="range" min="0" max="2" step="0.05" data-turbo="strength" value="${esc(t.strength)}"${t.on ? "" : " disabled"}><output>${Number(t.strength).toFixed(2)}</output></label>
+      </div>
+    </div>
+    <div class="loras">${loras}</div>
+    <div class="adv-sub">Sampling</div>
+    <div class="grid2">
       <label class="lbl">Sampler ${select('data-set="sampler"', o.samplers, s.sampler)}</label>
       <label class="lbl">Scheduler ${select('data-set="scheduler"', o.schedulers, s.scheduler)}</label>
       <label class="lbl">Overlap frames <select data-set="overlap" data-num>${overlaps}</select></label>
       <label class="lbl">Seed mode <select data-set="seed_mode"><option${s.seed_mode === "increment" ? " selected" : ""}>increment</option><option${s.seed_mode === "same" ? " selected" : ""}>same</option></select></label>
       <label class="lbl">Sage attention ${select('data-set="sage_attention"', sage, s.sage_attention)}</label>
-      <label class="lbl">CLIP ${select('data-set="clip"', o.clips, s.clip, "Choose…")}</label>
       <label class="lbl">Reference resize (px) <input data-set="ref_resize_px" data-num type="number" min="64" step="2" value="${esc(s.ref_resize_px)}"></label>
-      <label class="lbl">Video VAE ${select('data-set="video_vae"', o.vaes, s.video_vae, "Choose…")}</label>
-      <label class="lbl">Audio VAE ${select('data-set="audio_vae"', o.vaes, s.audio_vae, "Choose…")}</label>
       <label class="lbl">Shift video <input data-set="shift_video" data-num type="number" step="0.5" value="${esc(s.shift_video)}"></label>
       <label class="lbl">Shift audio <input data-set="shift_audio" data-num type="number" step="0.5" value="${esc(s.shift_audio)}"></label>
     </div>`;
+}
+
+function pinText(r) {
+  if (!r) return "";
+  const bits = [];
+  if (r.pins && r.pins.end) {
+    bits.push(r.pins.end.kind === "old_tail" ? `pinned to Shot ${r.pins.end.to}` : `leads into Shot ${r.pins.end.to}`);
+  }
+  if (r.join === "cut") bits.push("cut");
+  if (r.seam === "mismatch") bits.push("hard cut before it");
+  return bits.length ? " · " + bits.join(" · ") : "";
 }
 
 function renderPlan() {
@@ -1301,27 +1642,36 @@ function renderPlan() {
     const i = S.dry.chain.indexOf(id);
     return i >= 0 ? S.dry.rows[i] : null;
   };
+  const what = (r) => (r.status === "locked" ? `take · seed ${r.seed}`
+    : r.status === "reused" ? `reused (${r.source}) · seed ${r.seed}` : `will render (${r.reason}) · seed ${r.seed}`);
   $("plan").innerHTML = act.map((s, k) => {
     const row = lastRowFor(s.id), dry = dryRow(s.id);
     let len, status, color;
+    if (s.kind === "clip") {
+      const r = dry || row;
+      len = (r ? r.seconds : s.clip.frames / 24).toFixed(2) + "s";
+      status = `clip · ${s.clip.original_name || s.clip.file || "no video"}${r && r.seam === "mismatch" ? " · not bridged yet" : ""}${r && r.join === "cut" ? " · cut" : ""}`;
+      return `<div class="plan-row"><span>Seg ${k + 1}</span><span class="muted">${esc(len)}</span><span style="color:#8FD3F0">${esc(status)}</span></div>`;
+    }
     if (s.id === rid) { len = (row ? row.seconds.toFixed(2) : s.seconds) + "s"; status = "rendering…"; color = "#E9E7E2"; }
     else if (s.status === "approved" && (row || dry)) {
       const r = dry || row;
       len = r.seconds.toFixed(2) + "s";
-      status = dry && dry.status === "reused" ? `reused (${dry.source}) · seed ${dry.seed}`
-        : dry ? `will render (${dry.reason}) · seed ${dry.seed}` : `reused · seed ${row.seed}`;
-      color = dry && dry.status !== "reused" ? "#A3A6AD" : "#9FE0C2";
+      status = dry ? what(dry) + pinText(dry)
+        : `${row.locked ? "take" : row.status === "render" ? "rendered" : "reused"} · seed ${row.seed}${pinText(row)}`;
+      color = dry && dry.status === "render" ? "#A3A6AD" : "#9FE0C2";
     }
     else if (s.status === "review" && row) {
       len = row.seconds.toFixed(2) + "s";
-      status = `rendered${dry && dry.status === "reused" ? ` (${dry.source})` : ""} · seed ${row.seed}`;
+      status = `rendered${dry && dry.status !== "render" ? ` (${dry.status === "locked" ? "take" : dry.source})` : ""} · seed ${row.seed}${pinText(dry || row)}`;
       color = "#FFD08A";
     }
     else {
       len = (dry ? dry.seconds.toFixed(2) : s.seconds) + "s";
-      status = dry ? (dry.status === "reused" ? `reused (${dry.source}) · seed ${dry.seed}` : `will render (${dry.reason}) · seed ${dry.seed}`) : "will render";
+      status = dry ? what(dry) + pinText(dry) : "will render";
       color = "#A3A6AD";
     }
+    if ((dry || row) && (dry || row).seam === "mismatch") color = "#FFB4A8";
     return `<div class="plan-row"><span>Seg ${k + 1}</span><span class="muted">${esc(len)}</span><span style="color:${color}">${esc(status)}</span></div>`;
   }).join("");
 }
@@ -1340,6 +1690,9 @@ document.addEventListener("click", async (e) => {
   const p = P();
   switch (a) {
     case "primary": primary(); break;
+    case "approve": { const rv = reviewShot(); if (rv && !busyGuard()) { rv.status = "approved"; rv.was_approved = false; commit(); } break; }
+    case "approve-final": { const rv = reviewShot(); if (rv) { rv.status = "approved"; rv.was_approved = false; } if (previewStale()) refreshPreview(); else upscaleFinal(); break; }
+    case "bridge": bridgeShot(shotOf(el)); break;
     case "reroll": reroll(); break;
     case "stop": stop(); break;
     case "dry-run": dryRun(); break;
@@ -1350,7 +1703,10 @@ document.addEventListener("click", async (e) => {
       if (S.busy) return toast("Wait for the render to finish (or Stop it) first.");
       const s = shotOf(el);
       s.bypassed = !s.bypassed;
-      queueFrom(s.id, !s.bypassed);
+      S.dry = null;
+      if (!syncAfter(s, `${s.bypassed ? "Bypassing" : "Turning on"} a Shot`) && renderedAfter(s).length && s.take) {
+        toast("The Shots after it keep their takes. If a join looks wrong, reroll the Shot after it to bridge it.");
+      }
       commit();
       break;
     }
@@ -1358,19 +1714,36 @@ document.addEventListener("click", async (e) => {
       if (S.busy) return toast("Wait for the render to finish (or Stop it) first.");
       const s = shotOf(el);
       if (s.text && !confirm(`Remove ${s.bypassed ? "this bypassed shot" : titleOf(s)}? Its text is deleted.`)) return;
-      queueFrom(s.id, false);
+      if (!s.bypassed) syncAfter(s, "Removing a Shot");
+      S.dry = null;
       p.shots = p.shots.filter((x) => x.id !== s.id);
       commit();
       break;
     }
-    case "add-shot": {
-      const s = { id: uid("s"), text: "", seconds: 5, shot_seed: -1, bypassed: false, status: "queued", was_approved: false };
-      p.shots.push(s);
-      S.open = s.id;
-      commit();
-      setTimeout(() => { const t = document.querySelector(`[data-shot="${s.id}"] textarea`); if (t) t.focus(); }, 0);
+    case "add-shot": insertShot(p.shots.length); break;
+    case "add-first": insertShot(0); break;
+    case "add-first-clip": pickClip(P().shots[0] ? P().shots[0].id : null, false, true); break;
+    case "insert-clip-after": pickClip(shotOf(el).id, false); break;
+    case "replace-clip": pickClip(shotOf(el).id, true); break;
+    case "pick-clip-file": pickClipFile(shotOf(el)); break;
+    case "toggle-join": toggleJoin(shotOf(el)); break;
+    case "insert-before": case "insert-after": {
+      const s = shotOf(el);
+      insertShot(p.shots.indexOf(s) + (a === "insert-after" ? 1 : 0));
       break;
     }
+    case "take-step": { const s = shotOf(el) || reviewShot(); stepTake(s, +el.dataset.dir); break; }
+    case "takes": manageTakes(shotOf(el) || reviewShot()); break;
+    case "use-take": { $("modal").hidden = true; const s = P().shots.find((x) => x.id === el.dataset.shot); useTake(s, el.dataset.name); break; }
+    case "delete-take": deleteTake(el.dataset.shot, el.dataset.name); break;
+    case "refresh": refreshPreview(); break;
+    case "browse-model": browseModels(el.dataset.kind, el.dataset.target); break;
+    case "mb-pick": mbPick(el.dataset.name); break;
+    case "mb-folders": MB.mode = "folders"; MB.path = ""; renderMB(); break;
+    case "mb-cd": MB.path = el.dataset.path; renderMB(); break;
+    case "mb-back": MB.mode = "files"; renderMB(); break;
+    case "mb-add": if (MB.shown) mbChangeFolders("add", MB.shown); break;
+    case "mb-remove": if (confirm("Stop looking for models in this folder? The files stay where they are.")) mbChangeFolders("remove", el.dataset.path); break;
     case "wrap": wrap(el); break;
     case "bypass-cast": { if (busyGuard()) return; const c = castOf(el); c.bypassed = !c.bypassed; sharedChanged("Cast & Scenes"); commit(); break; }
     case "remove-cast": {
@@ -1390,6 +1763,7 @@ document.addEventListener("click", async (e) => {
       break;
     }
     case "audio-preview": previewing() ? stopPreview() : startPreview(); break;
+    case "pick-audio": pickAudio(); break;
     case "pick-image": { const c = castOf(el); if (c) pickImages(c.id); break; }
     case "view-image": { const c = castOf(el); if (c && c.image && !["missing", "invalid"].includes(S.refState[c.id])) openLightbox(c.id); break; }
     case "edit-cast": openEditor(castOf(el)); break;
@@ -1405,6 +1779,7 @@ document.addEventListener("click", async (e) => {
     case "restart": restartComfy(); break;
     case "mute": toggleMute(); break;
     case "vsr-on": p.settings.rtx_vsr.on = !p.settings.rtx_vsr.on; commit(); break;
+    case "clip-pixels": p.settings.clip_pixels = !p.settings.clip_pixels; commit(); break;
     case "final": upscaleFinal(); break;
     case "audio-route": {
       if (busyGuard()) return;
@@ -1443,12 +1818,14 @@ document.addEventListener("click", async (e) => {
     case "rename": closeMenu(); renameProject(); break;
     case "duplicate": closeMenu(); duplicateProject(); break;
     case "delete-project": closeMenu(); deleteDialog(); break;
+    case "export-project": closeMenu(); exportDialog(); break;
+    case "import-project": closeMenu(); pickImport(); break;
+    case "export-go": exportGo(); break;
     case "confirm-delete": confirmDelete(); break;
     case "conflict-reload": S.conflict = null; loadProject(P().slug); break;
     case "conflict-keep": saveNow(true); break;
     case "relink": { const sel = el.closest("[data-cast]").querySelector("select[data-relink]"); if (sel) { sel.focus(); if (sel.showPicker) try { sel.showPicker(); } catch (e) { /* not allowed */ } } break; }
     case "clear-segments": clearSegments(); break;
-    case "save-segments": p.settings.save_segments = p.settings.save_segments === false; commit(); break;
     case "close-modal": $("modal").hidden = true; break;
     default: break;
   }
@@ -1468,6 +1845,14 @@ document.addEventListener("input", (e) => {
   const el = e.target;
   const p = P();
   if (!p) return;
+  if (el.id === "mb-q" && MB) {
+    MB.q = el.value;
+    const pos = el.selectionStart;
+    renderMB();
+    const q = $("mb-q");
+    if (q) { q.focus(); q.setSelectionRange(pos, pos); }
+    return;
+  }
   if (el.id === "editor-desc") autoGrow(el);
   else if (el.dataset.style) { p.style[el.dataset.style] = el.value; scheduleSave(); }
   else if (el.dataset.shotField === "text") { shotOf(el).text = el.value; scheduleSave(); }
@@ -1522,7 +1907,32 @@ document.addEventListener("change", (e) => {
       const n = v === "" || v === "auto" ? -1 : parseInt(v, 10);
       s.shot_seed = Number.isFinite(n) && n >= -1 ? n : s.shot_seed;
     } else s.text = el.value;
-    if (changed && !s.bypassed) queueFrom(s.id);
+    if (changed && !s.bypassed) editInPlace(s, k);
+    return commit();
+  }
+  if (el.dataset.clipFile !== undefined) {
+    const sh = shotOf(el);
+    if (!el.value) return;
+    const [sub, name] = splitChoice(el.value);
+    setClipFile(sh, sub, name, null);
+    return;
+  }
+  if (el.dataset.clip) {
+    const sh = shotOf(el), c = sh.clip, k = el.dataset.clip;
+    if (k === "audio") c.audio = el.value;
+    else if (k === "trim_in") {
+      c.trim_in = Math.max(0, Math.min(parseFloat(el.value) || 0, Math.max(0, (c.duration || 0) - 0.25)));
+      c.frames = clipFrames(Math.min(c.frames / 24, (c.duration || 1e9) - c.trim_in)) || c.frames;
+    } else if (k === "length") {
+      c.frames = clipFrames(Math.min(parseFloat(el.value) || 0, (c.duration || 1e9) - c.trim_in)) || c.frames;
+    }
+    sh.seconds = c.frames / 24;
+    if (changed) clipChanged(sh);
+    return commit();
+  }
+  if (el.dataset.melband !== undefined) {
+    p.audio.melband_model = el.value || null;
+    if (changed && p.audio.voice_ref) sharedChanged("Audio");
     return commit();
   }
   if (el.dataset.audio) {
@@ -1654,13 +2064,20 @@ async function duplicateProject() {
 }
 
 async function renameProject() {
-  const name = (prompt("Rename the project (its folder stays the same):", P().name) || "").trim();
+  if (busyGuard()) return;
+  const name = (prompt("Rename the project. Its input and takes folders are renamed too:", P().name) || "").trim();
   if (!name || name === P().name) return;
-  P().name = name;
   await saveNow();
+  let res;
+  try {
+    res = await api(`/longshot/projects/${encodeURIComponent(P().slug)}/rename`,
+      { method: "POST", body: { name, base: P().saved_at } });
+  } catch (e) { toast(e.message); return; }
+  const old = P().slug;
+  await loadProject(res.slug);
   await refreshProjects();
   renderHeader();
-  toast(`Renamed. Saved segments and files stay under "${P().slug}"; new videos save as longshot/${name}_#####.mp4.`);
+  toast(res.slug === old ? "Renamed." : `Renamed. Its files moved to input/longshot/${res.slug} and output/longshot/${res.slug}.`);
 }
 
 async function openList() {
@@ -1683,12 +2100,74 @@ function deleteDialog() {
   const local = S.local;
   showModal(`Delete "${P().name}"?`, null, `<p style="margin:0;color:var(--sub)">The project file is deleted. This can't be undone.</p>
     <div class="checks">
-      <label${local ? "" : " hidden"}><input type="checkbox" id="del-segments"> Also delete its saved segments (output/longshot/${esc(P().slug)}/segments)</label>
+      <label${local ? "" : " hidden"}><input type="checkbox" id="del-segments"> Also delete its saved takes (output/longshot/${esc(P().slug)}/takes)</label>
       <label${local ? "" : " hidden"}><input type="checkbox" id="del-inputs"> Also delete its input folder (input/longshot/${esc(P().slug)})</label>
       ${local ? "" : '<span class="muted small">Files can only be deleted from the machine running ComfyUI.</span>'}
     </div>
     <div class="dialog-actions"><button class="ghost" data-action="close-modal">Keep it</button>
     <button class="danger-btn" data-action="confirm-delete">Delete</button></div>`);
+}
+
+// ---------------------------------------------------------------------------
+// Export / import (on the machine running ComfyUI)
+// ---------------------------------------------------------------------------
+
+const mbSize = (b) => (b >= 1073741824 ? (b / 1073741824).toFixed(1) + " GB" : Math.max(0.1, b / 1048576).toFixed(1) + " MB");
+
+async function exportDialog() {
+  if (busyGuard()) return;
+  await saveNow();
+  let est = { references: 0, takes: 0, video: 0 };
+  try { est = await api(`/longshot/export/${encodeURIComponent(P().slug)}/estimate`); } catch (e) { /* sizes unknown */ }
+  showModal(`Export · ${P().name}`, "", `
+    <p class="muted small">One .zip with the project and every file it uses: reference images, the song and video clips. Model files aren't included; the other machine finds its own by name.</p>
+    <label class="check-row"><input type="checkbox" checked disabled> Project and references <span class="muted small">· ${mbSize(est.references)}</span></label>
+    <label class="check-row"><input type="checkbox" id="exp-takes" checked> Include takes <span class="muted small">· ${mbSize(est.takes)} · approved Shots open already rendered, with their take history</span></label>
+    <label class="check-row"><input type="checkbox" id="exp-video"${est.video ? "" : " disabled"}> Include the last preview video <span class="muted small">· ${est.video ? mbSize(est.video) : "none yet"}</span></label>
+    <div class="dialog-actions"><button class="ghost" data-action="close-modal">Cancel</button>
+      <button class="primary sm-primary" data-action="export-go">Export .zip</button></div>`);
+}
+
+function exportGo() {
+  const q = `takes=${$("exp-takes").checked ? 1 : 0}&video=${$("exp-video").checked ? 1 : 0}`;
+  const a = document.createElement("a");
+  a.href = `/longshot/export/${encodeURIComponent(P().slug)}?${q}`;
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  $("modal").hidden = true;
+  toast("Preparing the export… your browser downloads it when it's ready.");
+}
+
+function pickImport() {
+  if (busyGuard()) return;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = ".zip,application/zip";
+  inp.addEventListener("change", () => { if (inp.files.length) importZip(inp.files[0]); });
+  inp.click();
+}
+
+async function importZip(file) {
+  if (!S.local) { toast("Projects can only be imported on the machine running ComfyUI."); return; }
+  if (busyGuard()) return;
+  await saveNow();
+  toast(`Importing ${file.name}…`);
+  const fd = new FormData();
+  fd.append("file", file, file.name);
+  let data = null;
+  try {
+    const res = await fetch("/longshot/import", { method: "POST", body: fd });
+    try { data = await res.json(); } catch (e) { /* not JSON */ }
+    if (!res.ok) throw new Error((data && data.error) || res.statusText);
+  } catch (e) { toast("Import failed: " + e.message); return; }
+  await refreshProjects();
+  await loadProject(data.slug);
+  const miss = (data.missing || []).length;
+  toast(`Imported "${P().name}": ${data.files} file${data.files === 1 ? "" : "s"}` +
+    (data.takes ? `, ${data.takes} take${data.takes === 1 ? "" : "s"}` : "") +
+    (miss ? `. ${miss} file${miss > 1 ? "s were" : " was"} missing from the export.` : "."));
 }
 
 async function confirmDelete() {
@@ -1754,9 +2233,12 @@ async function relinkFromSelect(el) {
 const IMAGE_RE = /\.(png|jpe?g|webp|bmp|gif|tiff?)$/i;
 const isImageFile = (f) => IMAGE_RE.test(f.name || "");
 
-async function uploadImage(file) {
+async function uploadImage(file) { return uploadFile(file, "images"); }
+
+async function uploadFile(file, kind) {
   const fd = new FormData();
   fd.append("project", P().slug);
+  fd.append("kind", kind);
   fd.append("file", file, file.name);
   const res = await fetch("/longshot/upload", { method: "POST", body: fd });
   let data = null;
@@ -1823,6 +2305,41 @@ async function addImages(fileList, targetId) {
   if (!target && list.length === 1 && !failed.length) openEditor(cards[0]);   // name the new reference
 }
 
+/** Dropping (or choosing) a song: it becomes the project's audio file. */
+async function addAudio(fileList) {
+  const p = P();
+  const files = [...fileList];
+  const f = files.find((x) => AUDIO_RE.test(x.name || ""));
+  if (!f) { toast("Drop an audio file here (MP3, WAV, FLAC, OGG, M4A, AAC, Opus)."); return; }
+  if (busyGuard()) return;
+  S.audioOpen = true;
+  stopPreview();
+  S.uploading.audio = true;
+  render();
+  let info;
+  try { info = await uploadFile(f, "audio"); }
+  catch (e) { toast(`Couldn't upload ${f.name}: ${e.message}`); return; }
+  finally { delete S.uploading.audio; }
+  const same = !!p.audio.sha256 && info.sha256 === p.audio.sha256;
+  Object.assign(p.audio, { file: info.name, subfolder: info.subfolder, original_name: info.name,
+    sha256: info.sha256, size_bytes: info.size_bytes });
+  S.refState.audio = "ok";
+  S.refInfo.audio = Object.assign({ state: "ok" }, info);
+  await loadInputs();
+  if (!same && (p.audio.lip_sync || p.audio.voice_ref)) sharedChanged("Audio");
+  commit();
+  toast(same ? "Same song as before — nothing re-renders." : `${info.name} is the project's audio now.`);
+}
+
+function pickAudio() {
+  if (busyGuard()) return;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "audio/*";
+  inp.addEventListener("change", () => { if (inp.files.length) addAudio(inp.files); });
+  inp.click();
+}
+
 function pickImages(targetId) {
   if (busyGuard()) return;
   const inp = document.createElement("input");
@@ -1837,25 +2354,42 @@ const dragHasFiles = (e) => !!e.dataTransfer && [...e.dataTransfer.types].includ
 let dropEl = null;
 
 /** Where a drop would land: a card (replace) or the panel / Add tile (add). */
+const AUDIO_RE = /\.(mp3|wav|flac|ogg|m4a|aac|opus|wma)$/i;
+const VIDEO_RE = /\.(mp4|mov|webm|mkv|m4v|avi)$/i;
+const DROP_PANELS = ["#cast-panel", "#audio-panel", "#shots-panel"];
+
+/** Where a drop would land: a reference card (replace) or Cast & Scenes (add),
+ *  the Audio panel (the song), or the Shots list (a video clip). */
 function dropTargetOf(e) {
-  const panel = e.target.closest && e.target.closest("#cast-panel");
-  if (!panel || !P()) return null;
-  const card = e.target.closest("[data-cast]");
-  return card ? { el: card, id: card.dataset.cast } : { el: panel.querySelector("[data-drop=add]") || panel, id: null };
+  if (!P() || !e.target.closest) return null;
+  const cast = e.target.closest("#cast-panel");
+  if (cast) {
+    const card = e.target.closest("[data-cast]");
+    return card ? { zone: "cast", el: card, id: card.dataset.cast }
+      : { zone: "cast", el: cast.querySelector("[data-drop=add]") || cast, id: null };
+  }
+  const audio = e.target.closest("#audio-panel");
+  if (audio) return { zone: "audio", el: audio, id: null };
+  const shots = e.target.closest("#shots-panel");
+  if (shots) {
+    const card = e.target.closest("[data-shot]");
+    return card ? { zone: "shots", el: card, id: card.dataset.shot } : { zone: "shots", el: shots, id: null };
+  }
+  return null;
 }
 
 function clearDrop() {
   if (dropEl) dropEl.classList.remove("drop-target");
   dropEl = null;
-  $("cast-panel").classList.remove("dragging");
+  DROP_PANELS.forEach((sel) => { const el = document.querySelector(sel); if (el) el.classList.remove("dragging"); });
 }
 
 window.addEventListener("dragover", (e) => {
   if (!dragHasFiles(e)) return;
-  e.preventDefault();                 // a missed drop must never replace the Studio page with the image
+  e.preventDefault();                 // a missed drop must never replace the Studio page with the file
   const t = dropTargetOf(e);
-  e.dataTransfer.dropEffect = t ? "copy" : "none";
-  $("cast-panel").classList.add("dragging");
+  e.dataTransfer.dropEffect = "copy";        // a project .zip can go anywhere
+  DROP_PANELS.forEach((sel) => { const el = document.querySelector(sel); if (el) el.classList.add("dragging"); });
   const el = t ? t.el : null;
   if (el !== dropEl) {
     if (dropEl) dropEl.classList.remove("drop-target");
@@ -1868,21 +2402,28 @@ window.addEventListener("dragend", clearDrop);
 window.addEventListener("drop", (e) => {
   if (!dragHasFiles(e)) return;
   e.preventDefault();
+  const zip = [...e.dataTransfer.files].find((x) => /\.zip$/i.test(x.name || ""));
+  if (zip) { clearDrop(); importZip(zip); return; }
   const t = dropTargetOf(e);
   clearDrop();
-  if (t) addImages(e.dataTransfer.files, t.id);
+  if (!t) return;
+  if (t.zone === "cast") addImages(e.dataTransfer.files, t.id);
+  else if (t.zone === "audio") addAudio(e.dataTransfer.files);
+  else if (t.zone === "shots") addClipFiles(e.dataTransfer.files, t.id);
 });
 
 async function clearSegments() {
   if (busyGuard()) return;
   const st = S.segStats || { files: 0, bytes: 0 };
-  if (!confirm(`Delete ${st.files} saved segment file${st.files === 1 ? "" : "s"} (${(st.bytes / 1048576).toFixed(1)} MB) for "${P().name}"? Approved Shots stay approved but will render again after a restart.`)) return;
+  if (!confirm(`Delete all ${st.files} saved take file${st.files === 1 ? "" : "s"} (${(st.bytes / 1048576).toFixed(1)} MB) for "${P().name}"? ` +
+      "Rendered Shots keep their status, but every Shot has to render again (Shots still in ComfyUI's memory come back until it restarts).")) return;
   try { S.segStats = await api("/longshot/clear-segments", { method: "POST", body: { project: P().slug } }); }
   catch (e) { toast(e.message); return; }
+  for (const x of P().shots) { x.take = null; }
+  S.takes = {};
   S.dry = null;
-  renderSettings();
-  renderPlan();
-  toast("Saved segments cleared. Segments still in ComfyUI's memory are kept until it restarts.");
+  commit();
+  toast("All takes deleted.");
 }
 
 async function openFolder(which) {
@@ -1894,12 +2435,22 @@ async function openFolder(which) {
 }
 
 let toastTimer = null;
-function toast(msg) {
+let toastAction = null;
+function toast(msg, action) {
   const t = $("toast");
   t.textContent = msg;
+  toastAction = null;
+  if (action) {
+    const b = document.createElement("button");
+    b.className = "toast-act";
+    b.textContent = action.label;
+    b.addEventListener("click", () => { t.hidden = true; action.fn(); });
+    t.appendChild(b);
+    toastAction = action;
+  }
   t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, 6000);
+  toastTimer = setTimeout(() => { t.hidden = true; }, action ? 10000 : 6000);
 }
 
 function showModal(title, text, html) {
@@ -1918,10 +2469,13 @@ function showModal(title, text, html) {
 // ---------------------------------------------------------------------------
 
 let confirmResolve = null;
-function confirmBox({ title, body, yes = "Continue", no = "Cancel" }) {
+function confirmBox({ title, body, yes = "Continue", no = "Cancel", check = null }) {
   return new Promise((resolve) => {
     $("confirm-title").textContent = title;
     $("confirm-body").textContent = body;
+    const row = $("confirm-check-row");
+    row.hidden = !check;
+    if (check) { $("confirm-check-label").textContent = check; $("confirm-check").checked = false; }
     $("confirm-yes").textContent = yes;
     $("confirm-no").textContent = no;
     confirmResolve = resolve;
@@ -1935,7 +2489,8 @@ function confirmDone(v) {
   $("confirm").hidden = true;
   const r = confirmResolve;
   confirmResolve = null;
-  if (r) r(v);
+  const asked = !$("confirm-check-row").hidden;
+  if (r) r(asked ? { ok: v, checked: v && $("confirm-check").checked } : v);
 }
 $("confirm-yes").addEventListener("click", () => confirmDone(true));
 $("confirm-no").addEventListener("click", () => confirmDone(false));
@@ -2181,6 +2736,470 @@ function layoutStage() {
 }
 
 // ---------------------------------------------------------------------------
+// RAM / GPU / VRAM of the ComfyUI machine, in the top bar
+// ---------------------------------------------------------------------------
+
+const fmtGB = (b) => (b / 1073741824).toFixed(b >= 10 * 1073741824 ? 0 : 1);
+let statsTimer = null;
+
+async function pollStats() {
+  clearTimeout(statsTimer);
+  if (document.visibilityState === "visible" && S.conn === "ok") {
+    try { renderStats(await api("/longshot/stats")); } catch (e) { /* ComfyUI busy or restarting */ }
+  }
+  statsTimer = setTimeout(pollStats, 2000);
+}
+
+function renderStats(d) {
+  const el = $("sysstats");
+  const chip = (label, value, frac, title) =>
+    `<span class="stat${frac !== null && frac >= 0.9 ? " hot" : ""}" title="${esc(title)}">${label} <b>${value}</b></span>`;
+  const out = [];
+  if (d.ram) out.push(chip("RAM", `${fmtGB(d.ram.used)}/${fmtGB(d.ram.total)} GB`, d.ram.used / d.ram.total, "System memory in use on the ComfyUI machine"));
+  if (d.gpu && d.gpu.util !== null && d.gpu.util !== undefined) out.push(chip("GPU", `${Math.round(d.gpu.util)}%`, d.gpu.util / 100, d.gpu.name || "GPU load"));
+  if (d.gpu) out.push(chip("VRAM", `${fmtGB(d.gpu.vram_used)}/${fmtGB(d.gpu.vram_total)} GB`, d.gpu.vram_used / d.gpu.vram_total, `Video memory in use on ${d.gpu.name || "the GPU"}`));
+  el.innerHTML = out.join("");
+  el.hidden = !out.length;
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  pollStats();
+  if (P() && !S.busy && Object.values(S.refState).some((st) => st === "missing" || st === "invalid")) {
+    loadInputs().then(checkInputs).then(render);
+  }
+});
+window.addEventListener("focus", () => {
+  if (P() && !S.busy && Object.values(S.refState).some((st) => st === "missing" || st === "invalid")) {
+    loadInputs().then(checkInputs).then(render);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Model files: matching by name, and the model browser
+// ---------------------------------------------------------------------------
+
+/** The listed name for a saved model name (mirrors the server): the same
+ *  name, the other OS's separators, or the one listed file with that file name. */
+function matchModel(value, names) {
+  if (!value) return null;
+  names = names || [];
+  if (names.includes(value)) return value;
+  const norm = value.replace(/\\/g, "/");
+  const twin = names.find((n) => n.replace(/\\/g, "/") === norm);
+  if (twin) return twin;
+  const base = norm.split("/").pop().toLowerCase();
+  const hits = names.filter((n) => n.replace(/\\/g, "/").split("/").pop().toLowerCase() === base);
+  return hits.length === 1 ? hits[0] : null;
+}
+
+/** [label, kind, get, set] for every model file the project uses. */
+function modelSlots(p) {
+  const s = p.settings, a = p.audio;
+  const out = [
+    ["Model", "models", () => s.model, (v) => { s.model = v; }],
+    ["Text encoder", "clips", () => s.clip, (v) => { s.clip = v; }],
+    ["Video VAE", "vaes", () => s.video_vae, (v) => { s.video_vae = v; }],
+    ["Audio VAE", "vaes", () => s.audio_vae, (v) => { s.audio_vae = v; }],
+  ];
+  if (s.turbo.on) out.push(["Turbo LoRA", "loras", () => s.turbo.lora, (v) => { s.turbo.lora = v; }]);
+  s.loras.forEach((l, i) => { if (l.on && l.name) out.push([`LoRA ${i + 1}`, "loras", () => l.name, (v) => { l.name = v; }]); });
+  if (a.voice_ref) out.push(["Vocal separation model", "melband", () => a.melband_model, (v) => { a.melband_model = v; }]);
+  return out;
+}
+
+/** On open: a project saved on another machine finds its model files here by
+ *  name, even in a different subfolder. Nothing re-renders: same files. */
+function relinkModels(p) {
+  if (!S.opts) return 0;
+  let n = 0;
+  for (const [, kind, get, set] of modelSlots(p)) {
+    const v = get();
+    const m = matchModel(v, S.opts[kind]);
+    if (v && m && m !== v) { set(m); n++; }
+  }
+  return n;
+}
+
+function missingModels(p) {
+  if (!S.opts) return [];
+  return modelSlots(p).filter(([, kind, get]) => !matchModel(get(), S.opts[kind]))
+    .map(([label, , get]) => `${label}${get() ? ` (${get()})` : ""}`);
+}
+
+let MB = null;            // model browser state
+const MB_TITLES = { diffusion_models: "diffusion_models", text_encoders: "text_encoders", vae: "vae", loras: "loras" };
+
+async function browseModels(kind, target) {
+  if (busyGuard()) return;
+  MB = { kind, target, q: "", mode: "files", data: null, path: "" };
+  showModal("Choose a model file", "", '<div class="muted">Loading…</div>');
+  await loadMB();
+}
+
+async function loadMB() {
+  try { MB.data = await api("/longshot/models?kind=" + encodeURIComponent(MB.kind)); }
+  catch (e) { MB.data = { folders: [], files: [], error: e.message }; }
+  renderMB();
+}
+
+function currentFor(target) {
+  const p = P(), s = p.settings;
+  if (target === "turbo") return s.turbo.lora;
+  if (target === "melband") return p.audio.melband_model;
+  if (target.startsWith("lora:")) return s.loras[+target.slice(5)].name;
+  return s[target];
+}
+
+function renderMB() {
+  if (!MB || $("modal").hidden) return;
+  const body = $("modal-body");
+  if (MB.mode === "folders") return renderMBFolders(body);
+  const d = MB.data || { folders: [], files: [] };
+  const cur = currentFor(MB.target);
+  const q = MB.q.trim().toLowerCase();
+  const files = d.files.filter((f) => !q || f.name.toLowerCase().includes(q));
+  const mb = (b) => (b ? (b > 1e9 ? (b / 1073741824).toFixed(1) + " GB" : Math.round(b / 1048576) + " MB") : "");
+  const rows = files.map((f) => {
+    const parts = f.name.replace(/\\/g, "/").split("/");
+    const file = parts.pop();
+    const sub = parts.length ? parts.join("/") + "/" : "";
+    return `<button class="mb-file${f.name === cur ? " current" : ""}" data-action="mb-pick" data-name="${esc(f.name)}" title="${esc((f.folder || "") + " · " + f.name)}">
+      <span class="mb-name"><span class="muted">${esc(sub)}</span>${esc(file)}</span><span class="muted small">${mb(f.bytes)}</span></button>`;
+  }).join("") || `<div class="muted">${d.files.length ? "No file matches." : "ComfyUI found no files in these folders."}</div>`;
+  const folders = d.folders.map((f) => `<div class="mb-folder${f.exists ? "" : " gone"}">
+      <span class="mono small">${esc(f.path)}</span>${f.studio ? '<span class="chip">added here</span>' : ""}${f.exists ? "" : '<span class="chip">not found</span>'}
+      ${f.studio ? `<button class="ghost sm local-only" data-action="mb-remove" data-path="${esc(f.path)}">Remove</button>` : ""}</div>`).join("");
+  body.innerHTML = `${d.error ? `<div class="err"><span>${esc(d.error)}</span></div>` : ""}
+    <input class="field" id="mb-q" type="search" placeholder="Search ${d.files.length} ${esc(MB_TITLES[MB.kind])} files…" value="${esc(MB.q)}" autocomplete="off">
+    <div class="mb-list">${rows}</div>
+    <div class="mb-where"><div class="small muted">Where ComfyUI looks for ${esc(MB_TITLES[MB.kind])}:</div>${folders}
+      <div class="mb-add">${S.local ? `<button class="ghost sm" data-action="mb-folders">Add a folder…</button>
+        <span class="muted small">for models kept anywhere else on this machine</span>`
+        : '<span class="muted small">Models kept elsewhere: add their folder from the machine running ComfyUI, or list it in ComfyUI\'s extra_model_paths.yaml.</span>'}</div></div>`;
+  const q2 = $("mb-q");
+  if (q2 && document.activeElement !== q2 && MB.focus !== false) { q2.focus(); q2.setSelectionRange(q2.value.length, q2.value.length); }
+}
+
+async function renderMBFolders(body) {
+  let d;
+  try { d = await api("/longshot/browse?path=" + encodeURIComponent(MB.path || "")); }
+  catch (e) { d = { error: e.message, dirs: [], path: MB.path }; }
+  if (!MB || MB.mode !== "folders") return;
+  const crumbs = d.path ? `<span class="mono small">${esc(d.path)}</span>` : '<span class="muted">This computer</span>';
+  body.innerHTML = `${d.error ? `<div class="err"><span>${esc(d.error)}</span></div>` : ""}
+    <div class="mb-path">${d.parent !== null && d.parent !== undefined ? `<button class="ghost sm" data-action="mb-cd" data-path="${esc(d.parent)}">↑ Up</button>`
+      : d.path ? '<button class="ghost sm" data-action="mb-cd" data-path="">↑ Drives</button>' : ""} ${crumbs}</div>
+    <div class="mb-list">${d.dirs.map((x) => `<button class="mb-file" data-action="mb-cd" data-path="${esc(d.path ? (d.path.replace(/[\\/]$/, "") + (d.path.includes("\\") ? "\\" : "/") + x) : x)}">📁 ${esc(x)}</button>`).join("")
+      || '<div class="muted">No folders here.</div>'}</div>
+    <div class="dialog-actions">
+      <span class="muted small" style="margin-right:auto">${d.path ? `${d.models} model file${d.models === 1 ? "" : "s"} directly in this folder (subfolders are searched too)` : ""}</span>
+      <button class="ghost" data-action="mb-back">Back</button>
+      <button class="primary sm-primary" data-action="mb-add"${d.path ? "" : " disabled"}>Use this folder for ${esc(MB_TITLES[MB.kind])}</button>
+    </div>`;
+  MB.shown = d.path;
+}
+
+async function mbChangeFolders(action, path) {
+  try {
+    MB.data = await api("/longshot/model-folders", { method: "POST", body: { kind: MB.kind, path, action } });
+    S.opts = await api("/longshot/options");
+  } catch (e) { toast(e.message); return; }
+  MB.mode = "files";
+  renderMB();
+  render();
+  if (action === "add") toast("Folder added. ComfyUI lists its files now, and the Studio adds it again after a restart.");
+}
+
+function mbPick(name) {
+  const p = P(), s = p.settings, t = MB.target;
+  const before = currentFor(t);
+  $("modal").hidden = true;
+  MB = null;
+  if (before === name) return;
+  if (t === "turbo") { s.turbo.lora = name; if (s.turbo.on) sharedChanged("Turbo LoRA"); }
+  else if (t === "melband") { p.audio.melband_model = name; if (p.audio.voice_ref) sharedChanged("Audio"); }
+  else if (t.startsWith("lora:")) { const l = s.loras[+t.slice(5)]; l.name = name; if (l.on) sharedChanged("LoRAs"); }
+  else { s[t] = name; sharedChanged("Settings"); }
+  commit();
+}
+
+// ---------------------------------------------------------------------------
+// Clip Shots: real video in the timeline
+// ---------------------------------------------------------------------------
+
+const ZONE_S = () => (Number(P().settings.overlap) || 22) / 24;
+
+/** The longest valid clip length (17k + 5 frames at 24 fps) within `sec`. */
+function clipFrames(sec) {
+  const n = Math.floor(Math.max(0, Number(sec) || 0) * 24 + 1e-6);
+  return n < 5 ? 0 : Math.floor((n - 5) / 17) * 17 + 5;
+}
+
+/** The generated Shots joined to `s` by a Bridge re-render in place, so they
+ *  lead into it and out of it. (A Cut leaves them as they are.) */
+function bridgeAround(s) {
+  const act = active();
+  const i = act.indexOf(s);
+  if (i < 0) return [];
+  const out = [];
+  const prev = act[i - 1], next = act[i + 1];
+  if (prev && prev.kind !== "clip" && s.join !== "cut" && prev.status !== "queued") { prev.status = "queued"; out.push(prev); }
+  if (next && next.kind !== "clip" && next.join !== "cut" && next.status !== "queued") { next.status = "queued"; out.push(next); }
+  S.dry = null;
+  return out;
+}
+
+function bridgeNote(shots) {
+  if (!shots.length) return "";
+  const names = shots.map((x) => titleOf(x)).join(" and ");
+  return ` ${names} will re-render to ${shots.length > 1 ? "lead into and out of it" : "join it"}.`;
+}
+
+async function addClipFiles(fileList, nearId, replace, atIndex) {
+  const p = P();
+  const f = [...fileList].find((x) => VIDEO_RE.test(x.name || ""));
+  if (!f) { toast("Drop a video file (MP4, MOV, WebM, MKV) to add a clip."); return; }
+  if (busyGuard()) return;
+  S.uploading.clip = true;
+  toast(`Uploading ${f.name}…`);
+  let info;
+  try { info = await uploadFile(f, "video"); }
+  catch (e) { toast(`Couldn't upload ${f.name}: ${e.message}`); return; }
+  finally { delete S.uploading.clip; }
+  await loadInputs();
+  const near = nearId ? p.shots.findIndex((x) => x.id === nearId) : -1;
+  const at = atIndex !== undefined ? atIndex : near < 0 ? p.shots.length : near + (replace ? 0 : 1);
+  await insertClip(at, info, replace && near >= 0 ? p.shots[near] : null);
+}
+
+/** A new Clip Shot from a file already in the input folder. */
+async function insertClip(at, info, replacing) {
+  const p = P();
+  let pr;
+  try { pr = await api(`/longshot/probe?name=${encodeURIComponent(info.name)}&subfolder=${encodeURIComponent(info.subfolder || "")}`); }
+  catch (e) { toast("Couldn't read the video: " + e.message); return; }
+  const want = replacing && replacing.window ? replacing.window / 24 : Math.min(pr.duration, 10);
+  const frames = clipFrames(Math.min(want, pr.duration));
+  if (!frames) { toast("That clip is too short (it needs at least a quarter of a second)."); return; }
+  const s = { id: uid("k"), kind: "clip", status: "approved", join: "bridge", bypassed: false, text: "",
+    seconds: frames / 24, shot_seed: -1, prev_seeds: [], take: null, window: null, take_seconds: null,
+    clip: { file: info.name, subfolder: info.subfolder || "", original_name: info.name, sha256: info.sha256 || null,
+      size_bytes: info.size_bytes || null, trim_in: 0, frames, duration: pr.duration, fps: pr.fps,
+      width: pr.width, height: pr.height, has_audio: pr.has_audio, audio: pr.has_audio ? "clip" : "mute" } };
+  p.shots.splice(Math.max(0, Math.min(at, p.shots.length)), 0, s);
+  S.refState["clip:" + s.id] = "ok";
+  if (replacing) replacing.bypassed = true;
+  const redo = bridgeAround(s);
+  p.preview_dirty = true;
+  S.open = s.id;
+  commit();
+  toast((replacing ? `${titleOf(s)} is now a clip; the Shot it replaced is bypassed, so you can switch back.`
+    : `Clip added as ${titleOf(s)}.`) + bridgeNote(redo) +
+    (replacing && replacing.window && frames !== replacing.window ? ` Trimmed to ${(frames / 24).toFixed(2)} s to match.` : ""));
+}
+
+function pickClip(nearId, replace, before) {
+  if (busyGuard()) return;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "video/*,.mkv,.webm,.mov";
+  inp.addEventListener("change", () => {
+    if (!inp.files.length) return;
+    if (before) addClipFiles(inp.files, null, false, 0);
+    else addClipFiles(inp.files, nearId, replace);
+  });
+  inp.click();
+}
+
+/** Upload a different video for an existing clip card. */
+function pickClipFile(s) {
+  if (!s || busyGuard()) return;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "video/*,.mkv,.webm,.mov";
+  inp.addEventListener("change", async () => {
+    if (!inp.files.length) return;
+    let info;
+    try { info = await uploadFile(inp.files[0], "video"); } catch (e) { toast(e.message); return; }
+    await loadInputs();
+    await setClipFile(s, info.subfolder || "", info.name, info);
+  });
+  inp.click();
+}
+
+async function setClipFile(s, sub, name, info) {
+  let pr;
+  try { pr = await api(`/longshot/probe?name=${encodeURIComponent(name)}&subfolder=${encodeURIComponent(sub)}`); }
+  catch (e) { toast("Couldn't read the video: " + e.message); return; }
+  const c = s.clip;
+  Object.assign(c, { file: name, subfolder: sub, original_name: name, duration: pr.duration, fps: pr.fps,
+    width: pr.width, height: pr.height, has_audio: pr.has_audio, trim_in: 0,
+    sha256: info ? info.sha256 : null, size_bytes: info ? info.size_bytes : null });
+  if (!pr.has_audio) c.audio = "mute";
+  c.frames = clipFrames(Math.min(c.frames / 24 || 10, pr.duration)) || clipFrames(pr.duration);
+  s.seconds = c.frames / 24;
+  S.refState["clip:" + s.id] = "ok";
+  clipChanged(s);
+  commit();
+}
+
+/** Trim, length, audio or file of a clip changed: its bridged neighbours re-render. */
+function clipChanged(s) {
+  P().preview_dirty = true;
+  const redo = bridgeAround(s);
+  if (redo.length) toast(`${titleOf(s)}'s clip changed.` + bridgeNote(redo));
+}
+
+function toggleJoin(s) {
+  if (!s || busyGuard()) return;
+  const act = active();
+  const prev = act[act.indexOf(s) - 1];
+  if (!prev || (prev.kind === "clip" && s.kind === "clip")) return;
+  s.join = s.join === "cut" ? "bridge" : "cut";
+  P().preview_dirty = true;
+  if (s.join === "bridge") {
+    // the generated side of the join re-renders so it meets the clip
+    const gen = s.kind === "clip" ? prev : s;
+    if (gen.kind !== "clip" && gen.status !== "queued") {
+      gen.status = "queued";
+      toast(`Bridge: ${titleOf(gen)} will re-render to flow ${gen === prev ? "into" : "out of"} the clip.`);
+    }
+  } else {
+    toast("Cut: the Shots stay as they are and meet with a hard cut. Update the preview to see it.");
+  }
+  S.dry = null;
+  commit();
+}
+
+function clipCardBody(s, title) {
+  const c = s.clip;
+  const missing = ["missing", "invalid"].includes(S.refState["clip:" + s.id]);
+  const secs = c.frames / 24;
+  const zone = ZONE_S().toFixed(2);
+  const act = active(), i = act.indexOf(s);
+  const prev = act[i - 1], next = act[i + 1];
+  const shared = [];
+  if (prev) shared.push(s.join === "cut" ? `its first ${zone} s is hidden behind ${titleOf(prev)} (cut)` : `its first ${zone} s is where ${titleOf(prev)} flows in`);
+  const strip = c.file && !missing ? `/longshot/filmstrip?name=${encodeURIComponent(c.file)}&subfolder=${encodeURIComponent(c.subfolder)}` +
+    `&in=${c.trim_in}&out=${(c.trim_in + secs).toFixed(3)}` : "";
+  return `<div class="shot-body clip-body">
+      ${strip ? `<img class="filmstrip" alt="" src="${esc(strip)}" loading="lazy">` : `<div class="filmstrip empty">${missing ? "Missing: " + esc(c.original_name || c.file) : "No video chosen"}</div>`}
+      <div class="shot-opts">
+        <label class="lbl-row">Video <select data-clip-file aria-label="${title} video">${inputOptions("videos", c.subfolder, c.file, "Choose a video…")}</select></label>
+        <button class="ghost sm" data-action="pick-clip-file">Upload…</button>
+      </div>
+      <div class="shot-opts">
+        <label class="lbl-row">Start <input type="number" step="0.1" min="0" data-clip="trim_in" value="${esc(c.trim_in)}" style="width:72px"> s</label>
+        <label class="lbl-row">Length <input type="number" step="0.1" min="0.25" data-clip="length" value="${esc(secs.toFixed(2))}" style="width:72px"> s</label>
+        <span class="mono small muted">→ ${secs.toFixed(2)} s · ${c.frames} frames</span>
+        <label class="lbl-row">Sound <select data-clip="audio"><option value="clip"${c.audio === "clip" ? " selected" : ""}${c.has_audio ? "" : " disabled"}>Clip's own${c.has_audio ? "" : " (none)"}</option>
+          <option value="mute"${c.audio !== "clip" ? " selected" : ""}>Mute</option></select></label>
+      </div>
+      <div class="muted small">${c.duration ? `Source: ${c.width || "?"}×${c.height || "?"} · ${c.fps ? c.fps + " fps" : "?"} · ${c.duration.toFixed(2)} s. ` : ""}Resized and centre-cropped to the film's size, at 24 fps.${shared.length ? " In the film, " + shared.join("; ") + "." : ""}</div>
+      <div class="shot-opts shot-more">
+        <span class="push"></span>
+        <button class="ghost sm" data-action="insert-before">⊕ Shot before</button>
+        <button class="ghost sm" data-action="insert-after">⊕ Shot after</button>
+        <button class="ghost sm" data-action="insert-clip-after">⊕ Clip after</button>
+      </div></div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Round 2: inserting Shots and take history
+// ---------------------------------------------------------------------------
+
+function insertShot(at) {
+  if (busyGuard()) return;
+  const p = P();
+  const s = { id: uid("s"), text: "", seconds: 5, shot_seed: -1, bypassed: false, status: "queued",
+    was_approved: false, join: "bridge", take: null, window: null, take_seconds: null, prev_seeds: [] };
+  p.shots.splice(Math.max(0, Math.min(at, p.shots.length)), 0, s);
+  S.open = s.id;
+  S.dry = null;
+  syncAfter(s, "Inserting a Shot");
+  commit();
+  setTimeout(() => { const t = document.querySelector(`[data-shot="${s.id}"] textarea`); if (t) t.focus(); }, 0);
+}
+
+const takesLoading = new Set();
+async function fetchTakes(id) {
+  if (!P() || takesLoading.has(id)) return;
+  takesLoading.add(id);
+  try {
+    const r = await api(`/longshot/takes/${encodeURIComponent(P().slug)}?shot=${encodeURIComponent(id)}`);
+    S.takes[id] = r.takes || [];
+  } catch (e) { S.takes[id] = []; }
+  takesLoading.delete(id);
+  renderShots();
+  renderDecision();
+}
+
+/** "Take 2 of 4 ◀ ▶" for a rendered Shot with more than one take. */
+function takeNav(s) {
+  if (!s || !s.take) return "";
+  const list = S.takes[s.id];
+  if (!list) { fetchTakes(s.id); return ""; }
+  if (list.length < 2) return "";
+  const i = list.findIndex((t) => t.name === s.take);
+  const off = !!S.busy;
+  return `<span class="take-nav" data-shot="${esc(s.id)}">
+    <button class="icon" data-action="take-step" data-dir="-1" aria-label="Previous take"${i <= 0 || off ? " disabled" : ""}>◀</button>
+    <button class="take-label" data-action="takes" title="All takes of ${esc(titleOf(s))}">Take ${i + 1} of ${list.length}</button>
+    <button class="icon" data-action="take-step" data-dir="1" aria-label="Next take"${i < 0 || i >= list.length - 1 || off ? " disabled" : ""}>▶</button></span>`;
+}
+
+function stepTake(s, dir) {
+  const list = s && S.takes[s.id];
+  if (!list) return;
+  const i = list.findIndex((t) => t.name === s.take);
+  const t = list[i + dir];
+  if (t) useTake(s, t.name);
+}
+
+/** Switching takes is instant: the take is a file, so nothing samples. */
+function useTake(s, name) {
+  if (!s || busyGuard()) return;
+  const t = (S.takes[s.id] || []).find((x) => x.name === name);
+  if (!t) return;
+  s.take = t.name;
+  if (t.seed !== null && t.seed !== undefined) s.shot_seed = t.seed;
+  s.window = t.window_frames;
+  s.take_seconds = Number(s.seconds);
+  if (s.status === "queued") s.status = "review";
+  S.dry = null;
+  commit();
+  refreshPreview();
+}
+
+function manageTakes(s) {
+  if (!s) return;
+  const list = S.takes[s.id];
+  if (!list) { fetchTakes(s.id).then(() => manageTakes(s)); return; }
+  const rows = list.map((t, i) => {
+    const cur = t.name === s.take;
+    return `<div class="take-row${cur ? " current" : ""}">
+      <span class="mono">Take ${i + 1}</span>
+      <span class="muted small">seed ${esc(t.seed)} · ${esc((t.created || "").replace("T", " ").slice(0, 16))} · ${t.seconds ? t.seconds.toFixed(2) + " s · " : ""}${(t.bytes / 1048576).toFixed(1)} MB</span>
+      ${cur ? '<span class="chip">In use</span>' : `<button class="ghost sm" data-action="use-take" data-shot="${esc(s.id)}" data-name="${esc(t.name)}">Use</button>
+        <button class="ghost sm local-only" data-action="delete-take" data-shot="${esc(s.id)}" data-name="${esc(t.name)}">Delete</button>`}
+    </div>`;
+  }).join("") || '<div class="muted">No saved takes yet.</div>';
+  showModal(`Takes · ${titleOf(s)}`, "", `<div class="take-list">${rows}</div>
+    <p class="muted small">Switching takes samples nothing. Deleting frees disk space; the take in use can't be deleted.${S.local ? "" : " Deleting works only on the machine running ComfyUI."}</p>`);
+}
+
+async function deleteTake(id, name) {
+  try { S.segStats = await api(`/longshot/takes/${encodeURIComponent(P().slug)}/${encodeURIComponent(name)}`, { method: "DELETE" }); }
+  catch (e) { toast(e.message); return; }
+  delete S.takes[id];
+  await fetchTakes(id);
+  renderSettings();
+  const s = P().shots.find((x) => x.id === id);
+  if (s) manageTakes(s);
+}
+
+// ---------------------------------------------------------------------------
 // C.5 Reroll an approved Shot
 // ---------------------------------------------------------------------------
 
@@ -2191,23 +3210,48 @@ function rememberTake(s) {
   s.prev_seeds = (s.prev_seeds || []).filter((x) => x !== seed).concat([seed]).slice(-10);
 }
 
+/** Shots after `s` that are rendered: they stay (locked) on an in-place render. */
+function renderedAfter(s) {
+  const act = active();
+  return act.slice(act.indexOf(s) + 1).filter((x) => x.status !== "queued");
+}
+
+/** Round 1 behaviour, on request: the Shots after `s` render again too. */
+function rippleAfter(s) {
+  for (const x of renderedAfter(s)) {
+    if (x.status === "approved") x.was_approved = true;
+    else x.was_rendered = true;
+    x.status = "queued";
+  }
+  S.dry = null;
+}
+
+/** "↯ hard cut · Bridge": re-render this Shot in place, pinned to the Shot now
+ *  before it and to its own old ending, so the Shots after it stay. */
+function bridgeShot(s) {
+  if (!s || busyGuard()) return;
+  rememberTake(s);
+  s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
+  s.status = "queued";
+  s.was_approved = false;
+  S.dry = null;
+  render();
+  queue({ upto: s.id, kind: "reroll", label: `Bridging into ${titleOf(s)}`,
+    note: "In place · the Shots around it keep their takes", onDone: onRendered(s.id) });
+}
+
 async function rerollShot(s) {
   if (!s || busyGuard()) return;
-  const act = active();
-  const after = act.slice(act.indexOf(s) + 1).filter((x) => x.status !== "queued");
+  const after = renderedAfter(s);
   if (after.length) {
     const a = numOf(after[0].id), z = numOf(after[after.length - 1].id);
-    const est = estimateFor([s, ...after]);
-    const ok = await confirmBox({ title: `Reroll ${titleOf(s)}?`,
-      body: `Rerolling ${titleOf(s)} also re-renders ${after.length > 1 ? `Shots ${a}–${z}` : `Shot ${a}`}` +
-        `${est ? ` (${est})` : ""}. Their text and seeds are kept.`,
-      yes: `Reroll ${titleOf(s)}`, no: "Cancel" });
-    if (!ok) return;
-    for (const x of after) {
-      if (x.status === "approved") x.was_approved = true;
-      else x.was_rendered = true;
-      x.status = "queued";
-    }
+    const range = after.length > 1 ? `Shots ${a}–${z}` : `Shot ${a}`;
+    const ans = await confirmBox({ title: `Reroll ${titleOf(s)} in place?`,
+      body: `${titleOf(s)} gets a new take with the same length, pinned to the Shot before it and ` +
+        `to ${range}, which stay exactly as they are. One render.`,
+      yes: `Reroll ${titleOf(s)}`, no: "Cancel", check: `Also re-render ${range}` });
+    if (!ans.ok) return;
+    if (ans.checked) rippleAfter(s);
   }
   rememberTake(s);
   s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
@@ -2217,7 +3261,7 @@ async function rerollShot(s) {
   const n = numOf(s.id);
   render();
   queue({ upto: s.id, kind: "reroll", label: `Re-rolling Shot ${n} · seed ${s.shot_seed}`,
-    note: n > 1 ? (n === 2 ? "Shot 1 reused" : `Shots 1–${n - 1} reused`) : "",
+    note: renderedAfter(s).length ? "In place · the Shots around it keep their takes" : "",
     onDone: onRendered(s.id) });
 }
 
@@ -2225,9 +3269,8 @@ function useSeed(s, seed) {
   if (!s || busyGuard() || !Number.isFinite(seed)) return;
   rememberTake(s);
   s.shot_seed = seed;
-  queueFrom(s.id);
+  editInPlace(s, "shot_seed");
   commit();
-  toast(`${titleOf(s)} will render with seed ${seed}.`);
 }
 
 /** The saved final video, when it matches the current approved chain and settings. */
@@ -2246,7 +3289,7 @@ function upscaleFinal() {
   const v = P().settings.rtx_vsr;
   const target = act[act.length - 1].id;
   queue({ upto: target, kind: "final", final: true, label: `Upscaling final video · ${v.scale}× ${v.quality}`,
-    note: "Every Shot comes from saved segments; decoding, upscaling and saving",
+    note: "Every Shot loads its saved take; decoding, upscaling and saving",
     onDone: ({ rows, text, outputs, built }) => {
       const combine = outputs[built.nodes.combine] || {};
       const video = (combine.gifs || combine.videos || [])[0];

@@ -12,7 +12,9 @@
     DELETE /longshot/projects/<slug>?segments=1&inputs=1      delete (files: loopback only)
     GET  /longshot/inputs?subfolder=…   image / audio files in the input folder
     POST /longshot/check-inputs    {files: [{key, name, subfolder, sha256}]} -> ok/changed/missing
-    GET  /longshot/segments/<slug> saved segments: files, bytes
+    GET  /longshot/segments/<slug> saved takes (and old segments): files, bytes
+    GET  /longshot/takes/<slug>?shot=<id>   takes, oldest first
+    DELETE /longshot/takes/<slug>/<name>    delete one take (loopback only)
     POST /longshot/clear-segments  {project} (loopback only)
     POST /longshot/open-folder     {"which": "output"|"input", "select", "project"} (loopback only)
     POST /longshot/restart         restart ComfyUI (relaunches itself, like ComfyUI-Manager)
@@ -114,13 +116,12 @@ def _same_file(a, b):
 
 
 def resolve_names(project, lists):
-    """Model names saved on one OS ('H3\\x' on Windows) still match on another
-    ('H3/x'). Only rewrites a name that isn't listed but has a listed twin."""
+    """Model names saved on one machine still match on another: 'H3\\x' on
+    Windows is 'H3/x' on Linux, and a file kept in a different subfolder is
+    found by its file name when exactly one listed file has it."""
     def fix(value, kind):
         names = lists.get(kind) or []
-        if not value or value in names:
-            return value
-        return next((n for n in names if _same_file(n, value)), value)
+        return pj.match_model_name(value, names) or value
 
     s = project.get("settings") or {}
     for key, kind in (("model", "diffusion_models"), ("clip", "text_encoders"),
@@ -222,6 +223,158 @@ def current_env():
 
 
 _READY = set()
+MODEL_FOLDERS_FILE = os.path.join("default", "longshot-studio", "model_folders.json")
+_ADDED = {}          # kind -> folders this process added to ComfyUI
+
+
+_STATS = {"at": 0.0, "data": None}
+_NVSMI = {"path": None, "checked": False}
+
+
+def _nvidia_smi():
+    """GPU name, load and memory from nvidia-smi (shipped with the NVIDIA
+    driver), or None when there is no NVIDIA GPU or driver tool."""
+    if not _NVSMI["checked"]:
+        _NVSMI["checked"] = True
+        _NVSMI["path"] = shutil.which("nvidia-smi")
+        if not _NVSMI["path"] and os.name == "nt":
+            p = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvidia-smi.exe")
+            _NVSMI["path"] = p if os.path.isfile(p) else None
+    if not _NVSMI["path"]:
+        return None
+    try:
+        out = subprocess.run(
+            [_NVSMI["path"], "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    gpus = []
+    for line in out.strip().splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) == 4:
+            try:
+                gpus.append({"name": parts[0], "util": float(parts[1]),
+                             "vram_used": float(parts[2]) * 1048576,
+                             "vram_total": float(parts[3]) * 1048576})
+            except ValueError:
+                continue
+    return gpus or None
+
+
+def system_stats():
+    """RAM, GPU load and VRAM of the machine running ComfyUI, cached for a second."""
+    import time as _time
+    now = _time.monotonic()
+    if _STATS["data"] is not None and now - _STATS["at"] < 1.0:
+        return _STATS["data"]
+    out = {"ram": None, "gpu": None}
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        out["ram"] = {"used": vm.total - vm.available, "total": vm.total}
+    except Exception:
+        pass
+    gpus = _nvidia_smi()
+    if gpus:
+        out["gpu"] = gpus[0]                     # the first GPU (ComfyUI's default)
+    else:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free, total = torch.cuda.mem_get_info()
+                out["gpu"] = {"name": torch.cuda.get_device_name(0), "util": None,
+                              "vram_used": total - free, "vram_total": total}
+        except Exception:
+            pass
+    _STATS.update(at=now, data=out)
+    return out
+
+
+def probe_video(path):
+    ffmpeg = _ffmpeg_path()
+    if not ffmpeg:
+        return {}
+    try:
+        res = subprocess.run([ffmpeg, "-hide_banner", "-i", path], capture_output=True, text=True,
+                             timeout=20, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return pj.parse_probe(res.stderr)
+
+
+def make_filmstrip(path, t0, t1, n=6):
+    import folder_paths
+    ffmpeg = _ffmpeg_path()
+    if not ffmpeg:
+        return None
+    st = os.stat(path)
+    key = pj.hashlib.blake2b(f"{path}|{st.st_size}|{st.st_mtime_ns}|{t0:.2f}|{t1:.2f}|{n}".encode(),
+                             digest_size=10).hexdigest()
+    folder = os.path.join(folder_paths.get_temp_directory(), "longshot-filmstrips")
+    os.makedirs(folder, exist_ok=True)
+    out = os.path.join(folder, key + ".jpg")
+    if os.path.isfile(out):
+        return out
+    length = max(0.2, (t1 - t0) if t1 > t0 else 5.0)
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{t0:.3f}", "-t", f"{length:.3f}",
+           "-i", path, "-vf", f"fps={n / length:.4f},scale=128:-2,tile={n}x1", "-frames:v", "1",
+           "-q:v", "5", out]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=60,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out if os.path.isfile(out) else None
+
+
+def comfy_queue_busy():
+    try:
+        from server import PromptServer
+        running, pending = PromptServer.instance.prompt_queue.get_current_queue()
+        return bool(running or pending)
+    except Exception:
+        return False
+
+
+def model_folders_path():
+    import folder_paths
+    return os.path.join(folder_paths.get_user_directory(), MODEL_FOLDERS_FILE)
+
+
+def apply_model_folders():
+    """Register the model folders saved by the Studio with ComfyUI, so its
+    loaders (and everything else) list the files in them."""
+    import folder_paths
+    saved = pj.load_model_folders(model_folders_path())
+    for kind, folders in saved.items():
+        for folder in folders:
+            if os.path.isdir(folder) and folder not in folder_paths.get_folder_paths(kind):
+                folder_paths.add_model_folder_path(kind, folder)
+                _ADDED.setdefault(kind, []).append(folder)
+    return saved
+
+
+def model_listing(kind):
+    import folder_paths
+    saved = pj.load_model_folders(model_folders_path()).get(kind, [])
+    folders = []
+    for f in folder_paths.get_folder_paths(kind):
+        folders.append({"path": f, "exists": os.path.isdir(f), "studio": f in saved})
+    for f in saved:
+        if f not in [x["path"] for x in folders]:
+            folders.append({"path": f, "exists": os.path.isdir(f), "studio": True})
+    roots = [x["path"] for x in folders if x["exists"]]
+    files = []
+    for name in folder_paths.get_filename_list(kind):
+        root = next((r for r in roots if os.path.isfile(os.path.join(r, name))), None)
+        try:
+            size = os.path.getsize(os.path.join(root, name)) if root else None
+        except OSError:
+            size = None
+        files.append({"name": name, "bytes": size, "folder": root})
+    return {"kind": kind, "folders": folders, "files": files}
 
 
 def project_store():
@@ -258,6 +411,7 @@ def options_payload():
         "melband": names("diffusion_models"),
         "images": pj.list_inputs(input_dir)["images"],
         "audio": pj.list_inputs(input_dir)["audio"],
+        "videos": pj.list_inputs(input_dir)["videos"],
         "samplers": _input_options("KSamplerSelect", "sampler_name") or [],
         "schedulers": _input_options("BasicScheduler", "scheduler") or [],
         "sage_modes": _input_options("PathchSageAttentionKJ", "sage_attention") or [],
@@ -351,6 +505,68 @@ def register(routes=None):
     async def options(request):
         return web.json_response(options_payload())
 
+    @routes.get("/longshot/stats")
+    async def stats(request):
+        data = await asyncio.get_running_loop().run_in_executor(None, system_stats)
+        return web.json_response(data, headers=no_cache)
+
+    @routes.get("/longshot/models")
+    async def models(request):
+        kind = request.query.get("kind", "")
+        if kind not in pj.MODEL_KINDS:
+            return error("kind must be one of " + ", ".join(pj.MODEL_KINDS))
+        return web.json_response(model_listing(kind))
+
+    @routes.get("/longshot/browse")
+    async def browse(request):
+        if not local(request):
+            return error("Folders can only be browsed from the machine running ComfyUI.", 403)
+        try:
+            return web.json_response(pj.browse_dir(request.query.get("path", "")))
+        except ValueError as err:
+            return error(err)
+
+    @routes.post("/longshot/model-folders")
+    async def model_folders(request):
+        """{kind, path, action: "add" | "remove"} — loopback only."""
+        import folder_paths
+        if not local(request):
+            return error("Model folders can only be changed from the machine running ComfyUI.", 403)
+        body = await body_of(request)
+        kind = (body or {}).get("kind")
+        path = str((body or {}).get("path") or "").strip()
+        action = (body or {}).get("action", "add")
+        if kind not in pj.MODEL_KINDS or not path:
+            return error("Send {kind, path, action}.")
+        path = os.path.abspath(os.path.expanduser(path))
+        saved = pj.load_model_folders(model_folders_path())
+        mine = saved.setdefault(kind, [])
+        if action == "add":
+            if not os.path.isdir(path):
+                return error(f"Not a folder: {path}")
+            if path not in folder_paths.get_folder_paths(kind):
+                folder_paths.add_model_folder_path(kind, path)
+                _ADDED.setdefault(kind, []).append(path)
+            if path not in mine:
+                mine.append(path)
+        elif action == "remove":
+            if path not in mine:
+                return error("Only folders added here can be removed here. Folders from ComfyUI's "
+                             "own settings (extra_model_paths.yaml) stay.", 409)
+            mine.remove(path)
+            paths = folder_paths.folder_names_and_paths.get(kind, ([], set()))[0]
+            if path in paths:
+                paths.remove(path)
+            # ComfyUI's file list cache notices added folders, not removed ones
+            getattr(folder_paths, "filename_list_cache", {}).pop(kind, None)
+            helper = getattr(folder_paths, "cache_helper", None)
+            if helper is not None and hasattr(helper, "cache"):
+                helper.cache.pop(kind, None)
+        else:
+            return error("action must be add or remove")
+        pj.save_model_folders(model_folders_path(), saved)
+        return web.json_response(model_listing(kind))
+
     @routes.post("/longshot/build")
     async def build(request):
         try:
@@ -423,6 +639,31 @@ def register(routes=None):
                                       "current": c.current}, status=409)
         return web.json_response({"slug": slug, "saved_at": saved_at})
 
+    @routes.post("/longshot/projects/{slug}/rename")
+    async def rename_project(request):
+        """{name, base}: renames the project and moves its input and takes
+        folders to the new name. Refused while ComfyUI has work queued."""
+        import folder_paths
+        slug, body = slug_of(request), await body_of(request)
+        if not slug or body is None:
+            return error("Send {name}.")
+        store = project_store()
+        if not store.exists(slug):
+            return error("No such project.", 404)
+        if comfy_queue_busy():
+            return error("ComfyUI is still rendering. Rename when its queue is empty, so no "
+                         "files move during a render.", 409)
+        try:
+            new, saved_at = pj.rename_project(store, folder_paths.get_input_directory(),
+                                              folder_paths.get_output_directory(), slug,
+                                              body.get("name"), body.get("base"))
+        except pj.Conflict as c:
+            return web.json_response({"error": "This project was changed in another tab.",
+                                      "current": c.current}, status=409)
+        except ValueError as err:
+            return error(err)
+        return web.json_response({"slug": new, "saved_at": saved_at})
+
     @routes.delete("/longshot/projects/{slug}")
     async def delete_project(request):
         import folder_paths
@@ -451,21 +692,23 @@ def register(routes=None):
 
     @routes.post("/longshot/upload")
     async def upload(request):
-        """Multipart: project=<slug>, file=<image>. Saved to input/longshot/<slug>/."""
+        """Multipart: project=<slug>, kind=images|audio|video, file. Saved to input/longshot/<slug>/."""
         import folder_paths
         try:
             form = await request.post()
         except Exception as err:        # e.g. over ComfyUI's --max-upload-size
             return error(f"Upload failed: {err}", 413 if "large" in str(err).lower() else 400)
         slug, f = str(form.get("project") or ""), form.get("file")
+        kind = str(form.get("kind") or "images")
         if not pj.is_slug(slug) or not project_store().exists(slug):
             return error("No such project.", 404)
         if f is None or not hasattr(f, "file"):
-            return error("Send the image as 'file'.")
+            return error("Send the file as 'file'.")
         data = f.file.read()
         try:
             saved = await asyncio.get_running_loop().run_in_executor(
-                None, pj.store_upload, folder_paths.get_input_directory(), slug, f.filename, data)
+                None, pj.store_upload, folder_paths.get_input_directory(), slug, f.filename, data,
+                kind)
         except ValueError as err:
             return error(err)
         return web.json_response(saved)
@@ -485,6 +728,126 @@ def register(routes=None):
             out.append(result)
         return web.json_response({"files": out})
 
+    @routes.get("/longshot/probe")
+    async def probe(request):
+        """Length, frame rate, size and sound of a video in the input folder."""
+        import folder_paths
+        try:
+            path = pj.resolve_input(folder_paths.get_input_directory(), request.query.get("name"),
+                                    request.query.get("subfolder", ""))
+        except ValueError as err:
+            return error(err)
+        if not os.path.isfile(path):
+            return error("No such file.", 404)
+        info = await asyncio.get_running_loop().run_in_executor(None, probe_video, path)
+        if info.get("duration") is None:
+            return error("ffmpeg couldn't read that video.")
+        return web.json_response(info)
+
+    @routes.get("/longshot/filmstrip")
+    async def filmstrip(request):
+        """A strip of 6 thumbnails from a video (JPEG), cached by file, in and out."""
+        import folder_paths
+        q = request.query
+        try:
+            path = pj.resolve_input(folder_paths.get_input_directory(), q.get("name"),
+                                    q.get("subfolder", ""))
+            t0, t1 = max(0.0, float(q.get("in", 0))), float(q.get("out", 0))
+        except (ValueError, TypeError) as err:
+            return error(err)
+        if not os.path.isfile(path):
+            return error("No such file.", 404)
+        out = await asyncio.get_running_loop().run_in_executor(None, make_filmstrip, path, t0, t1)
+        if not out:
+            return error("ffmpeg couldn't make a filmstrip.", 500)
+        return web.FileResponse(out, headers={"Cache-Control": "max-age=3600"})
+
+    @routes.get("/longshot/export/{slug}/estimate")
+    async def export_estimate(request):
+        import folder_paths
+        slug, store = slug_of(request), project_store()
+        if not slug or not store.exists(slug):
+            return error("No such project.", 404)
+        return web.json_response(pj.export_estimate(
+            folder_paths.get_input_directory(), folder_paths.get_output_directory(), slug,
+            store.load(slug)))
+
+    @routes.get("/longshot/export/{slug}")
+    async def export(request):
+        """The project as one .zip (loopback only): ?takes=1&video=0."""
+        import folder_paths
+        slug, store = slug_of(request), project_store()
+        if not slug or not store.exists(slug):
+            return error("No such project.", 404)
+        if not local(request):
+            return error("Projects can only be exported on the machine running ComfyUI.", 403)
+        project = store.load(slug)
+        folder = os.path.join(folder_paths.get_temp_directory(), "longshot-export")
+        os.makedirs(folder, exist_ok=True)
+        dest = os.path.join(folder, slug + ".zip")
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: pj.export_project(
+                folder_paths.get_input_directory(), folder_paths.get_output_directory(),
+                project, dest, takes=request.query.get("takes", "1") == "1",
+                video=request.query.get("video") == "1"))
+        name = gb.safe_name(project.get("name") or slug)
+        return web.FileResponse(dest, headers={
+            "Content-Disposition": f'attachment; filename="{name}.zip"',
+            "Cache-Control": "no-cache"})
+
+    @routes.post("/longshot/import")
+    async def import_(request):
+        """Multipart file=<export .zip> (loopback only). Streamed to disk, so
+        ComfyUI's upload size limit doesn't apply."""
+        import folder_paths
+        if not local(request):
+            return error("Projects can only be imported on the machine running ComfyUI.", 403)
+        folder = os.path.join(folder_paths.get_temp_directory(), "longshot-import")
+        os.makedirs(folder, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=folder, suffix=".zip")
+        os.close(fd)
+        try:
+            reader = await request.multipart()
+            got = False
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                if part.name != "file":
+                    continue
+                with open(tmp, "wb") as out:
+                    while True:
+                        chunk = await part.read_chunk(1 << 20)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                got = True
+            if not got:
+                return error("Send the .zip as 'file'.")
+            slug, summary = await asyncio.get_running_loop().run_in_executor(
+                None, pj.import_project, project_store(), folder_paths.get_input_directory(),
+                folder_paths.get_output_directory(), tmp)
+        except ValueError as err:
+            return error(err)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return web.json_response(dict(summary, slug=slug))
+
+    @routes.post("/longshot/find-inputs")
+    async def find_inputs(request):
+        """{project, files: [{key, name, sha256}]}: where missing references are now."""
+        import folder_paths
+        body = await body_of(request)
+        if body is None or not isinstance(body.get("files"), list):
+            return error("Send {project, files: [...]}.")
+        found = await asyncio.get_running_loop().run_in_executor(
+            None, pj.find_inputs, folder_paths.get_input_directory(),
+            str(body.get("project") or ""), body["files"][:200])
+        return web.json_response({"files": found})
+
     @routes.get("/longshot/segments/{slug}")
     async def segments(request):
         import folder_paths
@@ -493,11 +856,39 @@ def register(routes=None):
             return error("Not a project slug.", 400)
         return web.json_response(pj.segment_stats(folder_paths.get_output_directory(), slug))
 
+    @routes.get("/longshot/takes/{slug}")
+    async def takes(request):
+        import folder_paths
+        slug = slug_of(request)
+        if not slug:
+            return error("Not a project slug.")
+        shot = request.query.get("shot")
+        return web.json_response({"takes": pj.list_takes(folder_paths.get_output_directory(),
+                                                         slug, shot)})
+
+    @routes.delete("/longshot/takes/{slug}/{name}")
+    async def delete_take(request):
+        import folder_paths
+        slug, name = slug_of(request), request.match_info["name"]
+        if not slug or not pj.TAKE_NAME_RE.fullmatch(name):
+            return error("Not a take.")
+        if not local(request):
+            return error("Takes can only be deleted from the machine running ComfyUI.", 403)
+        store = project_store()
+        if store.exists(slug):
+            for i, shot in enumerate(store.load(slug).get("shots") or []):
+                if shot.get("take") == name:
+                    return error("That take is the one this Shot uses. Switch to another take "
+                                 "first.", 409)
+        removed = pj.delete_take(folder_paths.get_output_directory(), slug, name)
+        return web.json_response({"deleted": removed,
+                                  **pj.segment_stats(folder_paths.get_output_directory(), slug)})
+
     @routes.post("/longshot/clear-segments")
     async def clear_segments(request):
         import folder_paths
         if not local(request):
-            return error("Saved segments can only be cleared from the machine running ComfyUI.", 403)
+            return error("Saved takes can only be deleted from the machine running ComfyUI.", 403)
         body = await body_of(request) or {}
         slug = body.get("project")
         if not pj.is_slug(slug):
@@ -542,5 +933,9 @@ def register(routes=None):
         asyncio.get_running_loop().call_later(0.6, restart_comfyui)
         return web.json_response({"restarting": True})
 
+    try:
+        apply_model_folders()
+    except Exception as err:      # a broken settings file mustn't stop the page
+        logger.warning("H3 Long Shot Studio: couldn't add saved model folders: %s", err)
     logger.info("H3 Long Shot Studio %s at /longshot", VERSION)
     return True

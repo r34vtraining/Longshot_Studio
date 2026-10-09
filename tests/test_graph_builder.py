@@ -133,11 +133,13 @@ def test_sample_builds_the_reference_workflow():
     assert p["builder"]["inputs"]["task_type"] == "reference generation"
 
     # Shots: all six, chained, seeds as saved (Shot 3 carries its saved 0)
-    shots = of_class(p, "MiniMaxH3Shot")
+    shots = of_class(p, "MiniMaxH3TimelineShot")
     assert len(shots) == 6
     assert [p[f"shot{n}"]["inputs"]["seconds"] for n in range(1, 7)] == [5, 5, 5, 5, 9, 6]
     assert [p[f"shot{n}"]["inputs"]["shot_seed"] for n in range(1, 7)] == [-1, -1, 0, -1, -1, -1]
-    assert all(s["inputs"]["cut_verb"] == "the camera cuts to" for s in shots.values())
+    assert [p[f"shot{n}"]["inputs"]["shot_id"] for n in range(1, 7)] == [f"s{n}" for n in range(1, 7)]
+    assert all(s["inputs"]["lock"] == "" and s["inputs"]["join"] == "bridge"
+               and s["inputs"]["frames"] == 0 for s in shots.values())
     assert p["builder"]["inputs"]["shots"] == ["shot6", 0]
 
     c = p["combine"]["inputs"]
@@ -164,7 +166,7 @@ def test_prompt_is_json_serialisable():
 def test_start_renders_shot_1_only():
     b = build(sample(), upto="s1")
     assert b.chain == ["s1"]
-    assert len(of_class(b.prompt, "MiniMaxH3Shot")) == 1
+    assert len(of_class(b.prompt, "MiniMaxH3TimelineShot")) == 1
     assert b.prompt["builder"]["inputs"]["shots"] == ["shot1", 0]
     check_wiring(b.prompt)
 
@@ -172,7 +174,7 @@ def test_start_renders_shot_1_only():
 @pytest.mark.parametrize("upto,n", [("s2", 2), ("s4", 4), ("s6", 6)])
 def test_continue_queues_the_chain_up_to_the_target(upto, n):
     b = build(sample(), upto=upto)
-    assert len(of_class(b.prompt, "MiniMaxH3Shot")) == n
+    assert len(of_class(b.prompt, "MiniMaxH3TimelineShot")) == n
     assert b.prompt["builder"]["inputs"]["shots"] == [f"shot{n}", 0]
 
 
@@ -254,7 +256,7 @@ def test_bypassed_shots_are_left_out_and_renumber(off):
     b = build(p)
     live = [s for i, s in enumerate(p["shots"]) if i not in off]
     assert b.chain == [s["id"] for s in live]
-    shots = of_class(b.prompt, "MiniMaxH3Shot")
+    shots = of_class(b.prompt, "MiniMaxH3TimelineShot")
     assert len(shots) == len(live)
     for n, s in enumerate(live, 1):
         assert b.prompt[f"shot{n}"]["inputs"]["text"] == s["text"]
@@ -606,10 +608,23 @@ def test_long_shot_gets_the_project_slug_as_cache_name():
     assert build(p).prompt["longshot"]["inputs"]["cache_name"] == "renamed-later"
 
 
-def test_saving_segments_can_be_turned_off():
+def test_takes_are_always_saved_because_locked_shots_load_them():
     p = sample()
-    p["settings"]["save_segments"] = False
-    assert build(p).prompt["longshot"]["inputs"]["save_to_disk"] is False
+    p["settings"]["save_segments"] = False        # a Stage 1 setting, no longer used
+    assert build(p).prompt["longshot"]["inputs"]["save_to_disk"] is True
+
+
+def test_locks_frames_and_joins_reach_the_timeline_shots():
+    p = sample()
+    p["shots"][0].update(lock="s1__1722__0123abcd.safetensors", frames=124)
+    p["shots"][1].update(frames=120, join="cut")          # 120 isn't 17k + 5: ignored
+    g = build(p).prompt
+    assert g["shot1"]["inputs"]["lock"] == "s1__1722__0123abcd.safetensors"
+    assert g["shot1"]["inputs"]["frames"] == 124
+    assert g["shot2"]["inputs"]["frames"] == 0 and g["shot2"]["inputs"]["join"] == "cut"
+    p["shots"][2]["lock"] = "../../etc/passwd"
+    with pytest.raises(gb.BuildError, match="isn't a take file"):
+        build(p)
 
 
 def test_references_and_audio_in_a_project_subfolder():
@@ -703,3 +718,65 @@ def test_upscale_final_needs_the_rtx_pack():
     env = gb.Env(classes=set(gb.required_classes(p)))
     with pytest.raises(gb.BuildError, match="RTX-VSR"):
         build(p, final=True, env=env)
+
+
+# ---------------------------------------------------------------------------
+# Clip Shots
+# ---------------------------------------------------------------------------
+
+def with_clip(**clip):
+    p = sample()
+    c = {"file": "run.mp4", "subfolder": "longshot/sample-project", "trim_in": 1.5, "frames": 124,
+         "audio": "clip", "has_audio": True}
+    c.update(clip)
+    p["shots"].insert(2, {"id": "c1", "kind": "clip", "status": "approved", "join": "bridge", "clip": c})
+    return p
+
+
+def test_a_clip_shot_builds_load_video_clip_and_clip_shot():
+    b = build(with_clip())
+    g = b.prompt
+    load = g["clipload3"]["inputs"]
+    assert load["video"] == "longshot/sample-project/run.mp4"
+    assert (load["force_rate"], load["frame_load_cap"], load["skip_first_frames"]) == (24, 124, 36)
+    clip = g["clip3"]["inputs"]
+    assert clip["audio"] == ["clipload3", 2] and clip["audio_mode"] == "clip"
+    assert clip["vae"] == ["vae_video", 0] and clip["audio_vae"] == ["vae_audio", 0]
+    assert (clip["width"], clip["height"]) == (b.width, b.height)
+    shot = g["shot3"]["inputs"]
+    assert g["shot3"]["class_type"] == "MiniMaxH3ClipShot" and shot["shots"] == ["shot2", 0]
+    assert g["shot4"]["inputs"]["shots"] == ["shot3", 0]
+    assert {"VHS_LoadVideo", "MiniMaxH3Clip", "MiniMaxH3ClipShot"} <= set(gb.required_classes(with_clip()))
+    check_wiring(g)
+
+
+def test_a_silent_or_muted_clip_gets_no_audio_link():
+    for clip in ({"has_audio": False}, {"audio": "mute"}):
+        g = build(with_clip(**clip)).prompt
+        assert g["clip3"]["inputs"]["audio_mode"] == "mute" and "audio" not in g["clip3"]["inputs"]
+
+
+@pytest.mark.parametrize("clip,msg", [({"file": ""}, "no video file"), ({"frames": 120}, "valid length"),
+                                      ({"file": "../x.mp4"}, "bad file name")])
+def test_bad_clips_are_build_errors(clip, msg):
+    with pytest.raises(gb.BuildError, match=msg):
+        build(with_clip(**clip))
+
+
+def test_original_clip_pixels_only_on_the_final_video():
+    p = with_clip()
+    p["settings"]["clip_pixels"] = True
+    assert "clip_pixels" not in build(p).prompt
+    g = build(p, final=True).prompt
+    assert g["clip_pixels"]["inputs"] == {"images": ["decode", 0], "latent": ["longshot", 0],
+                                          "enabled": True}
+
+
+def test_clips_load_scaled_to_cover_the_film():
+    wide = build(with_clip(width=3840, height=1080))          # wider than 16:9: fit the height
+    load = wide.prompt["clipload3"]["inputs"]
+    assert (load["custom_width"], load["custom_height"]) == (0, wide.height + 8)
+    tall = build(with_clip(width=1080, height=1920)).prompt["clipload3"]["inputs"]
+    assert tall["custom_height"] == 0 and tall["custom_width"] > 0
+    unknown = build(with_clip()).prompt["clipload3"]["inputs"]
+    assert (unknown["custom_width"], unknown["custom_height"]) == (0, 0)

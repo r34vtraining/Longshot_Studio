@@ -25,6 +25,8 @@
           <button role="menuitem" data-action="save-as">Save as…</button>
           <button role="menuitem" data-action="rename">Rename…</button>
           <button role="menuitem" data-action="duplicate">Duplicate</button>
+          <button role="menuitem" data-action="export-project" class="local-only">Export…</button>
+          <button role="menuitem" data-action="import-project" class="local-only">Import…</button>
           <button role="menuitem" data-action="delete-project" class="danger">Delete…</button>
         </div>
       </div>
@@ -32,6 +34,7 @@
     </div>
   </div>
   <div class="top-right">
+    <div id="sysstats" class="sysstats mono" hidden></div>
     <button class="ghost sm restart-btn" data-action="restart" id="restart-btn" title="Restart ComfyUI (finished segments are kept on disk)">
       <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7a5 5 0 1 1-1.5-3.6"/><path d="M12 1.8v2.6H9.4"/></svg>
       Restart
@@ -82,7 +85,11 @@
     <div class="panel" id="shots-panel">
       <div class="panel-head">
         <h2>Shots</h2>
-        <span class="muted small">editing, bypassing or removing a shot re-renders the shots after it</span>
+        <span class="muted small">approved shots keep their takes; a re-render is pinned to the shots around it</span>
+      </div>
+      <div class="first-row">
+        <button class="addtile wide first" data-action="add-first" id="add-first" hidden></button>
+        <button class="addtile first clip-tile" data-action="add-first-clip" id="add-first-clip" hidden title="Put a video clip before Shot 1">＋ Clip before Shot 1</button>
       </div>
       <div id="shots" class="shot-list"></div>
       <button class="addtile wide" data-action="add-shot" id="add-shot"></button>
@@ -229,6 +236,7 @@
   <div class="dialog confirm" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
     <h3 id="confirm-title"></h3>
     <p id="confirm-body"></p>
+    <label class="confirm-check" id="confirm-check-row" hidden><input type="checkbox" id="confirm-check"> <span id="confirm-check-label"></span></label>
     <div class="dialog-actions">
       <button class="ghost" id="confirm-no"></button>
       <button class="primary sm-primary" id="confirm-yes"></button>

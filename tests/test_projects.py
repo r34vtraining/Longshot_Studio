@@ -155,7 +155,7 @@ def test_check_inputs_refuses_paths_outside_the_input_folder(inputs, name, sub):
 
 
 def test_list_inputs(inputs):
-    assert pj.list_inputs(inputs) == {"subfolder": "", "images": [], "audio": ["song.mp3"]}
+    assert pj.list_inputs(inputs) == {"subfolder": "", "images": [], "audio": ["song.mp3"], "videos": []}
     assert pj.list_inputs(inputs, "longshot/demo")["images"] == ["portrait.png"]
     assert pj.list_inputs(inputs, "longshot/nope")["images"] == []
     with pytest.raises(ValueError):
@@ -260,3 +260,178 @@ def test_upload_refuses_bad_slugs_empty_and_unreadable_files(tmp_path):
     ('we<ird>:"name?.webp', "we_ird_name_.webp"), ("  .png", "upload.png")])
 def test_upload_names_are_made_safe(raw, clean):
     assert pj.clean_upload_name(raw) == clean
+
+
+# ---------------------------------------------------------------------------
+# Model files on another machine
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("saved,listed,want", [
+    ("H3\\model.safetensors", ["H3/model.safetensors"], "H3/model.safetensors"),
+    ("H3/model.safetensors", ["H3\\model.safetensors"], "H3\\model.safetensors"),
+    ("H3\\model.safetensors", ["minimax/Model.safetensors", "other.safetensors"],
+     "minimax/Model.safetensors"),                     # another subfolder: found by file name
+    ("H3\\model.safetensors", ["a/model.safetensors", "b/model.safetensors"], None),  # ambiguous
+    ("H3\\model.safetensors", ["x.safetensors"], None),
+    ("", ["x.safetensors"], None),
+])
+def test_model_names_match_across_machines(saved, listed, want):
+    assert pj.match_model_name(saved, listed) == want
+
+
+def test_model_folders_round_trip(tmp_path):
+    path = str(tmp_path / "cfg" / "model_folders.json")
+    assert pj.load_model_folders(path) == {}
+    pj.save_model_folders(path, {"diffusion_models": ["D:/AI", "D:/AI"], "bogus": ["x"], "vae": []})
+    assert pj.load_model_folders(path) == {"diffusion_models": ["D:/AI"]}
+    with open(path, "w") as fh:
+        fh.write("not json")
+    assert pj.load_model_folders(path) == {}
+
+
+def test_browse_dir_lists_folders_and_counts_models(tmp_path):
+    (tmp_path / "models" / "H3").mkdir(parents=True)
+    (tmp_path / "models" / "a.safetensors").write_bytes(b"x")
+    (tmp_path / "models" / "notes.txt").write_text("x")
+    (tmp_path / "models" / ".hidden").mkdir()
+    out = pj.browse_dir(str(tmp_path / "models"))
+    assert out["dirs"] == ["H3"] and out["models"] == 1
+    assert out["parent"] == str(tmp_path)
+    assert pj.browse_dir("")["dirs"]                       # drives / root
+    with pytest.raises(ValueError):
+        pj.browse_dir(str(tmp_path / "nope"))
+
+
+# ---------------------------------------------------------------------------
+# Round 3: renaming moves folders, finding missing files, export / import
+# ---------------------------------------------------------------------------
+
+def _project_with_files(tmp_path, store):
+    inp, out = tmp_path / "input", tmp_path / "output"
+    (inp / "longshot" / "demo").mkdir(parents=True)
+    (inp / "longshot" / "demo" / "face.png").write_bytes(b"face")
+    (inp / "song.mp3").write_bytes(b"song")
+    (out / "longshot" / "demo" / "takes").mkdir(parents=True)
+    take = "s1__5__0123abcd.safetensors"
+    (out / "longshot" / "demo" / "takes" / take).write_bytes(b"take")
+    project = {"name": "Demo", "cast": [{"id": "c1", "label": "<hero>", "image": "face.png",
+                                         "subfolder": "longshot/demo", "sha256": pj.file_sha256(str(inp / "longshot" / "demo" / "face.png"))}],
+               "audio": {"file": "song.mp3", "subfolder": ""},
+               "shots": [{"id": "s1", "take": take, "status": "approved"}]}
+    store.save("demo", project)
+    return str(inp), str(out), take
+
+
+def test_rename_moves_the_input_and_takes_folders(tmp_path, store):
+    inp, out, take = _project_with_files(tmp_path, store)
+    new, _ = pj.rename_project(store, inp, out, "demo", "Chase Scene")
+    assert new == "chase-scene" and not store.exists("demo")
+    p = store.load(new)
+    assert p["name"] == "Chase Scene" and p["cast"][0]["subfolder"] == "longshot/chase-scene"
+    assert p["audio"]["subfolder"] == ""                     # files outside the project stay put
+    assert os.path.isfile(os.path.join(inp, "longshot", "chase-scene", "face.png"))
+    assert os.path.isfile(os.path.join(out, "longshot", "chase-scene", "takes", take))
+    assert p["shots"][0]["take"] == take
+    assert not os.path.exists(os.path.join(inp, "longshot", "demo"))
+
+
+def test_rename_to_the_same_slug_only_renames(tmp_path, store):
+    inp, out, _ = _project_with_files(tmp_path, store)
+    assert pj.rename_project(store, inp, out, "demo", "DEMO")[0] == "demo"
+    assert store.load("demo")["name"] == "DEMO"
+
+
+def test_rename_never_merges_into_an_existing_folder(tmp_path, store):
+    inp, out, _ = _project_with_files(tmp_path, store)
+    os.makedirs(os.path.join(inp, "longshot", "chase"))
+    assert pj.rename_project(store, inp, out, "demo", "Chase")[0] == "chase-2"
+
+
+def test_missing_files_are_found_by_contents_then_by_name(tmp_path):
+    inp = tmp_path / "input"
+    (inp / "longshot" / "demo").mkdir(parents=True)
+    (inp / "longshot" / "demo" / "renamed.png").write_bytes(b"face")
+    (inp / "other.png").write_bytes(b"different")
+    sha = __import__("hashlib").sha256(b"face").hexdigest()
+    found = pj.find_inputs(str(inp), "demo", [
+        {"key": "c1", "name": "face.png", "sha256": sha},
+        {"key": "c2", "name": "other.png", "sha256": "0" * 64},
+        {"key": "c3", "name": "gone.png", "sha256": "1" * 64}])
+    by = {f["key"]: f for f in found}
+    assert by["c1"]["name"] == "renamed.png" and by["c1"]["match"] == "same"
+    assert by["c1"]["subfolder"] == "longshot/demo"
+    assert by["c2"]["match"] == "name" and "c3" not in by
+
+
+def test_export_then_import_brings_everything(tmp_path, store):
+    inp, out, take = _project_with_files(tmp_path, store)
+    dest = str(tmp_path / "demo.zip")
+    man = pj.export_project(inp, out, store.load("demo"), dest, takes=True)
+    assert len(man["files"]) == 2 and man["takes"] == [take] and not man["missing"]
+    # import on "another machine"
+    other = pj.ProjectStore(str(tmp_path / "other" / "projects"))
+    inp2, out2 = str(tmp_path / "other" / "input"), str(tmp_path / "other" / "output")
+    slug, summary = pj.import_project(other, inp2, out2, dest)
+    p = other.load(slug)
+    assert slug == "demo" and summary["files"] == 2 and summary["takes"] == 1
+    assert p["cast"][0]["subfolder"] == "longshot/demo" and p["audio"]["subfolder"] == "longshot/demo"
+    assert os.path.isfile(os.path.join(inp2, "longshot", "demo", "song.mp3"))
+    assert p["shots"][0]["take"] == take
+    assert os.path.isfile(os.path.join(out2, "longshot", "demo", "takes", take))
+    # importing again makes a second project, never overwrites
+    slug2, _ = pj.import_project(other, inp2, out2, dest)
+    assert slug2 != slug
+
+
+def test_export_without_takes_imports_shots_to_render_again(tmp_path, store):
+    inp, out, _ = _project_with_files(tmp_path, store)
+    dest = str(tmp_path / "demo.zip")
+    pj.export_project(inp, out, store.load("demo"), dest, takes=False)
+    other = pj.ProjectStore(str(tmp_path / "o" / "p"))
+    slug, summary = pj.import_project(other, str(tmp_path / "o" / "i"), str(tmp_path / "o" / "o"), dest)
+    assert summary["takes"] == 0 and other.load(slug)["shots"][0]["take"] is None
+
+
+def test_import_refuses_other_zips(tmp_path, store):
+    import zipfile
+    bad = tmp_path / "x.zip"
+    with zipfile.ZipFile(bad, "w") as z:
+        z.writestr("readme.txt", "hi")
+    with pytest.raises(ValueError, match="isn't an H3 Long Shot Studio project"):
+        pj.import_project(store, str(tmp_path / "i"), str(tmp_path / "o"), str(bad))
+    (tmp_path / "y.zip").write_bytes(b"nope")
+    with pytest.raises(ValueError, match="isn't a project export"):
+        pj.import_project(store, str(tmp_path / "i"), str(tmp_path / "o"), str(tmp_path / "y.zip"))
+
+
+def test_import_ignores_paths_outside_the_zip_layout(tmp_path, store):
+    import zipfile, json as _json
+    z_path = tmp_path / "evil.zip"
+    with zipfile.ZipFile(z_path, "w") as z:
+        z.writestr("project.json", _json.dumps({"name": "E", "cast": [{"id": "c1", "image": "a.png"}],
+                                                "shots": []}))
+        z.writestr("manifest.json", _json.dumps({"format": 1, "files": [
+            {"key": "cast:c1", "path": "../../escape.png"}], "takes": ["../../x.safetensors"]}))
+        z.writestr("../../escape.png", b"x")
+    slug, summary = pj.import_project(store, str(tmp_path / "i"), str(tmp_path / "o"), str(z_path))
+    assert summary["files"] == 0 and summary["takes"] == 0
+    assert not (tmp_path / "escape.png").exists()
+
+
+def test_uploads_take_audio_and_video_by_kind(tmp_path):
+    out = pj.store_upload(str(tmp_path), "demo", "Song.MP3", b"ID3audio", kind="audio")
+    assert out["name"] == "Song.mp3"
+    assert pj.store_upload(str(tmp_path), "demo", "clip.mov", b"\0\0video", kind="video")["name"] == "clip.mov"
+    with pytest.raises(ValueError):
+        pj.store_upload(str(tmp_path), "demo", "clip.mov", b"x", kind="audio")
+
+
+def test_probe_report_parsing_and_clip_lengths():
+    text = """Input #0, mov,mp4, from 'x.mp4':
+  Duration: 00:00:12.48, start: 0.000000, bitrate: 1200 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High), yuv420p(progressive), 1920x1080 [SAR 1:1 DAR 16:9], 29.97 fps, 29.97 tbr
+  Stream #0:1[0x2](und): Audio: aac (LC), 48000 Hz, stereo, fltp, 128 kb/s"""
+    info = pj.parse_probe(text)
+    assert info == {"duration": 12.48, "fps": 29.97, "width": 1920, "height": 1080, "has_audio": True}
+    assert pj.parse_probe("Duration: 00:01:02.5\\n Stream #0:0: Video: vp9, 640x360, 25 fps")["has_audio"] is False
+    assert pj.clip_frames(5.0) == 107 and pj.clip_frames(5.2) == 124 and pj.clip_frames(0.1) == 0

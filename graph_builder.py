@@ -41,11 +41,15 @@ MEGAPIXELS = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.98, 1.0, 1.2, 1.5, 1.8, 
 
 # Which pack provides each node class, for "missing node" errors.
 PACKS = {
-    "MiniMaxH3Shot": "H3 Prompt Compiler (github.com/r34vtraining/H3_Prompt_Compiler)",
+    "MiniMaxH3TimelineShot": "H3 Long Shot 1.4.0+ (github.com/r34vtraining/H3_Longshot)",
+    "MiniMaxH3Clip": "H3 Long Shot 1.5.0+ (github.com/r34vtraining/H3_Longshot)",
+    "MiniMaxH3ClipShot": "H3 Long Shot 1.5.0+ (github.com/r34vtraining/H3_Longshot)",
+    "MiniMaxH3ClipPixels": "H3 Long Shot 1.5.0+ (github.com/r34vtraining/H3_Longshot)",
+    "VHS_LoadVideo": "ComfyUI-VideoHelperSuite",
     "MiniMaxH3Subject": "H3 Prompt Compiler (github.com/r34vtraining/H3_Prompt_Compiler)",
     "MiniMaxH3RefPromptBuilder": "H3 Prompt Compiler (github.com/r34vtraining/H3_Prompt_Compiler)",
-    "MiniMaxH3LongShot": "H3 Long Shot 1.3.0+ (github.com/r34vtraining/H3_Longshot)",
-    "MiniMaxH3SongTrack": "H3 Long Shot 1.3.0+ (github.com/r34vtraining/H3_Longshot)",
+    "MiniMaxH3LongShot": "H3 Long Shot 1.4.0+ (github.com/r34vtraining/H3_Longshot)",
+    "MiniMaxH3SongTrack": "H3 Long Shot 1.4.0+ (github.com/r34vtraining/H3_Longshot)",
     "MiniMaxH3SigmaShift": "ComfyUI core (update ComfyUI)",
     "MiniMaxH3TurboLoRA": "ComfyUI-MiniMax-H3-Turbo",
     "PathchSageAttentionKJ": "ComfyUI-KJNodes",
@@ -57,6 +61,49 @@ PACKS = {
     "RTXVideoSuperResolution": "ComfyUI-NVIDIA-RTX-VSR-Pro (RTX Video Super Resolution)",
 }
 VSR_QUALITIES = ["LOW", "MEDIUM", "HIGH", "ULTRA"]
+
+
+TAKE_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}__\d{1,20}__[0-9a-f]{8}\.safetensors")
+
+
+def _clip_nodes(g, n, shot, prev, vae, avae, width, height):
+    """A Clip Shot: VHS Load Video (24 fps, trimmed) → MiniMax H3 Clip → Clip Shot."""
+    clip = shot.get("clip") or {}
+    if not clip.get("file"):
+        raise BuildError(f"Shot {n} is a clip with no video file chosen.")
+    try:
+        path = pj.input_path_value(clip["file"], clip.get("subfolder", ""))
+    except ValueError as err:
+        raise BuildError(f"Shot {n}'s clip: {err}") from None
+    frames = int(clip.get("frames") or 0)
+    if frames < 5 or frames % 17 != 5:
+        raise BuildError(f"Shot {n}'s clip length ({frames} frames) isn't a valid length; "
+                         f"trim it again.")
+    skip = int(round(_num(clip.get("trim_in", 0), f"Shot {n} clip start", 0, 1e6) * FPS))
+    # Load it already scaled so it just covers the film's size (one side set, so
+    # VHS keeps the aspect); MiniMax H3 Clip centre-crops the rest. A 4K clip is
+    # never held in memory at full size.
+    cw = ch = 0
+    sw, sh = clip.get("width"), clip.get("height")
+    if isinstance(sw, (int, float)) and isinstance(sh, (int, float)) and sw > 0 and sh > 0:
+        if sw / sh > width / height:
+            ch = height + 8
+        else:
+            cw = width + 8
+    load = g.add(f"clipload{n}", "VHS_LoadVideo", f"[Shot {n}] clip video", video=path,
+                 force_rate=FPS, custom_width=cw, custom_height=ch, frame_load_cap=frames,
+                 skip_first_frames=skip, select_every_nth=1)
+    mode = "clip" if clip.get("audio", "clip") == "clip" and clip.get("has_audio", True) else "mute"
+    inputs = dict(images=[load[0], 0], vae=vae, audio_vae=avae, width=width, height=height,
+                  frames=frames, audio_mode=mode)
+    if mode == "clip":
+        inputs["audio"] = [load[0], 2]
+    prepared = g.add(f"clip{n}", "MiniMaxH3Clip", f"[Shot {n}] clip", **inputs)
+    shot_inputs = dict(clip=prepared, shot_id=str(shot.get("id") or f"clip{n}"),
+                       join=shot.get("join") if shot.get("join") in ("bridge", "cut") else "bridge")
+    if prev is not None:
+        shot_inputs["shots"] = prev
+    return g.add(f"shot{n}", "MiniMaxH3ClipShot", f"[Shot {n}] clip", **shot_inputs)
 
 
 class BuildError(ValueError):
@@ -207,7 +254,7 @@ def required_classes(project: dict, dry_run: bool = False, final: bool = False) 
     s = project.get("settings") or {}
     a = project.get("audio") or {}
     need = ["UNETLoader", "MiniMaxH3SigmaShift", "CLIPLoader", "VAELoader", "BasicScheduler",
-            "KSamplerSelect", "RandomNoise", "MiniMaxH3Shot", "MiniMaxH3RefPromptBuilder",
+            "KSamplerSelect", "RandomNoise", "MiniMaxH3TimelineShot", "MiniMaxH3RefPromptBuilder",
             "MiniMaxH3LongShot", "VAEDecode", "VHS_VideoCombine"]
     if not a.get("final_override"):
         need.append("VAEDecodeAudio")
@@ -219,6 +266,10 @@ def required_classes(project: dict, dry_run: bool = False, final: bool = False) 
         need.append("LoraLoaderModelOnly")
     if final or (s.get("rtx_vsr") or {}).get("on"):
         need.append("RTXVideoSuperResolution")
+    if any(sh.get("kind") == "clip" for sh in active_shots(project)):
+        need += ["VHS_LoadVideo", "MiniMaxH3Clip", "MiniMaxH3ClipShot"]
+        if final and s.get("clip_pixels"):
+            need.append("MiniMaxH3ClipPixels")
     if a.get("lip_sync") or a.get("voice_ref") or a.get("final_override"):
         need.append("VHS_LoadAudioUpload")
     if a.get("lip_sync"):
@@ -356,14 +407,29 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         subjects = g.add(f"subject{k + 1}", "MiniMaxH3Subject", f"{pic} subject", **inputs)
 
     # --- prompt ---------------------------------------------------------------
+    # Timeline Shots (Long Shot 1.4): each carries its id, its locked take
+    # (approved and reviewed Shots load their take instead of sampling), the
+    # window length to keep when re-rendered in place, and its join.
     shots = None
     for n, shot in enumerate(chain, 1):
+        if shot.get("kind") == "clip":
+            shots = _clip_nodes(g, n, shot, shots, vae, avae, width, height)
+            continue
         seconds = _num(shot.get("seconds", 5), f"Shot {n} seconds", 0.1, 600)
-        inputs = dict(cut_verb=CUT_VERB, seconds=seconds, text=shot.get("text", ""),
-                      shot_seed=_seed(shot.get("shot_seed", -1), f"Shot {n} seed"))
+        lock = shot.get("lock") or ""
+        if lock and not TAKE_NAME_RE.fullmatch(lock):
+            raise BuildError(f"Shot {n}'s take name {lock!r} isn't a take file.")
+        frames = shot.get("frames") or 0
+        frames = int(frames) if isinstance(frames, (int, float)) and frames > 0 and \
+            int(frames) % 17 == 5 else 0
+        join = shot.get("join") if shot.get("join") in ("bridge", "cut") else "bridge"
+        inputs = dict(shot_id=str(shot.get("id") or f"shot{n}"), seconds=seconds,
+                      text=shot.get("text", ""),
+                      shot_seed=_seed(shot.get("shot_seed", -1), f"Shot {n} seed"),
+                      lock=lock, join=join, frames=frames)
         if shots is not None:
             inputs["shots"] = shots
-        shots = g.add(f"shot{n}", "MiniMaxH3Shot", f"[Shot {n}]", **inputs)
+        shots = g.add(f"shot{n}", "MiniMaxH3TimelineShot", f"[Shot {n}]", **inputs)
 
     types = [t for t in (style.get("task_types") or ["reference generation"]) if t][:3]
     types += ["-"] * (3 - len(types))
@@ -417,12 +483,15 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                       sigmas=sigmas, prompt=_out(builder, 3), width=width, height=height,
                       overlap_frames=overlap, seed_mode=seed_mode, dry_run=bool(dry_run),
                       reuse_segments=True, ref_image_size=ref_size,
-                      save_to_disk=bool(s.get("save_segments", True)),
+                      save_to_disk=True,          # takes are what locked Shots load
                       cache_name=project_slug(project), audio_vae=avae,
                       **long_extra, **refs)
 
     # --- output -----------------------------------------------------------------
     images = g.add("decode", "VAEDecode", "VAE Decode", samples=long_shot, vae=vae)
+    if upscale_final and s.get("clip_pixels") and any(sh.get("kind") == "clip" for sh in chain):
+        images = g.add("clip_pixels", "MiniMaxH3ClipPixels", "Original clip pixels",
+                       images=images, latent=long_shot, enabled=True)
     vsr = s.get("rtx_vsr") or {}
     if vsr.get("on") or upscale_final:
         # NVIDIA RTX Video Super Resolution on the decoded frames, before saving.
