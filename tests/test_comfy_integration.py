@@ -361,18 +361,20 @@ def loop(install, monkeypatch, tmp_path):
     state = {"ex": new_executor()}
     RAN.clear()
 
-    def run(p, upto, dry_run=False, restart=False, final=False):
+    def run(p, upto, dry_run=False, restart=False, final=False, standalone=False):
         """restart=True: ComfyUI restarted — Long Shot's memory and ComfyUI's
         caches are gone; only files on disk remain."""
         if restart:
             ls.clear_segment_cache()
             state["ex"] = new_executor()
         ex = state["ex"]
-        built = gb.build_prompt(p, upto=upto, dry_run=dry_run, env=srv.current_env(), final=final)
+        built = gb.build_prompt(p, upto=upto, dry_run=dry_run, env=srv.current_env(), final=final,
+                                standalone=standalone)
         server.events.clear()
         calls = len(sampler.calls)
+        # every output node, as ComfyUI's /prompt does (the ProRes master is a second one)
         ex.execute(built.prompt, f"p{len(server.events)}-{upto}", {"client_id": "studio"},
-                   ["combine"])
+                   [k for k, v in built.prompt.items() if v["class_type"] == "VHS_VideoCombine"])
         assert ex.success, [(m[1].get("exception_message"), "".join(m[1].get("traceback", []))) for m in ex.status_messages if m[0] == "execution_error"]
         outputs = ex.history_result["outputs"]
         progress = [(d["segment"], d["status"]) for e, d in server.events
@@ -407,10 +409,11 @@ def test_core_loop_start_continue_reroll_edit(loop):
     out, progress, sampled = loop(p, "s1")
     assert sampled == 1 and progress == [(1, "rendering"), (1, "done")]
     video = out["combine"]["gifs"][0]
-    assert video["subfolder"] == "longshot" and video["type"] == "output"
+    # saved in the project's own videos folder, next to its takes
+    assert video["subfolder"] == "longshot/sample-project/videos" and video["type"] == "output"
     assert video["filename"].startswith("Sample project_")
     assert os.path.isfile(os.path.join(folder_paths.get_output_directory(), "longshot",
-                                       video["filename"]))
+                                       "sample-project", "videos", video["filename"]))
     # nvenc when this machine's ffmpeg can actually use it, software h264 otherwise
     assert video["format"] == (gb.NVENC if srv.nvenc_available() else gb.H264)
     assert out["longshot"]["plan_json"][0]["seed"] == 1722
@@ -984,3 +987,157 @@ def test_upscale_final_reuses_every_segment(loop, monkeypatch):
     assert sampled == 0 and progress == [(1, "reused"), (2, "reused")]
     assert ("vsr", "scale by multiplier", 2.0, "ULTRA") in RAN and "unet" not in RAN
     assert out["combine"]["gifs"][0]["filename"].startswith("Sample project_final_")
+
+
+# ---------------------------------------------------------------------------
+# Round 4: ProRes master, side-file cleanup, memory routes
+# ---------------------------------------------------------------------------
+
+def _probe(path):
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json",
+                          str(path)], capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+@CORE_PACKS
+@pytest.mark.skipif(not shutil.which("ffprobe"), reason="needs ffprobe")
+def test_final_writes_a_10_bit_prores_master_with_sound_and_metadata(loop, monkeypatch):
+    monkeypatch.setitem(comfy_nodes.NODE_CLASS_MAPPINGS, "RTXVideoSuperResolution", _vsr_stand_in())
+    srv.register_video_formats()
+    srv.register_video_formats()                    # twice is harmless
+    assert folder_paths.get_folder_paths("VHS_video_formats").count(
+        os.path.join(PKG_DIR, "video_formats")) == 1
+    env = srv.current_env()
+    assert gb.PRORES in env.video_formats
+    p = small()
+    p["settings"]["rtx_vsr"] = {"on": False, "scale": 2.0, "quality": "ULTRA"}
+    p["settings"]["prores_master"] = True
+    built = gb.build_prompt(p, upto="s1", final=True, env=env)
+    ok, err, outs, node_errors = validate(built.prompt)
+    assert ok, (err, node_errors)
+    assert sorted(outs) == ["combine", "combine_prores"]
+    loop(p, "s1")
+    out, progress, sampled = loop(p, "s1", final=True)
+    assert sampled == 0
+    master = out["combine_prores"]["gifs"][0]
+    assert master["filename"].startswith("Sample project_final_master_") and \
+        master["filename"].endswith("-audio.mov")
+    assert master["subfolder"] == "longshot/sample-project/videos"
+    path = os.path.join(folder_paths.get_output_directory(), *master["subfolder"].split("/"),
+                        master["filename"])
+    info = _probe(path)
+    v = next(s for s in info["streams"] if s["codec_type"] == "video")
+    a = next(s for s in info["streams"] if s["codec_type"] == "audio")
+    assert v["codec_name"] == "prores" and v["profile"] == "HQ" and v["pix_fmt"] == "yuv422p10le"
+    assert a["codec_name"] == "pcm_s16le"
+    tags = {k.lower(): val for k, val in info["format"].get("tags", {}).items()}
+    assert "prompt" in tags and "MiniMaxH3LongShot" in tags["prompt"], "workflow metadata in the master"
+    # the mp4 keeps its metadata too
+    mp4 = out["combine"]["gifs"][0]
+    info = _probe(os.path.join(folder_paths.get_output_directory(), *mp4["subfolder"].split("/"),
+                               mp4["filename"]))
+    assert "prompt" in {k.lower() for k in info["format"].get("tags", {})}
+
+    # Save PNG / audio-less video both off: only the two videos with sound stay
+    vdir = os.path.join(folder_paths.get_output_directory(), *mp4["subfolder"].split("/"))
+    before = set(os.listdir(vdir))
+    removed = pj.remove_render_side_files(folder_paths.get_output_directory(),
+                                          srv.video_entries(out), png=True, noaudio=True)
+    assert len(removed) == 4                     # 2 PNGs + 2 silent videos
+    left = set(os.listdir(vdir))
+    assert left == before - {r.rsplit("/", 1)[-1] for r in removed}
+    assert mp4["filename"] in left and master["filename"] in left
+    assert mp4["workflow"] not in left and master["workflow"] not in left
+    assert mp4["filename"].replace("-audio", "") not in left
+    assert master["filename"].replace("-audio", "") not in left
+
+
+@CORE_PACKS
+def test_cleanup_route_uses_comfyuis_history_of_that_render(loop, monkeypatch):
+    p = small()
+    out, _, _ = loop(p, "s1")
+    video = out["combine"]["gifs"][0]
+    vdir = os.path.join(folder_paths.get_output_directory(), *video["subfolder"].split("/"))
+    png, silent = video["workflow"], video["filename"].replace("-audio", "")
+    assert os.path.isfile(os.path.join(vdir, png)) and os.path.isfile(os.path.join(vdir, silent))
+    monkeypatch.setattr(srv, "history_outputs", lambda pid: out if pid == "p1" else None)
+    assert _client_call("POST", "/longshot/cleanup-outputs", json={"prompt_id": "nope", "png": True})[0] == 404
+    assert _client_call("POST", "/longshot/cleanup-outputs", json={"png": True})[0] == 400
+    status, res = _client_call("POST", "/longshot/cleanup-outputs",
+                               json={"prompt_id": "p1", "png": True, "noaudio": False})
+    assert status == 200 and res["removed"] == [f"{video['subfolder']}/{png}"]
+    assert os.path.isfile(os.path.join(vdir, silent))
+    status, res = _client_call("POST", "/longshot/cleanup-outputs",
+                               json={"prompt_id": "p1", "png": True, "noaudio": True})
+    assert res["removed"] == [f"{video['subfolder']}/{silent}"]
+    assert os.path.isfile(os.path.join(vdir, video["filename"]))
+
+
+@CORE_PACKS
+def test_clear_cache_route_drops_long_shots_pieces(loop, monkeypatch):
+    p = small()
+    loop(p, "s1")
+    ls = _long_shot_module()
+    assert len(ls._SEGMENT_CACHE) >= 1
+    assert srv.longshot_module() is ls
+    monkeypatch.setattr(srv, "comfy_queue_busy", lambda: True)
+    assert _client_call("POST", "/longshot/clear-cache")[0] == 409
+    monkeypatch.setattr(srv, "comfy_queue_busy", lambda: False)
+    status, res = _client_call("POST", "/longshot/clear-cache")
+    assert status == 200 and res["cleared"] >= 1 and len(ls._SEGMENT_CACHE) == 0
+    # the next render loads the take from disk (or memory of ComfyUI) — nothing samples
+    p["shots"][0]["status"] = "approved"
+    out, progress, sampled = loop(p, "s1")
+    assert sampled <= 1
+
+
+@CORE_PACKS
+def test_round_4b_standalone_shot_then_bridge_the_gap(loop, monkeypatch):
+    """Every other Shot rendered fresh from the references, the gap bridged."""
+    monkeypatch.setattr(_long_shot_module(), "STORE_ROOT",
+                        os.path.join(folder_paths.get_output_directory(), "longshot"))
+    p = small()
+    p["slug"] = "standalone-test"
+    for i in range(3, 6):
+        p["shots"][i]["bypassed"] = True
+    out, _, sampled = loop(p, "s1")
+    assert sampled == 1
+    studio_step(p, out["longshot"]["plan_json"], {"s1"})
+
+    # Shot 3 on its own: one Shot, no pins at either end
+    out, progress, sampled = loop(p, "s3", standalone=True)
+    rows = out["longshot"]["plan_json"]
+    assert sampled == 1 and progress == [(1, "rendering"), (1, "done")]
+    assert [r["id"] for r in rows] == ["s3"]
+    assert rows[0]["pins"] == {"start": None, "end": None}
+    assert rows[0]["take"].startswith("s3__")
+    studio_step(p, rows, {"s1", "s3"})
+    standalone_take = p["shots"][2]["take"]
+
+    # Locked in a chain right after Shot 1: nothing samples, the join is a hard cut
+    p["shots"][1]["bypassed"] = True
+    out, _, sampled = loop(p, "s3")
+    rows = out["longshot"]["plan_json"]
+    assert sampled == 0
+    assert [r["status"] for r in rows] == ["locked", "locked"]
+    assert [r["seam"] for r in rows] == [None, "mismatch"]
+
+    # Shot 2 back in the gap: it renders as a bridge, pinned to Shot 1's tail and
+    # to the head of the standalone take, and both joins are clean
+    p["shots"][1]["bypassed"] = False
+    out, progress, sampled = loop(p, "s3")
+    rows = out["longshot"]["plan_json"]
+    assert sampled == 1 and progress[1] == (2, "rendering")
+    assert [r["status"] for r in rows] == ["locked", "render", "locked"]
+    assert rows[1]["pins"] == {"start": {"from": 1},
+                               "end": {"to": 3, "kind": "head", "take": standalone_take}}
+    assert [r["seam"] for r in rows] == [None, "ok", "ok"]
+    assert rows[2]["take"] == standalone_take
+    studio_step(p, rows, {"s1", "s2", "s3"})
+
+    # Rerolling the standalone Shot stays standalone: fresh, no pins
+    p["shots"][2].update(shot_seed=4242, lock=None)
+    out, _, sampled = loop(p, "s3", standalone=True)
+    rows = out["longshot"]["plan_json"]
+    assert sampled == 1 and rows[0]["pins"] == {"start": None, "end": None}
+    assert rows[0]["take"] != standalone_take

@@ -2,9 +2,11 @@
 
 Projects are JSON files named by slug:
     <ComfyUI user dir>/default/longshot-studio/projects/<slug>.json
-The slug is fixed when a project is created; renaming changes only the
-display name, so saved segments (output/longshot/<slug>/segments) and the
-input subfolder (input/longshot/<slug>) keep matching.
+A project's files live in folders named by its slug:
+    input/longshot/<slug>/             references, songs, clips
+    output/longshot/<slug>/takes/      rendered Shots (Long Shot takes)
+    output/longshot/<slug>/videos/     rendered videos
+Renaming a project moves both folders to the new name's slug.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.5.0"
+STUDIO_VERSION = "0.6.3"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -372,6 +374,88 @@ def takes_folder(output_dir, slug):
     return os.path.join(output_dir, "longshot", slug, "takes")
 
 
+def videos_folder(output_dir, slug):
+    return os.path.join(output_dir, "longshot", slug, "videos")
+
+
+def videos_subfolder(slug):
+    return f"longshot/{slug}/videos"
+
+
+def list_videos(output_dir, slug):
+    """Video files directly inside output/longshot/<slug>/videos, by name."""
+    folder = videos_folder(output_dir, slug)
+    if not is_slug(slug) or not os.path.isdir(folder):
+        return []
+    return sorted(f for f in os.listdir(folder)
+                  if os.path.isfile(os.path.join(folder, f)) and "." in f
+                  and f.rsplit(".", 1)[1].lower() in VIDEO_EXTENSIONS)
+
+
+# ---------------------------------------------------------------------------
+# After a render: the first-frame PNG and the video without sound
+# ---------------------------------------------------------------------------
+
+# What Video Combine writes per render: <prefix>_00001.png (first frame, with the
+# workflow), <prefix>_00001.mp4 (no sound) and <prefix>_00001-audio.mp4.
+_RENDER_FILE_RE = re.compile(r"(?P<stem>.+)_(?P<n>\d{5,})(?P<audio>-audio)?\.(?P<ext>mp4|mov|webm|mkv)",
+                             re.IGNORECASE)
+
+
+def render_side_files(output_dir, entries, png=False, noaudio=False):
+    """The side files of a render's saved videos that the project doesn't keep.
+
+    `entries` are Video Combine's results for one render ({filename, subfolder,
+    type}). Only files inside output/longshot/… that sit next to one of those
+    videos are returned: its <prefix>_<n>.png (png=True) and, when the entry
+    is the -audio file, the silent <prefix>_<n>.<ext> (noaudio=True). The
+    video the player uses (the -audio one) is never among them."""
+    root = os.path.realpath(os.path.join(output_dir, "longshot"))
+    out = []
+    for e in entries or []:
+        if not isinstance(e, dict) or (e.get("type") or "output") != "output":
+            continue
+        name = e.get("filename")
+        if not isinstance(name, str) or "/" in name or "\\" in name or name in (".", ".."):
+            continue
+        try:
+            sub = _clean_subfolder(e.get("subfolder") or "")
+        except ValueError:
+            continue
+        if sub != "longshot" and not sub.startswith("longshot/"):
+            continue
+        m = _RENDER_FILE_RE.fullmatch(name)
+        if not m:
+            continue
+        folder = os.path.join(output_dir, *sub.split("/"))
+        if not os.path.realpath(folder).startswith(root) or \
+                not os.path.isfile(os.path.join(folder, name)):
+            continue
+        base = f"{m.group('stem')}_{m.group('n')}"
+        want = []
+        if png:
+            want.append(base + ".png")
+        if noaudio and m.group("audio"):
+            want.append(f"{base}.{m.group('ext')}")
+        for f in want:
+            path = os.path.join(folder, f)
+            if os.path.isfile(path) and os.path.realpath(path).startswith(root + os.sep):
+                out.append(path)
+    return list(dict.fromkeys(out))
+
+
+def remove_render_side_files(output_dir, entries, png=False, noaudio=False):
+    """Delete render_side_files(...). Returns the removed paths relative to output/."""
+    removed = []
+    for path in render_side_files(output_dir, entries, png, noaudio):
+        try:
+            os.remove(path)
+            removed.append(os.path.relpath(path, output_dir).replace(os.sep, "/"))
+        except OSError:
+            pass
+    return removed
+
+
 TAKE_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}__\d{1,20}__[0-9a-f]{8}\.safetensors")
 _TAKE_INTS = ("window_frames", "overlap", "width", "height", "seed", "head_audio", "tail_audio")
 
@@ -617,10 +701,27 @@ def rename_project(store, input_dir, output_dir, slug, name, base=None):
         clip = sh.get("clip")
         if isinstance(clip, dict) and (clip.get("subfolder") or "").replace("\\", "/").strip("/") == old_sub:
             clip["subfolder"] = new_sub
+    _move_video_refs(project, slug, new)
     project["name"] = name
     saved_at = store.save(new, project, force=True)
     store.delete(slug)
     return new, saved_at
+
+
+def _move_video_refs(project, old, new):
+    """The player's videos moved with output/longshot/<old>: point at the new folder."""
+    old_root, new_root = f"longshot/{old}", f"longshot/{new}"
+    for key in ("last_output", "final_output"):
+        out = project.get(key)
+        if not isinstance(out, dict):
+            continue
+        for vkey in ("video", "master"):
+            v = out.get(vkey)
+            if not isinstance(v, dict):
+                continue
+            sub = str(v.get("subfolder") or "").replace("\\", "/").strip("/")
+            if sub == old_root or sub.startswith(old_root + "/"):
+                v["subfolder"] = new_root + sub[len(old_root):]
 
 
 # ---------------------------------------------------------------------------
@@ -704,22 +805,61 @@ def export_estimate(input_dir, output_dir, slug, project):
             pass
     folder = takes_folder(output_dir, slug)
     takes = sum(os.path.getsize(os.path.join(folder, n)) for n in _take_files(folder))
-    video = 0
-    lo = (project.get("last_output") or {}).get("video") or {}
-    if lo.get("filename"):
-        p = os.path.join(output_dir, lo.get("subfolder") or "", lo["filename"])
-        video = os.path.getsize(p) if os.path.isfile(p) else 0
-    return {"references": refs, "takes": takes, "video": video}
+    videos = _export_videos(output_dir, slug, project)
+    return {"references": refs, "takes": takes, "videos": sum(os.path.getsize(p) for _, p in videos),
+            "video_files": len(videos)}
+
+
+def _video_path(output_dir, v):
+    """Full path of a {filename, subfolder} output video, or None."""
+    if not isinstance(v, dict) or not v.get("filename"):
+        return None
+    try:
+        sub = _clean_subfolder(v.get("subfolder") or "")
+    except ValueError:
+        return None
+    name = v["filename"]
+    if "/" in name or "\\" in name:
+        return None
+    p = os.path.join(output_dir, *(sub.split("/") if sub else []), name)
+    return p if os.path.isfile(p) else None
+
+
+def _export_videos(output_dir, slug, project):
+    """[(name in the zip's videos/, full path)]: every video in the project's
+    videos folder, plus the player's videos when they are older renders kept
+    elsewhere (output/longshot)."""
+    out, names = [], set()
+    folder = videos_folder(output_dir, slug)
+    for f in list_videos(output_dir, slug):
+        out.append((f, os.path.join(folder, f)))
+        names.add(f)
+    seen = {os.path.realpath(p) for _, p in out}
+    for key in ("last_output", "final_output"):
+        for vkey in ("video", "master"):
+            p = _video_path(output_dir, ((project.get(key) or {}) if isinstance(project.get(key), dict)
+                                         else {}).get(vkey))
+            if p and os.path.realpath(p) not in seen:
+                base, n = os.path.basename(p), 2
+                name = base
+                while name in names:
+                    stem, ext = base.rsplit(".", 1)
+                    name, n = f"{stem} ({n}).{ext}", n + 1
+                out.append((name, p))
+                names.add(name)
+                seen.add(os.path.realpath(p))
+    return out
 
 
 def export_project(input_dir, output_dir, project, dest, takes=True, video=False):
     """Write the project, its reference files, and optionally its takes and
-    last video into the zip at `dest`. Missing files are listed, not fatal."""
+    its videos (video=True: everything in output/longshot/<slug>/videos) into
+    the zip at `dest`. Missing files are listed, not fatal."""
     import zipfile
     slug = project.get("slug") or slugify(project.get("name"))
     manifest = {"format": EXPORT_FORMAT, "studio_version": STUDIO_VERSION, "slug": slug,
                 "name": project.get("name"), "files": [], "missing": [], "takes": [],
-                "video": None}
+                "video": None, "videos": [], "player": {}}
     stored = {}                   # sha/name -> path in zip, so a file goes in once
     with zipfile.ZipFile(dest, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
         for key, item, field in _refs(project):
@@ -747,12 +887,20 @@ def export_project(input_dir, output_dir, project, dest, takes=True, video=False
             for name in _take_files(folder):
                 z.write(os.path.join(folder, name), "takes/" + name)
                 manifest["takes"].append(name)
-        lo = (project.get("last_output") or {}).get("video") or {}
-        if video and lo.get("filename"):
-            p = os.path.join(output_dir, lo.get("subfolder") or "", lo["filename"])
-            if os.path.isfile(p):
-                z.write(p, "video/" + os.path.basename(lo["filename"]))
-                manifest["video"] = "video/" + os.path.basename(lo["filename"])
+        if video:
+            by_path = {}
+            for name, p in _export_videos(output_dir, slug, project):
+                z.write(p, "videos/" + name)
+                manifest["videos"].append(name)
+                by_path[os.path.realpath(p)] = "videos/" + name
+            # which zipped file each of the player's videos is
+            for key in ("last_output", "final_output"):
+                out = project.get(key) if isinstance(project.get(key), dict) else {}
+                for vkey in ("video", "master"):
+                    p = _video_path(output_dir, out.get(vkey))
+                    if p and os.path.realpath(p) in by_path:
+                        manifest["player"][f"{key}.{vkey}"] = by_path[os.path.realpath(p)]
+            manifest["video"] = manifest["player"].get("last_output.video")
         clean = dict(project)
         clean.pop("saved_at", None)
         z.writestr("project.json", json.dumps(clean, ensure_ascii=False, indent=2))
@@ -823,28 +971,52 @@ def import_project(store, input_dir, output_dir, zip_path):
         for sh in project.get("shots") or []:
             if sh.get("take") and sh["take"] not in have:
                 sh["take"] = None              # renders again on this machine
-        vid = manifest.get("video")
-        lo = project.get("last_output") or {}
-        if vid and vid in names and str(vid).startswith("video/") and lo.get("video"):
-            vdir = os.path.join(output_dir, "longshot")
+        # Videos go into the new project's videos folder. Exports from 0.5 carry
+        # only the last preview, as video/<name>.
+        arcs = ["videos/" + str(v) for v in manifest.get("videos") or []]
+        old = manifest.get("video")
+        if old and str(old).startswith("video/"):
+            arcs.append(str(old))
+        vdir = videos_folder(output_dir, slug)
+        placed_v = {}
+        for arc in arcs:
+            if arc not in names or arc in placed_v:
+                continue
+            try:
+                fname = clean_upload_name(os.path.basename(arc), ("video",))
+            except ValueError:
+                continue
             os.makedirs(vdir, exist_ok=True)
-            base = os.path.basename(vid)
-            target, n = os.path.join(vdir, base), 2
+            target, n = os.path.join(vdir, fname), 2
+            stem, ext = fname.rsplit(".", 1)
             while os.path.exists(target):
-                stem, ext = base.rsplit(".", 1)
                 target = os.path.join(vdir, f"{stem} ({n}).{ext}")
                 n += 1
-            with z.open(vid) as src, open(target, "wb") as dst:
+            with z.open(arc) as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst, 1 << 20)
-            lo["video"] = dict(lo["video"], filename=os.path.basename(target), subfolder="longshot",
-                               type="output")
-        else:
-            project["last_output"] = None
-        project.pop("final_output", None)
+            placed_v[arc] = os.path.basename(target)
+        player = dict(manifest.get("player") or {})
+        if old and "last_output.video" not in player:
+            player["last_output.video"] = old
+        for key in ("last_output", "final_output"):
+            out = project.get(key)
+            if not isinstance(out, dict):
+                project[key] = None
+                continue
+            for vkey in ("video", "master"):
+                arc = player.get(f"{key}.{vkey}")
+                if isinstance(out.get(vkey), dict) and arc in placed_v:
+                    out[vkey] = dict(out[vkey], filename=placed_v[arc],
+                                     subfolder=videos_subfolder(slug), type="output",
+                                     workflow=None)     # the first-frame PNG isn't exported
+                elif vkey in out:
+                    out.pop(vkey)
+            if not out.get("video"):
+                project[key] = None
         project["name"] = name
     saved_at = store.save(slug, project, force=True)
     return slug, {"saved_at": saved_at, "files": len(placed), "takes": takes_in,
-                  "missing": manifest.get("missing") or []}
+                  "videos": len(placed_v), "missing": manifest.get("missing") or []}
 
 
 # ---------------------------------------------------------------------------

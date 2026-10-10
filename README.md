@@ -1,5 +1,90 @@
 # H3 Long Shot Studio
 
+## What's new in 0.6.3
+
+Works with H3 Long Shot **1.5.0 or later** (no Long Shot update needed). Replace the
+Studio folder, restart ComfyUI, then hard-refresh the Studio tab.
+
+**Rendering Shots**
+- **▶ Render all** (Shots panel): one run renders every Shot not rendered yet, each
+  continued from the Shot before it. Rendered Shots keep their takes, so gaps between
+  them render as bridges.
+- **▶ Render odd Shots** (Shots panel): Shots 1, 3, 5… each on its own, one after
+  another. Follow with **Render all** to bridge Shots 2, 4, 6….
+- **▶ on any Shot not rendered yet** (in place of its status circle): renders that Shot on
+  its own, fresh from the references. See *Standalone Shots and bridging*.
+- **Gaps render as bridges:** a Shot between two rendered Shots is pinned to the ending of
+  the one before and the opening of the one after.
+- **Rerolling a standalone Shot** next to rendered Shots asks **Pinned to Shot N and Shot
+  M** (default: in place, the neighbours keep their takes, and it's no longer standalone)
+  or **On its own** (a fresh start; the joins become hard cuts until bridged again).
+  Re-rendering one after an edit asks the same.
+- **Clear render** (in an open Shot): back to "not rendered", keeping prompt, length and
+  seed. It then renders again pinned to the Shots around it, or press its ▶ to render it
+  on its own. The old take stays in Take history. The same prompt and seed give the same
+  picture unless something around it changed; use Reroll for a new one.
+- A reroll or bridge renders only that Shot, never a Shot still waiting further left. The
+  main button no longer renders other waiting Shots further down the chain on the way.
+- Standalone Shots are marked *standalone*; a join that is a hard cut shows **↯ hard cut**
+  with **Bridge** (on the Shot card and in Plan).
+
+**Reviewing**
+- **Stitched preview:** after Render odd Shots (or ▶ on a Shot while others are rendered),
+  the preview plays every rendered Shot back to back with the Shots not rendered yet left
+  out. Nothing is sampled; the marks on the scrub bar show the real Shot numbers.
+- **One by one:** when several Shots are under review, the main button becomes **✓ Approve
+  & review Shot N** and jumps to the next one.
+
+**Editing Shots**
+- Editing a Shot's text, seconds or seed shows **▶ Render Shot N** right away, with
+  Approve off. Type it back exactly as it was and the Shot returns to its take and state;
+  nothing re-renders.
+- **One click on Render always works**, also straight from a Shot's text box.
+- **Reset Shot seeds** (next to the seed in Settings) puts the Shots' own seeds back to
+  auto. With approved Shots it asks: all Shots, or only Shots not yet rendered.
+
+**Keeping approved Shots**
+- **Reference changes** (add, swap, edit, bypass, remove) ask **Keep approved Shots**
+  (default) or **Re-render everything**. Kept Shots keep their takes; the change applies
+  from the next Shot you render.
+- **Settings changes** ask the same: steps, sampler, scheduler, shifts, seed mode, Turbo,
+  LoRAs, model, text encoder, VAEs, reference image size and resize, Sage attention and
+  Style & Sound. Kept Shots keep the look of the old settings, so a big change (Turbo on /
+  off, another LoRA) can show between Shots; a different video VAE changes how every Shot
+  decodes, approved ones too.
+- Resolution, aspect and overlap still re-render everything (takes made at another size or
+  overlap can't be reused), as do the audio routes.
+
+**References (Cast & Scenes)**
+- **◀ ▶ under each reference picture** step through the same list as its file menu.
+- **Drop an image on the open reference editor** to replace its picture; typed label and
+  description stay.
+
+**Output files**
+- **Videos go into the project's folder:** `output/longshot/<project>/videos/`, next to its
+  takes. Older renders stay where they are and still play. Renaming a project moves its
+  videos too, and **Open output folder** opens that folder.
+- **Save PNG** and **Save audio-less MP4** (Settings, above *Saved takes*), both off by
+  default: only the video with sound is kept. Videos keep their embedded workflow metadata.
+- **ProRes master** (Settings, under the upscale settings, off by default): **Upscale final
+  video** also writes a 10-bit ProRes 422 HQ `.mov` with sound and workflow metadata next
+  to the MP4.
+- **Export:** **Include videos** (off by default) adds everything in the project's videos
+  folder; Import puts them back.
+- The project list shows a frame of the video when there's no PNG.
+
+**Memory**
+- **Free VRAM**, **Free RAM** and **Clear cache** in the top bar, next to the RAM / GPU /
+  VRAM figures. Free RAM also unloads the models, so the next render loads them from disk;
+  Clear cache drops Long Shot's in-memory pieces (saved takes stay). Disabled while a
+  render runs.
+
+**Fixes**
+- Upscaling the final video a second time with nothing changed no longer says the preview
+  is out of date.
+- A render's leftover PNG / silent video is only removed for files that render made, never
+  for files ComfyUI reused from its cache.
+
 ## What's new in 0.5.0
 
 Needs H3 Long Shot **1.5.0 or later**. Replace both folders, restart ComfyUI, then
@@ -159,7 +244,9 @@ ComfyUI and hard-refresh the page (Ctrl+Shift+R).
   (including Long Shot's per-segment `mmh3.longshot` events), and reads the plan and the video
   from `/history`.
 - Projects are saved as `ComfyUI/user/default/longshot-studio/projects/<slug>.json` (see *Projects*).
-- Videos are saved to `ComfyUI/output/longshot/<project>_00001.mp4`. Video Combine uses NVENC
+- Videos are saved to `ComfyUI/output/longshot/<slug>/videos/<project>_00001-audio.mp4`.
+  Settings decides whether the first-frame PNG (`<project>_00001.png`) and the silent copy
+  (`<project>_00001.mp4`) are kept; both are deleted after each render by default. Video Combine uses NVENC
   when your ffmpeg can actually run it (checked with a one-frame test encode), and the
   software h264 encoder otherwise.
 - The size uses the same rule as ComfyUI's ResolutionSelector and MiniMax's size table
@@ -201,20 +288,21 @@ model when Voice reference is on).
 ### Projects
 
 - **Rename** moves the project's folders with it: `input/longshot/<slug>` and
-  `output/longshot/<slug>` (takes) take the new name, and every reference is updated,
+  `output/longshot/<slug>` (takes and videos) take the new name, and every reference is updated,
   so nothing re-renders. It waits until ComfyUI's queue is empty, and never merges
   into a folder that already exists (it picks `name-2`).
 - **Export…** (Project menu, on the ComfyUI machine) saves one `.zip` with the
   project and every file it uses: reference images, the song and video clips.
   **Include takes** is on by default, so approved Shots open already rendered with
-  their take history; the last preview video is optional. Model files aren't included.
+  their take history. **Include videos** (off by default) adds every video in the
+  project's videos folder. Model files aren't included.
 - **Import…** (or drop the `.zip` anywhere on the page) makes a new project: files go
   into its own folders and every reference is relinked. It never overwrites a project.
 
 - **Slug.** Each project has a fixed slug: its name lower-cased, with other characters
   turned into `-` (for example `my-chase-scene` for "My chase scene"). Names with no Latin letters or
   digits get `project-<hash>`. **Rename** changes only the display name, so the
-  project's takes (`output/longshot/<slug>/takes`) and input folder
+  project's takes and videos (`output/longshot/<slug>/`) and input folder
   (`input/longshot/<slug>`) stay attached.
 - **Menu.** Click the project name for **New project**, **Open…** (with the last
   video's first frame, the save time and progress), **Save** (Ctrl/⌘ S), **Save as…**,
@@ -369,8 +457,13 @@ so segments are reused and only the decode, upscale and save run again.
   while you review.
 - **⤢ Upscale final video** (decision panel, once every Shot is approved). It always
   upscales, with the scale and quality set next to the switch, and saves as
-  `longshot/<project>_final_#####.mp4`. After that, the panel shows the saved file
-  name and offers "again".
+  `longshot/<slug>/videos/<project>_final_#####-audio.mp4`. After that, the panel shows
+  the saved file name and offers "again".
+- **ProRes master** (checkbox under the upscale settings): the final upscale also writes
+  `<project>_final_master_#####-audio.mov`, 10-bit ProRes 422 HQ with PCM sound and the
+  workflow metadata, from the same frames. Expect large files (about 1.3 GB per minute
+  at 1080p). If ComfyUI hasn't loaded the Studio's ProRes format yet (restart), Video
+  Helper Suite's own ProRes is used and the Studio says so.
 - **Scale** is 1.5× or 2×. Higher factors mostly run out of memory on long chains.
 - **RAM.** ComfyUI holds every frame in system RAM as float32, before and after the
   upscale. A 35 s chain at 0.6 MP needs about 20 GB at 1.5× and 30 GB at 2×. The
@@ -414,10 +507,38 @@ so segments are reused and only the decode, upscale and save run again.
 - The first frames after a pinned join can decode very slightly differently; this
   is expected to be invisible.
 
+### Standalone Shots and bridging
+
+On long locked-off takes, small drifts add up from Shot to Shot. To keep drift from
+travelling, render every other Shot fresh and let the Shots between them bridge:
+
+1. **▶ Render odd Shots** renders Shots 1, 3, 5… each on its own, straight from the
+   references (or press **▶** on single Shots).
+2. **▶ Render all** renders Shots 2, 4, 6… in one run, each pinned to the ending of the
+   Shot before it and the opening of the Shot after it.
+3. Review them one by one with **✓ Approve & review Shot N**.
+
+Pressing the main button instead of Render all also works: it renders one gap at a time.
+For the standard workflow (every Shot continued from the one before), use **Render all**
+on its own.
+
+Drift can then build up across one Shot at most. The bridges can only join what the
+standalone Shots give them, so write each standalone Shot to **open close to where the
+previous Shot ends** (same framing, positions and lighting). A bridge shares the overlap
+frames (Advanced → Overlap) at both ends with its neighbours, so the first fraction of a
+second of each standalone Shot is where the bridge arrives.
+
+- A standalone Shot stays locked to its take in every later render; nothing continues
+  it from the left unless you press **Bridge** on it.
+- Rerolling or re-rendering a standalone Shot after an edit keeps it standalone. If the
+  Shot before it was already rendered, that join becomes a hard cut until you reroll the
+  Shot before it (pinned to both ends) or press **Bridge**.
+- Changing references keeps approved standalone Shots, like any approved Shot.
+
 ### Opening folders
 
 The **Open input folder** and **Open output folder** buttons open the folder on the machine
-running ComfyUI. They only work when you browse from that machine (a loopback connection with
+running ComfyUI (the output button opens the project's videos folder and selects the video). They only work when you browse from that machine (a loopback connection with
 no proxy headers). From another device, such as over Tailscale, the buttons are hidden and
 **Download video** appears instead.
 
@@ -434,6 +555,9 @@ no proxy headers). From another device, such as over Tailscale, the buttons are 
     through ComfyUI's real executor. Loaders, decoders and the sampler are stand-ins; Long
     Shot, the prompt nodes, LoadImage, KJ resize and VHS are real, and VHS writes a real mp4.
   - Also covers the HTTP routes.
+  - The ProRes master is written through the real VHS and checked with ffprobe (ProRes HQ,
+    10-bit 4:2:2, PCM sound, workflow metadata), and the PNG / silent-video cleanup runs on
+    real render output.
 - `test_studio_server.py`: who counts as local, open-folder path safety, portable model names.
 - `test_projects.py`:
   - slugs, including non-Latin names;
@@ -442,7 +566,9 @@ no proxy headers). From another device, such as over Tailscale, the buttons are 
   - two-tab conflicts;
   - missing / changed / relinked references;
   - `check-inputs` path refusal;
-  - Delete and Clear touch only the chosen files.
+  - Delete and Clear touch only the chosen files;
+  - videos move with a rename, export / import with and without videos, and the render
+    cleanup never leaves `output/longshot` or touches the video with sound.
 - `test_comfy_integration.py` also covers crash-resume. After a simulated restart,
   nothing is re-sampled and the model never loads until a new Shot renders.
 

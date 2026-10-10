@@ -4,7 +4,7 @@
     GET  /longshot/static/<file>   its JS / CSS
     GET  /longshot/capabilities    {"local": bool} — may this browser open folders?
     GET  /longshot/options         model / LoRA / VAE / CLIP / file lists, sizes, node status
-    POST /longshot/build           {project, upto, dry_run} -> API prompt (graph_builder)
+    POST /longshot/build           {project, upto, dry_run, final, standalone} -> API prompt (graph_builder)
     GET  /longshot/projects        saved projects (newest first)
     POST /longshot/projects        {name, project} -> new project with its own slug
     GET  /longshot/projects/<slug> one project
@@ -16,8 +16,11 @@
     GET  /longshot/takes/<slug>?shot=<id>   takes, oldest first
     DELETE /longshot/takes/<slug>/<name>    delete one take (loopback only)
     POST /longshot/clear-segments  {project} (loopback only)
-    POST /longshot/open-folder     {"which": "output"|"input", "select", "project"} (loopback only)
+    POST /longshot/open-folder     {"which": "output"|"input", "select", "project", "subfolder"} (loopback only)
     POST /longshot/restart         restart ComfyUI (relaunches itself, like ComfyUI-Manager)
+    POST /longshot/cleanup-outputs {prompt_id, png, noaudio}: delete a finished render's
+                                   first-frame PNG and/or silent video (output/longshot only)
+    POST /longshot/clear-cache     drop Long Shot's in-memory pieces (takes on disk stay)
 
 The browser talks to ComfyUI's own endpoints for everything else: /prompt,
 /ws, /history, /view, /interrupt.
@@ -71,11 +74,18 @@ def is_local_request(remote, headers) -> bool:
         return False
 
 
-def folder_for(which, output_dir, input_dir, project=None):
+def folder_for(which, output_dir, input_dir, project=None, subfolder=None):
     """The only folders open-folder may open. Never a path from the browser:
-    the project slug only picks input/longshot/<slug> when that folder exists."""
+    the project slug only picks input/longshot/<slug> or the project's videos
+    folder (output/longshot/<slug>/videos) when that folder exists."""
     if which == "output":
-        return os.path.join(output_dir, gb.OUTPUT_SUBFOLDER)
+        base = os.path.join(output_dir, gb.OUTPUT_SUBFOLDER)
+        if pj.is_slug(project):
+            videos = pj.videos_folder(output_dir, project)
+            sub = str(subfolder or "").replace("\\", "/").strip("/")
+            if os.path.isdir(videos) and sub in ("", pj.videos_subfolder(project)):
+                return videos
+        return base
     if which == "input":
         if pj.is_slug(project):
             sub = os.path.join(input_dir, "longshot", project)
@@ -327,6 +337,84 @@ def make_filmstrip(path, t0, t1, n=6):
     except (OSError, subprocess.SubprocessError):
         return None
     return out if os.path.isfile(out) else None
+
+
+def video_entries(outputs):
+    """Every saved file Video Combine reported in a history entry's outputs."""
+    out = []
+    for node_out in (outputs or {}).values():
+        if not isinstance(node_out, dict):
+            continue
+        for key in ("gifs", "videos"):
+            for e in node_out.get(key) or []:
+                if isinstance(e, dict):
+                    out.append(e)
+    return out
+
+
+def fresh_outputs(entry):
+    """A history entry's outputs without the nodes ComfyUI served from its cache:
+    their files belong to an earlier render."""
+    outputs = dict(entry.get("outputs") or {})
+    for m in (entry.get("status") or {}).get("messages") or []:
+        if isinstance(m, (list, tuple)) and len(m) == 2 and m[0] == "execution_cached":
+            for node in (m[1] or {}).get("nodes") or []:
+                outputs.pop(node, None)
+    return outputs
+
+
+def history_outputs(prompt_id):
+    """The outputs one finished prompt made itself (cached nodes left out), or None."""
+    try:
+        from server import PromptServer
+        h = PromptServer.instance.prompt_queue.get_history(prompt_id=prompt_id)
+    except Exception:
+        return None
+    entry = (h or {}).get(prompt_id)
+    return fresh_outputs(entry) if isinstance(entry, dict) else None
+
+
+def longshot_module():
+    """Long Shot's node module (loaded by ComfyUI under its folder's name)."""
+    for name, mod in list(sys.modules.items()):
+        if name.endswith(".nodes") and hasattr(mod, "clear_segment_cache") \
+                and hasattr(mod, "_SEGMENT_CACHE"):
+            return mod
+    return None
+
+
+def clear_longshot_cache():
+    """Drop the pieces Long Shot keeps in RAM. Returns how many, or None when
+    Long Shot isn't loaded. Takes on disk aren't touched."""
+    import gc
+    mod = longshot_module()
+    if mod is None:
+        return None
+    n = len(mod._SEGMENT_CACHE)
+    mod.clear_segment_cache()
+    gc.collect()
+    return n
+
+
+def register_video_formats():
+    """Let Video Helper Suite find the Studio's own video formats (the 10-bit
+    ProRes master). Works whether VHS loaded before or after the Studio."""
+    import folder_paths
+    folder = os.path.join(HERE, "video_formats")
+    key = "VHS_video_formats"
+    entry = folder_paths.folder_names_and_paths.get(key)
+    if entry is None:
+        folder_paths.folder_names_and_paths[key] = ([folder], {".json"})
+    else:
+        paths, exts = entry
+        if folder not in paths:
+            # VHS creates the entry with a tuple; keep its extensions set
+            folder_paths.folder_names_and_paths[key] = (list(paths) + [folder], exts)
+        exts.add(".json")
+    getattr(folder_paths, "filename_list_cache", {}).pop(key, None)
+    helper = getattr(folder_paths, "cache_helper", None)
+    if helper is not None and hasattr(helper, "cache"):
+        helper.cache.pop(key, None)
 
 
 def comfy_queue_busy():
@@ -584,7 +672,8 @@ def register(routes=None):
         try:
             built = gb.build_prompt(project, upto=body.get("upto"),
                                     dry_run=bool(body.get("dry_run")), env=current_env(),
-                                    final=bool(body.get("final")))
+                                    final=bool(body.get("final")),
+                                    standalone=bool(body.get("standalone")))
         except gb.BuildError as err:
             return error(err)
         return web.json_response(built.as_dict())
@@ -908,7 +997,8 @@ def register(routes=None):
         import folder_paths
         try:
             folder = folder_for(body.get("which"), folder_paths.get_output_directory(),
-                                folder_paths.get_input_directory(), body.get("project"))
+                                folder_paths.get_input_directory(), body.get("project"),
+                                body.get("subfolder"))
         except ValueError as err:
             return error(err)
         os.makedirs(folder, exist_ok=True)
@@ -918,6 +1008,33 @@ def register(routes=None):
         except Exception as err:
             return error(f"Couldn't open the folder: {err}", 500)
         return web.json_response({"opened": folder, "selected": bool(select)})
+
+    @routes.post("/longshot/cleanup-outputs")
+    async def cleanup_outputs(request):
+        """{prompt_id, png, noaudio}: after a render, delete the side files the
+        project doesn't keep. Only files ComfyUI's history lists for that
+        prompt, inside output/longshot, and never the video with sound."""
+        import folder_paths
+        body = await body_of(request)
+        if body is None or not isinstance(body.get("prompt_id"), str):
+            return error("Send {prompt_id, png, noaudio}.")
+        png, noaudio = bool(body.get("png")), bool(body.get("noaudio"))
+        outputs = history_outputs(body["prompt_id"])
+        if outputs is None:
+            return error("ComfyUI has no finished render with that id.", 404)
+        removed = await asyncio.get_running_loop().run_in_executor(
+            None, pj.remove_render_side_files, folder_paths.get_output_directory(),
+            video_entries(outputs), png, noaudio)
+        return web.json_response({"removed": removed})
+
+    @routes.post("/longshot/clear-cache")
+    async def clear_cache(request):
+        if comfy_queue_busy():
+            return error("ComfyUI is rendering. Clear the cache when its queue is empty.", 409)
+        n = await asyncio.get_running_loop().run_in_executor(None, clear_longshot_cache)
+        if n is None:
+            return error("The H3 Long Shot pack isn't loaded.", 404)
+        return web.json_response({"cleared": n})
 
     @routes.post("/longshot/restart")
     async def restart(request):
@@ -933,6 +1050,10 @@ def register(routes=None):
         asyncio.get_running_loop().call_later(0.6, restart_comfyui)
         return web.json_response({"restarting": True})
 
+    try:
+        register_video_formats()
+    except Exception as err:
+        logger.warning("H3 Long Shot Studio: couldn't add its video formats: %s", err)
     try:
         apply_model_folders()
     except Exception as err:      # a broken settings file mustn't stop the page

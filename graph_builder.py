@@ -10,7 +10,7 @@ H3 Ref2V Long Shot workflow:
     UNETLoader -> [Sage] -> SigmaShift -> [Turbo LoRA] -> [LoRA x3] -> BasicScheduler
     LoadImage -> ImageResizeKJv2 -> Long Shot ref_images.ref_image_k
     Subject chain + Shot chain -> Ref Prompt Builder r2v -> long_shot -> Long Shot
-    Long Shot -> VAEDecode + VAEDecodeAudio -> VHS_VideoCombine
+    Long Shot -> VAEDecode + VAEDecodeAudio -> VHS_VideoCombine [+ ProRes master]
     [VHS_LoadAudioUpload -> Song Track / MelBand vocals / Video Combine audio]
 """
 
@@ -28,8 +28,15 @@ MAX_REFERENCES = 9          # Long Shot's ref_images autogrow limit
 MAX_SHOTS = 16              # Long Shot's planner limit
 MAX_SEED = 0xFFFFFFFFFFFFFFFF
 OUTPUT_SUBFOLDER = "longshot"
+VIDEOS_SUBFOLDER = "videos"     # output/longshot/<slug>/videos
 NVENC = "video/nvenc_h264-mp4"
 H264 = "video/h264-mp4"
+# The ProRes master: the Studio's own VHS format (video_formats/ in this pack),
+# fed 16-bit frames so the 10-bit file holds real 10-bit detail. VHS lists a
+# format from an added folder by its file name, .json included.
+PRORES_FORMAT_FILE = "h3-prores-422hq-10bit.json"
+PRORES = "video/" + PRORES_FORMAT_FILE
+VHS_PRORES = "video/ProRes"          # VHS's built-in one: 8-bit input in a 10-bit file
 
 # Same table and maths as ComfyUI's ResolutionSelector (1 MP = 1024 x 1024 px,
 # rounded to multiples of 32), so sizes match MiniMax's published size table.
@@ -181,6 +188,11 @@ def project_slug(project: dict) -> str:
     return slug if pj.is_slug(slug) else pj.slugify(project.get("name"))
 
 
+def videos_subfolder(project: dict) -> str:
+    """Where this project's renders are saved, under ComfyUI's output folder."""
+    return f"{OUTPUT_SUBFOLDER}/{project_slug(project)}/{VIDEOS_SUBFOLDER}"
+
+
 def active_cast(project: dict) -> list:
     return [c for c in project.get("cast") or [] if not c.get("bypassed")]
 
@@ -280,14 +292,18 @@ def required_classes(project: dict, dry_run: bool = False, final: bool = False) 
 
 
 def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
-                 env: Env | None = None, final: bool = False) -> Build:
+                 env: Env | None = None, final: bool = False, standalone: bool = False) -> Build:
     """Turn a Studio project into an API prompt rendering the chain of active
     Shots up to and including `upto` (all active Shots when None).
 
     final=True is "Upscale final video": RTX Super Resolution is always on
     (with the project's scale and quality) and the file is saved as
-    <project>_final_#####.mp4. The Long Shot part is identical, so every
-    segment is reused."""
+    <project>_final_#####.mp4 (plus a ProRes master .mov when the project asks
+    for one). The Long Shot part is identical, so every segment is reused.
+
+    standalone=True renders the Shot `upto` on its own: a one-Shot timeline, so
+    it starts fresh from the references with no pin to the Shots around it. Its
+    take is saved under its id like any other; later chains lock it."""
     env = env or Env()
     if not isinstance(project, dict):
         raise BuildError("The project must be a JSON object.")
@@ -303,6 +319,12 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         raise BuildError("ComfyUI is missing node(s) this project needs:\n  " + "\n  ".join(rows))
 
     chain = chain_upto(project, upto)
+    if standalone:
+        if upto is None:
+            raise BuildError("A standalone render needs the Shot to render.")
+        if chain[-1].get("kind") == "clip":
+            raise BuildError("A clip isn't rendered; it can't render on its own.")
+        chain = chain[-1:]
     if not chain:
         raise BuildError("No active Shots. Add a Shot (or turn one back on) to render.")
     if len(chain) > MAX_SHOTS:
@@ -513,14 +535,35 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             raise BuildError("Video Helper Suite offers neither nvenc nor h264 mp4 output.")
         fmt = H264
         warnings.append("NVENC isn't available; saving with the software h264 encoder.")
-    prefix = f"{OUTPUT_SUBFOLDER}/{safe_name(project.get('name'))}" + ("_final" if upscale_final else "")
+    # Renders go into the project's own folder, next to its takes:
+    # output/longshot/<slug>/videos/<Name>_00001-audio.mp4
+    prefix = f"{videos_subfolder(project)}/{safe_name(project.get('name'))}" + \
+        ("_final" if upscale_final else "")
     # nvenc takes a bitrate; the software h264 format takes a quality (crf) instead.
     quality = dict(bitrate=8, megabit=True) if fmt == NVENC else dict(crf=19)
+    out_audio = loader if final else decoded_audio
     combine = g.add("combine", "VHS_VideoCombine", "Video Combine",
                     frame_rate=FPS, loop_count=0, filename_prefix=prefix, format=fmt,
                     pix_fmt="yuv420p", **quality, save_metadata=True,
-                    pingpong=False, save_output=True, images=images,
-                    audio=loader if final else decoded_audio)
+                    pingpong=False, save_output=True, images=images, audio=out_audio)
+
+    if upscale_final and s.get("prores_master"):
+        # A second Video Combine on the same frames and sound: a ProRes 422 HQ
+        # master (.mov, PCM audio, workflow metadata) next to the mp4.
+        if env.video_formats is None or PRORES in env.video_formats:
+            pr_fmt, pr_extra = PRORES, dict(save_metadata=True)
+        elif VHS_PRORES in env.video_formats:
+            pr_fmt, pr_extra = VHS_PRORES, dict(profile="hq")
+            warnings.append("The Studio's 10-bit ProRes format isn't loaded (restart ComfyUI); "
+                            "the master is saved with Video Helper Suite's ProRes, from 8-bit "
+                            "frames in a 10-bit file.")
+        else:
+            raise BuildError("Video Helper Suite offers no ProRes format for the master file. "
+                             "Update ComfyUI-VideoHelperSuite, or turn the ProRes master off.")
+        g.add("combine_prores", "VHS_VideoCombine", "ProRes master",
+              frame_rate=FPS, loop_count=0, filename_prefix=prefix + "_master", format=pr_fmt,
+              **pr_extra, pingpong=False, save_output=True, images=images, audio=out_audio)
+        ids["prores"] = "combine_prores"
 
     ids.update(longshot="longshot", combine="combine", builder="builder")
     return Build(prompt=g.nodes, width=width, height=height,

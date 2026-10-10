@@ -1,0 +1,14 @@
+{
+    "main_pass":
+    [
+        "-n", "-c:v", "prores_ks", "-profile:v", "hq", "-vendor", "apl0",
+        "-pix_fmt", "yuv422p10le",
+        "-vf", "scale=out_color_matrix=bt709",
+        "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"
+    ],
+    "fake_trc": "bt709",
+    "input_color_depth": "16bit",
+    "audio_pass": ["-c:a", "pcm_s16le", "-movflags", "use_metadata_tags"],
+    "save_metadata": ["save_metadata", "BOOLEAN", {"default": true}],
+    "extension": "mov"
+}

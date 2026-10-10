@@ -35,6 +35,11 @@
   </div>
   <div class="top-right">
     <div id="sysstats" class="sysstats mono" hidden></div>
+    <div class="mem-btns" role="group" aria-label="Free memory">
+      <button class="ghost xs" data-action="free-vram" id="free-vram" title="Free VRAM: move the models out of the GPU. ComfyUI keeps them in RAM, so the next render starts quickly.">Free VRAM</button>
+      <button class="ghost xs" data-action="free-ram" id="free-ram" title="Free RAM: unload the models and clear ComfyUI's cache. The next render loads the models from disk again (slower start).">Free RAM</button>
+      <button class="ghost xs" data-action="clear-cache" id="clear-cache" title="Clear cache: drop the Shot pieces Long Shot keeps in RAM. Saved takes on disk stay, and Shots load from them.">Clear cache</button>
+    </div>
     <button class="ghost sm restart-btn" data-action="restart" id="restart-btn" title="Restart ComfyUI (finished segments are kept on disk)">
       <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7a5 5 0 1 1-1.5-3.6"/><path d="M12 1.8v2.6H9.4"/></svg>
       Restart
@@ -84,8 +89,14 @@
 
     <div class="panel" id="shots-panel">
       <div class="panel-head">
-        <h2>Shots</h2>
-        <span class="muted small">approved shots keep their takes; a re-render is pinned to the shots around it</span>
+        <div class="head-left">
+          <h2>Shots</h2>
+          <span class="muted small">approved shots keep their takes; a re-render is pinned to the shots around it</span>
+        </div>
+        <div class="head-right render-btns">
+          <button class="ghost sm" data-action="render-all" id="render-all" title="Render every Shot not rendered yet in one go, each continued from the Shot before it. Rendered Shots keep their takes, so gaps render as bridges.">▶ Render all</button>
+          <button class="ghost sm" data-action="render-odd" id="render-odd" title="Render Shots 1, 3, 5… that aren't rendered yet, each on its own (a fresh start from the references). Then Render all bridges the Shots in between.">▶ Render odd Shots</button>
+        </div>
       </div>
       <div class="first-row">
         <button class="addtile wide first" data-action="add-first" id="add-first" hidden></button>
@@ -239,6 +250,7 @@
     <label class="confirm-check" id="confirm-check-row" hidden><input type="checkbox" id="confirm-check"> <span id="confirm-check-label"></span></label>
     <div class="dialog-actions">
       <button class="ghost" id="confirm-no"></button>
+      <button class="ghost" id="confirm-alt" hidden></button>
       <button class="primary sm-primary" id="confirm-yes"></button>
     </div>
   </div>

@@ -54,6 +54,8 @@ const S = {
   conn: "connecting", open: null, takes: {}, styleOpen: false, audioOpen: false, advOpen: false, settingsOpen: true, uploading: {},
   busy: null, error: null, loop: false, dry: null, saveState: "",
   refState: {}, refInfo: {}, inputs: null, segStats: null, conflict: null, checkedFor: null,
+  gen: 0,          // bumped by every re-queue rule, so an edited Shot only returns to its take if nothing else changed
+  bad: {},         // "<shot id>:<field>" -> the field holds something that isn't a value yet (typing)
 };
 const P = () => S.project;
 
@@ -65,6 +67,8 @@ const DEFAULT_SETTINGS = {
   sampler: "er_sde", scheduler: "beta57", overlap: 22, seed: 1722, seed_mode: "increment",
   shift_video: 12, shift_audio: 3, sage_attention: "auto", save_segments: true,
   rtx_vsr: { on: false, scale: 2, quality: "ULTRA" },
+  save_png: false, save_noaudio: false,      // Video Combine's side files: deleted after each render
+  prores_master: false,                      // Upscale final also writes a 10-bit ProRes 422 HQ .mov
 };
 
 function normalize(p) {
@@ -82,8 +86,15 @@ function normalize(p) {
     was_approved: !!s.was_approved, was_rendered: !!s.was_rendered,
     prev_seeds: Array.isArray(s.prev_seeds) ? s.prev_seeds.slice(-10) : [],
     take: s.take || null, window: s.window || null, take_seconds: s.take_seconds ?? null,
+    // what the current take was rendered with: editing back to exactly this brings the take back
+    rendered: s.rendered && typeof s.rendered === "object" ? s.rendered
+      : s.take && s.status !== "queued" ? { text: s.text || "", seconds: Number(s.seconds) || 5, seed: s.shot_seed ?? -1 } : null,
+    edit_from: s.edit_from && typeof s.edit_from === "object" ? Object.assign({}, s.edit_from, { gen: 0 }) : null,
     join: s.join === "cut" ? "cut" : "bridge",
     kind: s.kind === "clip" ? "clip" : "shot",
+    standalone: !!s.standalone && s.kind !== "clip",   // its take was rendered on its own (no pins)
+    seam: ["ok", "mismatch"].includes(s.seam) ? s.seam : null,   // its left join, as last known
+    cleared: !!s.cleared && s.status === "queued",              // Clear render: waiting to render again
     clip: s.kind === "clip" ? Object.assign({ file: "", subfolder: "", original_name: "", sha256: null,
       size_bytes: null, trim_in: 0, frames: 0, duration: null, fps: null, width: null, height: null,
       has_audio: false, audio: "mute" }, s.clip || {}) : null }));
@@ -108,6 +119,45 @@ const numOf = (id) => active().findIndex((s) => s.id === id) + 1;
 const titleOf = (s) => (s ? "Shot " + numOf(s.id) : "—");
 const reviewShot = () => active().find((s) => s.status === "review");
 const nextQueued = () => active().find((s) => s.status === "queued");
+
+/** The Shot the main button renders: the first queued one, except that a queued
+ *  standalone Shot right after it goes first, so the gap can bridge into it. */
+function nextToRender() {
+  const nx = nextQueued();
+  if (!nx || nx.kind === "clip" || nx.standalone) return nx;
+  const act = active();
+  const after = act[act.indexOf(nx) + 1];
+  return after && after.kind !== "clip" && after.standalone && after.status === "queued" ? after : nx;
+}
+
+/** A join that's a hard cut: the seam Long Shot reported for this Shot's left
+ *  join in the last render that had both Shots (remembered on the Shot, since a
+ *  standalone render shows only one Shot). */
+function cutBefore(s) {
+  if (!s || s.bypassed || s.status === "queued") return false;
+  const act = active(), prev = act[act.indexOf(s) - 1];
+  if (!prev || s.join === "cut" || prev.kind === "clip" || s.kind === "clip" || prev.status === "queued") return false;
+  const row = lastRowFor(s.id), lo = last();
+  if (row && lo && lo.chain.includes(prev.id) && row.seam) return row.seam === "mismatch";
+  return s.seam === "mismatch";
+}
+
+/** Remember each join's state from a render, for the Shots it showed. */
+function noteSeams(rows, chain, standalone) {
+  const byId = new Map(P().shots.map((x) => [x.id, x]));
+  rows.forEach((r, i) => {
+    const sh = byId.get(chain[i]);
+    if (!sh || sh.kind === "clip") return;
+    if (i > 0) sh.seam = r.seam === "mismatch" ? "mismatch" : r.seam === "ok" ? "ok" : null;
+  });
+  if (standalone && chain.length === 1) {
+    // a fresh take: nothing leads into it, and the Shot after it no longer follows on
+    const act = active(), sh = byId.get(chain[0]), i = act.indexOf(sh);
+    const prev = act[i - 1], next = act[i + 1];
+    sh.seam = prev && isRendered(prev) && prev.kind !== "clip" && sh.join !== "cut" ? "mismatch" : null;
+    if (next && next.kind !== "clip" && next.status !== "queued" && next.join !== "cut") next.seam = "mismatch";
+  }
+}
 const renderingId = () => (S.busy && (S.busy.kind === "render" || S.busy.kind === "reroll") ? S.busy.target : null);
 const clock = (iso) => (iso || "").slice(11, 16);
 
@@ -223,6 +273,8 @@ function autoPickModels(p) {
 async function loadProject(slug) {
   stopPreview();
   const p = await api("/longshot/projects/" + encodeURIComponent(slug));
+  S.gen = 0;
+  S.bad = {};
   S.project = normalize(p);
   if (autoPickModels(S.project)) scheduleSave();
   const relinked = relinkModels(S.project);
@@ -289,8 +341,10 @@ async function checkInputs() {
   }
   S.refState = state;
   const audioMatters = p.audio.lip_sync || p.audio.voice_ref;
-  if (changed.some((k) => k !== "audio") || (changed.includes("audio") && audioMatters)) {
-    sharedChanged("A reference file");
+  if (changed.includes("audio") && audioMatters) sharedChanged("The song file");
+  else if (changed.some((k) => k !== "audio")) {
+    // a reference picture changed on disk: approved Shots may keep their takes
+    applyRefChange((await askRefChange("A reference file changed on disk")) || "keep", "A reference file");
   }
   if (adopted) scheduleSave();
   await relinkMissing();
@@ -322,15 +376,17 @@ async function relinkMissing() {
       if (f.match === "name") {
         const ok = await confirmBox({ title: `Use ${f.name}?`,
           body: `${refLabel(f.key)} is missing. A file with the same name is in ${f.subfolder ? "input/" + f.subfolder : "the input folder"}, ` +
-            "but it isn't the same file that was saved, so every Shot will render again.",
+            "but it isn't the same file that was saved, so it counts as a new picture.",
           yes: "Use it", no: "Not now" });
         if (!ok) continue;
       }
       setRefFile(f.key, f);
       S.refState[f.key] = "ok";
       S.refInfo[f.key] = Object.assign({ state: "ok" }, f);
-      if (f.match === "name" && refMatters(f.key)) sharedChanged(f.key === "audio" ? "Audio" : "Cast & Scenes");
-      else quiet++;
+      if (f.match === "name" && refMatters(f.key)) {
+        if (f.key === "audio" || f.key.startsWith("clip:")) sharedChanged(f.key === "audio" ? "Audio" : "Cast & Scenes");
+        else applyRefChange((await askRefChange(`${refLabel(f.key)} is a different picture`)) || "keep", "Cast & Scenes");
+      } else quiet++;
     }
     if (quiet) toast(`Found ${quiet} missing file${quiet > 1 ? "s" : ""} again — relinked, nothing re-renders.`);
     await loadInputs();
@@ -420,6 +476,7 @@ function syncAfter(s, what) {
 function editInPlace(s, field) {
   const wasRendered = s.status !== "queued";
   s.status = "queued";
+  s.edit_from = null;
   S.dry = null;
   if (field === "seconds" && syncAfter(s, `${titleOf(s)} changed length`)) return;
   const after = renderedAfter(s);
@@ -433,6 +490,7 @@ function editInPlace(s, field) {
 
 /** Editing a Shot: it and every Shot after it are queued again. */
 function queueFrom(id, includeSelf = true) {
+  S.gen++;
   const shots = P().shots;
   const i = shots.findIndex((s) => s.id === id);
   shots.forEach((s, k) => {
@@ -445,6 +503,7 @@ function queueFrom(id, includeSelf = true) {
 function sharedChanged(what, quiet = false) {
   const rendered = active().filter((s) => s.status !== "queued");
   S.dry = null;
+  S.gen++;
   if (!rendered.length) return;
   for (const s of P().shots) {
     if (s.status === "approved") s.was_approved = true;
@@ -453,6 +512,70 @@ function sharedChanged(what, quiet = false) {
   }
   if (!quiet) toast(`${what} changed — all ${rendered.length} rendered shot${rendered.length > 1 ? "s" : ""} ` +
         "will render again from Shot 1. Earlier approvals are flagged.");
+}
+
+/** Approved generated Shots (clips are always "approved" and don't count). */
+const approvedShots = () => active().filter((s) => s.kind !== "clip" && s.status === "approved");
+
+/** Cast & Scenes changed with approved Shots: they keep their takes (locked
+ *  takes never sample) and the change applies from the next Shot rendered.
+ *  Shots under review render again. */
+function keepApproved(what, withAction = false) {
+  S.dry = null;
+  S.gen++;
+  const redo = [];
+  for (const s of active()) {
+    if (s.kind === "clip") continue;
+    if (s.status === "review") { s.was_rendered = true; s.status = "queued"; redo.push(s); }
+  }
+  const n = approvedShots().length;
+  const msg = `${what} changed. ${n} approved Shot${n > 1 ? "s keep their takes" : " keeps its take"}; ` +
+    `the change applies from the next Shot you render.` +
+    (redo.length ? ` ${redo.map(titleOf).join(", ")} will render again.` : "");
+  toast(msg, withAction ? { label: "Re-render everything", fn: () => { sharedChanged(what); commit(); } } : undefined);
+}
+
+/** Ask how a Cast & Scenes change treats approved Shots. "keep" | "all" | null (cancelled).
+ *  Nothing approved: "all", no dialog (the change re-renders what's rendered, as before). */
+async function askRefChange(title) {
+  const ap = approvedShots();
+  if (!ap.length) return "all";
+  const review = active().filter((s) => s.kind !== "clip" && s.status === "review");
+  const rendered = active().filter((s) => s.status !== "queued" && s.kind !== "clip");
+  const est = estimateFor(rendered);
+  const ans = await confirmBox({ title: `${title}`,
+    body: `Keep approved Shots: the ${ap.length} approved Shot${ap.length > 1 ? "s keep their takes" : " keeps its take"} ` +
+      "and nothing re-renders for them; the change applies from the next Shot you render" +
+      (review.length ? ` (${review.map(titleOf).join(", ")} under review render${review.length > 1 ? "" : "s"} again)` : "") +
+      `. Re-render everything: all ${rendered.length} rendered Shot${rendered.length > 1 ? "s" : ""} render again with the change` +
+      (est ? `, ${est}` : "") + "; approvals are kept as a flag.",
+    yes: "Keep approved Shots", alt: "Re-render everything", no: "Cancel" });
+  return ans === true ? "keep" : ans === "alt" ? "all" : null;
+}
+
+/** Settings whose change approved takes don't depend on (item 2, round 5).
+ *  Resolution, aspect and overlap aren't here: takes made at another size or
+ *  overlap can't be loaded, so those still re-render everything. */
+const KEEPABLE = { steps: "steps", sampler: "the sampler", scheduler: "the scheduler",
+  shift_video: "the video shift", shift_audio: "the audio shift", seed_mode: "the seed mode",
+  sage_attention: "Sage attention", ref_resize_px: "the reference resize", model: "the model",
+  clip: "the text encoder", video_vae: "the video VAE", audio_vae: "the audio VAE" };
+
+/** Same choice as for references: keep approved Shots (default) or re-render everything. */
+async function askSettingChange(title) {
+  return askRefChange(`${title}?`);
+}
+
+function applyRefChange(mode, what, quiet = false) {
+  if (mode === "keep") keepApproved(what);
+  else sharedChanged(what, quiet);
+}
+
+/** No dialog (◀ ▶ under a reference): approved Shots are kept, with an undo-style
+ *  toast to re-render everything instead. */
+function refChangedQuietly(what) {
+  if (approvedShots().length) keepApproved(what, true);
+  else sharedChanged(what);
 }
 
 // ---------------------------------------------------------------------------
@@ -490,11 +613,15 @@ const isRendered = (s) => s.kind === "clip" || (s.status !== "queued" && !!s.tak
 function chainEnd(targetId) {
   const act = active();
   let end = act.findIndex((s) => s.id === targetId);
-  act.forEach((s, i) => { if (isRendered(s) && i > end) end = i; });
-  return end >= 0 ? act[end].id : targetId;
+  if (end < 0) return targetId;
+  // only the rendered Shots right after it: a later Shot still queued (another
+  // gap between standalone Shots) isn't sampled on the way
+  while (end + 1 < act.length && isRendered(act[end + 1])) end++;
+  return act[end].id;
 }
 
-async function queue({ upto, dry, kind, label, note, onDone, final = false }) {
+async function queue({ upto, dry, kind, label, note, onDone, final = false, standalone = false, batch = null,
+  omit = null, trimLeft = false }) {
   if (S.busy) return;
   if (Object.keys(S.uploading).length) { toast("Wait for the image upload to finish."); return; }
   S.error = null;
@@ -515,9 +642,21 @@ async function queue({ upto, dry, kind, label, note, onDone, final = false }) {
     if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
     return;
   }
-  let project = sendable(P());
+  let project = sendable(P());          // seeds are settled on the whole timeline first
   const target = upto;
-  if (kind === "render" || kind === "reroll" || kind === "refresh") upto = chainEnd(upto);
+  if (!standalone && !omit && (kind === "render" || kind === "reroll" || kind === "refresh")) upto = chainEnd(upto);
+  // Shots left out of this render (sent bypassed; the project itself is untouched):
+  // omit = given ids (the stitched preview leaves out Shots not rendered yet);
+  // trimLeft = everything up to the last Shot before the target that isn't
+  // rendered, so a waiting gap further left is never sampled on the way.
+  const drop = new Set(omit || []);
+  if (trimLeft) {
+    const act = active(), ti = act.findIndex((x) => x.id === target);
+    let k = -1;
+    act.forEach((x, i) => { if (i < ti && !isRendered(x)) k = i; });
+    act.slice(0, k + 1).forEach((x) => drop.add(x.id));
+  }
+  if (drop.size) project.shots.forEach((x) => { if (drop.has(x.id)) x.bypassed = true; });
   if (audioMissing() && (project.audio.lip_sync || project.audio.voice_ref || project.audio.final_override)) {
     project = Object.assign({}, project, { audio: Object.assign({}, project.audio,
       { lip_sync: false, voice_ref: false, final_override: false }) });
@@ -525,7 +664,7 @@ async function queue({ upto, dry, kind, label, note, onDone, final = false }) {
   }
   let built;
   try {
-    built = await api("/longshot/build", { method: "POST", body: { project, upto, dry_run: !!dry, final } });
+    built = await api("/longshot/build", { method: "POST", body: { project, upto, dry_run: !!dry, final, standalone } });
   } catch (e) {
     S.error = e.message;
     render();
@@ -543,8 +682,11 @@ async function queue({ upto, dry, kind, label, note, onDone, final = false }) {
     return;
   }
   if (kind === "render" || kind === "reroll" || kind === "final" || kind === "refresh") saveNow();   // approvals / new seed survive a closed tab
+  // what each Shot is rendered with, so an edit back to exactly this can bring the take back
+  const sent = {};
+  for (const sh of project.shots) sent[sh.id] = { text: sh.text || "", seconds: Number(sh.seconds) };
   S.busy = {
-    promptId: res.prompt_id, kind, target, label, note, baseNote: note, built, onDone,
+    promptId: res.prompt_id, kind, target, label, note, baseNote: note, built, onDone, sent, batch, standalone,
     of: built.chain.length, segs: {}, segT0: {}, step: 0, phase: "queued", started: Date.now(),
   };
   if (kind === "render" || kind === "reroll") S.open = target;
@@ -627,20 +769,71 @@ async function finish(promptId, entry) {
       S.error = "Long Shot returned no plan data. Update the H3 Long Shot pack to the version " +
                 "shipped with the Studio (it adds the plan and progress hooks).";
     } else {
-      try { b.onDone({ rows: ls.plan_json, text: (ls.text || [""])[0], outputs, built: b.built }); }
+      // ComfyUI can hand back a cached Long Shot's rows without Shot ids; the
+      // rows follow the chain the Studio built, so the ids come from there.
+      const rows = ls.plan_json;
+      if (Array.isArray(rows) && rows.length === b.built.chain.length) {
+        rows.forEach((r, i) => { if (r && !r.id) r.id = b.built.chain[i]; });
+      }
+      try { b.onDone({ rows, text: (ls.text || [""])[0], outputs, built: b.built, sent: b.sent }); }
       catch (e) { S.error = "Couldn't read the result: " + e.message; }
     }
   }
   render();
   if (b.kind === "render" || b.kind === "reroll" || b.kind === "final" || b.kind === "refresh") {
     if (!S.error) adoptCurrentFiles();
+    if (entry && !failed) await cleanupOutputs(promptId, entry.outputs);
     loadSegStats().then(renderSettings);
     saveNow();                       // save right after every finished render
   } else scheduleSave();
+  // Render odd Shots: the next one in the list, unless this one failed or was stopped
+  const ok = !failed && !stopped && !b.stopped && !S.error && !!entry;
+  let more = false;
+  if (b.batch) {
+    const rest = b.batch.ids.filter((id) => { const x = P().shots.find((y) => y.id === id); return x && !x.bypassed && x.status === "queued"; });
+    if (ok && rest.length) {
+      more = true;
+      setTimeout(() => renderAlone(P().shots.find((x) => x.id === rest[0]), { ids: rest.slice(1), of: b.batch.of }), 0);
+    } else if (!ok && rest.length) toast(`Render odd Shots stopped; ${rest.length} Shot${rest.length > 1 ? "s" : ""} still to render.`);
+  }
+  // A Shot rendered on its own shows alone; once the run is over, the preview
+  // shows every rendered Shot back to back so each one can be reviewed.
+  if (ok && b.standalone && !more && active().filter(isRendered).length > 1) setTimeout(() => stitchPreview(b.target), 0);
 }
 
-/** Every rendered piece keeps its take, window and (frozen) seed. */
-function adoptRows(rows) {
+/** Item 3: the preview from every rendered Shot, in order, with the Shots not
+ *  rendered yet left out (hard cuts there). Every Shot loads its take. */
+function stitchPreview(focusId) {
+  if (S.busy || !P()) return;
+  const act = active(), done = act.filter(isRendered);
+  if (done.length < 2) return;
+  const gaps = act.filter((x) => !isRendered(x)).map((x) => x.id);
+  queue({ upto: done[done.length - 1].id, kind: "refresh", omit: gaps,
+    label: "Updating the preview · rendered Shots back to back",
+    note: gaps.length ? "Nothing is sampled · Shots not rendered yet are left out" : "Nothing is sampled",
+    onDone: onRendered(null, false, { gaps: gaps.length > 0, focus: focusId }) });
+}
+
+/** Save PNG / Save audio-less MP4 are off: delete those side files of the render
+ *  that just finished (the video with sound is the one the player uses). */
+async function cleanupOutputs(promptId, outputs) {
+  const s = P().settings;
+  if (s.save_png && s.save_noaudio) return;
+  try {
+    await api("/longshot/cleanup-outputs", { method: "POST",
+      body: { prompt_id: promptId, png: !s.save_png, noaudio: !s.save_noaudio } });
+  } catch (e) { return; }
+  if (s.save_png) return;
+  const made = new Set();
+  for (const o of Object.values(outputs || {})) for (const g of (o && o.gifs) || []) made.add(g.filename);
+  for (const o of [P().last_output, P().final_output]) {
+    for (const k of ["video", "master"]) if (o && o[k] && made.has(o[k].filename)) o[k].workflow = null;
+  }
+}
+
+/** Every rendered piece keeps its take, window and (frozen) seed, and what it
+ *  was rendered with (text, seconds, seed). */
+function adoptRows(rows, sent, standalone = false) {
   const byId = new Map(P().shots.map((x) => [x.id, x]));
   for (const r of rows) {
     const sh = r.id && byId.get(r.id);
@@ -649,15 +842,22 @@ function adoptRows(rows) {
     sh.window = r.window_frames;
     sh.take_seconds = Number(sh.seconds);
     if (!(Number(sh.shot_seed) >= 0) && r.seed !== null && r.seed !== undefined) sh.shot_seed = r.seed;
+    const was = (sent || {})[sh.id] || { text: sh.text, seconds: Number(sh.seconds) };
+    sh.rendered = { text: was.text, seconds: was.seconds, seed: Number(sh.shot_seed) };
+    sh.edit_from = null;
+    // a new take: standalone or continued (the first Shot has nothing before it either way)
+    if (r.status !== "locked") sh.standalone = !!standalone && active()[0] !== sh;
+    sh.cleared = false;
   }
 }
 
-function onRendered(targetId) {
-  return ({ rows, text, outputs, built }) => {
+function onRendered(targetId, standalone = false, opts = {}) {
+  return ({ rows, text, outputs, built, sent }) => {
     const combine = outputs[built.nodes.combine] || {};
     const video = (combine.gifs || combine.videos || [])[0];
     if (!video) throw new Error("Video Combine saved no file.");
-    adoptRows(rows);
+    adoptRows(rows, sent, standalone);
+    if (!opts.gaps) noteSeams(rows, built.chain, standalone);    // joins next to a left-out gap aren't real
     for (const s of P().shots) {
       if (built.chain.includes(s.id) && s.id !== targetId && s.status === "queued") {
         // rendered on the way to the target (or past it, to the last rendered Shot)
@@ -667,13 +867,19 @@ function onRendered(targetId) {
     }
     const target = targetId && P().shots.find((s) => s.id === targetId);
     if (target) { target.status = "review"; target.was_rendered = false; target.was_approved = false; }
+    // a Shot edited while this rendered no longer matches its new take
+    for (const s of P().shots) if (s.kind !== "clip" && s.status !== "queued" && s.rendered && !matchesRendered(s)) {
+      s.edit_from = { status: s.status, was_approved: s.was_approved, was_rendered: s.was_rendered, take: s.take, gen: S.gen };
+      s.status = "queued";
+    }
     const at = new Date().toISOString();
     P().last_output = { video, plan: rows, chain: built.chain, text,
       size: [built.width, built.height], at, source_at: at };
     P().preview_dirty = false;
     S.dry = null;
     if (targetId) S.open = targetId;
-    const row = targetId ? rows[built.chain.indexOf(targetId)] : null;
+    const focus = targetId || opts.focus;
+    const row = focus && built.chain.includes(focus) ? rows[built.chain.indexOf(focus)] : null;
     loadVideo(row ? row.start + 0.04 : video.currentTime || 0);
     const cuts = rows.filter((r) => r.seam === "mismatch").map((r) => r.index);
     if (cuts.length) {
@@ -701,12 +907,26 @@ function refreshPreview() {
     note: "Every Shot loads its take · nothing is sampled", onDone: onRendered(null) });
 }
 
-function primary() {
-  const rv = reviewShot(), nx = nextQueued();
+async function primary() {
+  const rv0 = reviewShot(), nx0 = nextToRender();
+  let alone = false;
+  if (nx0 && nx0.standalone) {
+    const mode = await askStandalone(nx0, "Render");
+    if (!mode || S.busy) return;
+    alone = mode === "alone";
+  }
+  const rv = reviewShot(), nx = nextToRender();
+  if (rv !== rv0 || nx !== nx0) return;        // something changed while the dialog was open
   if (rv) { rv.status = "approved"; rv.was_approved = false; }
   if (!nx && previewStale()) { refreshPreview(); return; }
   if (!nx) { scheduleSave(); render(); return; }
+  if (nx.standalone && alone) { renderAlone(nx); return; }
   const n = numOf(nx.id);
+  if (nx.standalone) {
+    queue({ upto: nx.id, kind: "render", trimLeft: true, label: `Rendering Shot ${n} · ${pinnedNote(nx)}`,
+      note: "In place · the Shots around it keep their takes", onDone: onRendered(nx.id) });
+    return;
+  }
   const others = active().filter((x) => x !== nx && isRendered(x)).length;
   queue({ upto: nx.id, kind: "render", label: "Rendering Shot " + n,
     note: others ? `${others} Shot${others > 1 ? "s" : ""} load${others > 1 ? "" : "s"} ${others > 1 ? "their" : "its"} take · only Shot ${n} renders`
@@ -714,15 +934,103 @@ function primary() {
     onDone: onRendered(nx.id) });
 }
 
-function reroll() {
+async function reroll() {
   const rv = reviewShot();
   if (!rv || S.busy) return;
+  let alone = false;
+  if (rv.standalone) {
+    const mode = await askStandalone(rv, "Reroll");
+    if (!mode || S.busy || reviewShot() !== rv) return;
+    alone = mode === "alone";
+  }
   rememberTake(rv);
   rv.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
   rv.status = "queued";
   const n = numOf(rv.id);
-  queue({ upto: rv.id, kind: "reroll", label: `Re-rolling Shot ${n} · seed ${rv.shot_seed}`,
-    note: "Every other Shot keeps its take", onDone: onRendered(rv.id) });
+  queue({ upto: rv.id, kind: "reroll", standalone: alone, trimLeft: !alone,
+    label: `Re-rolling Shot ${n}${alone ? " on its own" : rv.standalone ? " · " + pinnedNote(rv) : ""} · seed ${rv.shot_seed}`,
+    note: alone ? "A fresh start · no pins to the Shots around it" : "Every other Shot keeps its take",
+    onDone: onRendered(rv.id, alone) });
+}
+
+/** Shots the panel buttons would render: not rendered yet, generated, active. */
+const toRender = () => active().filter((s) => s.kind !== "clip" && s.status === "queued");
+const oddToRender = () => toRender().filter((s) => numOf(s.id) % 2 === 1);
+
+/** ▶ Render all: one run through every Shot not rendered yet, each continued
+ *  from the Shot before it (the standard workflow). Rendered Shots keep their
+ *  takes, so gaps between them render as bridges. All land under review. */
+function renderAll() {
+  if (busyGuard()) return;
+  const list = toRender();
+  if (!list.length) { toast("Every Shot is rendered."); return; }
+  const lastOne = list[list.length - 1];
+  const others = active().filter((x) => isRendered(x)).length;
+  queue({ upto: lastOne.id, kind: "render", label: `Rendering all · ${list.length} Shot${list.length > 1 ? "s" : ""}`,
+    note: others ? `${others} rendered Shot${others > 1 ? "s keep their takes" : " keeps its take"} · each new Shot continues from the one before`
+      : "Each Shot continues from the one before",
+    onDone: onRendered(lastOne.id) });
+}
+
+/** ▶ Render odd Shots: Shots 1, 3, 5… not rendered yet, each on its own, one
+ *  render after another. Then Render all (or the main button) bridges the gaps. */
+function renderOdd() {
+  if (busyGuard()) return;
+  const list = oddToRender();
+  if (!list.length) { toast("Every odd Shot is rendered."); return; }
+  renderAlone(list[0], { ids: list.slice(1).map((x) => x.id), of: list.length });
+}
+
+/** Item 4 (round 5): a standalone Shot re-rendering next to rendered Shots —
+ *  pinned to them in place (default), or on its own again.
+ *  "pinned" | "alone" | null (cancelled). No rendered neighbour: "alone". */
+async function askStandalone(s, verb) {
+  const act = active(), i = act.indexOf(s);
+  const prev = act[i - 1] && isRendered(act[i - 1]) ? act[i - 1] : null;
+  const next = act[i + 1] && isRendered(act[i + 1]) ? act[i + 1] : null;
+  if (!prev && !next) return "alone";
+  const names = [prev, next].filter(Boolean).map(titleOf).join(" and ");
+  const how = [prev ? `starts from the end of ${titleOf(prev)}` : "", next ? `leads into ${titleOf(next)}` : ""]
+    .filter(Boolean).join(" and ");
+  const ans = await confirmBox({ title: `${verb} ${titleOf(s)}`,
+    body: `Pinned: ${titleOf(s)} ${how}, in place. ${names} keep${prev && next ? "" : "s"} ${prev && next ? "their takes" : "its take"}, ` +
+      `and ${titleOf(s)} is no longer standalone. On its own: a fresh start from the references; ` +
+      `the join${prev && next ? "s" : ""} with ${names} become${prev && next ? " hard cuts" : "s a hard cut"} until bridged again.`,
+    yes: `Pinned to ${names}`, alt: "On its own", no: "Cancel" });
+  return ans === true ? "pinned" : ans === "alt" ? "alone" : null;
+}
+
+function pinnedNote(s) {
+  const act = active(), i = act.indexOf(s);
+  const nb = [act[i - 1], act[i + 1]].filter((x) => x && isRendered(x));
+  return nb.length ? `pinned to ${nb.map(titleOf).join(" and ")}` : "";
+}
+
+/** Item 1 (round 5): back to "not rendered", keeping prompt, seconds and seed.
+ *  The take stays on disk, in Take history. */
+function clearRender(s) {
+  if (!s || s.kind === "clip" || busyGuard() || s.status === "queued") return;
+  Object.assign(s, { status: "queued", take: null, rendered: null, edit_from: null, standalone: false,
+    seam: null, was_approved: false, was_rendered: false, cleared: true });
+  delete S.takes[s.id];
+  S.gen++;
+  S.dry = null;
+  commit();
+  const pin = pinnedNote(s);
+  toast(`${titleOf(s)} is cleared. It renders again${pin ? `, ${pin}` : ""}, with the same prompt, length and seed ` +
+    "(the same picture unless something around it changed; Reroll for a new one). Its old take stays in Take history.");
+}
+
+/** Item 12: render one Shot on its own — a fresh generation from the
+ *  references, not continued from the Shot before and not pinned to the one
+ *  after. Its neighbours render later as bridges pinned to it. */
+function renderAlone(s, batch = null) {
+  if (!s || s.kind === "clip" || s.bypassed || S.busy) return;
+  const n = numOf(s.id);
+  const step = batch ? ` · ${batch.of - batch.ids.length} of ${batch.of}` : "";
+  queue({ upto: s.id, kind: "render", standalone: true, batch, label: `Rendering Shot ${n} on its own${step}`,
+    note: "A fresh start from the references · no pins to the Shots around it",
+    onDone: onRendered(s.id, true) });
 }
 
 function dryRun() {
@@ -757,10 +1065,11 @@ function connect() {
     S.conn = "ok";
     if (S.restarting) afterRestart();
     renderHeader(); renderDecision();
+    if (P()) renderShots();                     // ▶ on Shot cards follows the connection
     pollStats();
     if (S.busy) pollLater(); else autoCheck();
   };
-  ws.onclose = () => { S.conn = S.restarting ? "restarting" : "down"; renderHeader(); renderDecision(); retry(); };
+  ws.onclose = () => { S.conn = S.restarting ? "restarting" : "down"; renderHeader(); renderDecision(); if (P()) renderShots(); retry(); };
   ws.onerror = () => {};
   ws.onmessage = (ev) => {
     if (typeof ev.data !== "string") return;          // binary previews
@@ -873,13 +1182,22 @@ function totalSeconds() {
 }
 
 /** Loop range: halfway into the previous Shot → end of the Shot under review. */
+/** The Shot number of the i-th piece of a preview (a stitched preview skips Shots). */
+function rowNum(lo, i) {
+  const n = lo && lo.chain ? numOf(lo.chain[i]) : 0;
+  return n > 0 ? n : i + 1;
+}
+
 function loopRange() {
   const lo = last(), rv = reviewShot();
   if (!lo || !rv) return null;
   const i = lo.chain.indexOf(rv.id);
   if (i < 0) return null;
-  const row = lo.plan[i], prev = i > 0 ? lo.plan[i - 1] : null;
-  return { a: prev ? prev.start + prev.seconds / 2 : row.start, b: row.end, i, prev: !!prev };
+  // the half of the Shot before only when it really is the Shot before (not across a left-out gap)
+  const act = active(), before = act[act.indexOf(rv) - 1];
+  const row = lo.plan[i], prev = i > 0 && before && lo.chain[i - 1] === before.id ? lo.plan[i - 1] : null;
+  return { a: prev ? prev.start + prev.seconds / 2 : row.start, b: row.end, i, prev: !!prev,
+    prevTitle: prev ? titleOf(before) : "" };
 }
 
 function shotAt(t) {
@@ -905,7 +1223,7 @@ function updateTime() {
   const lo = last();
   $("scrub").value = String(t);
   const i = shotAt(t);
-  $("tc-overlay").textContent = (lo && i >= 0 ? "S" + (i + 1) + " · " : "") + fmt(t);
+  $("tc-overlay").textContent = (lo && i >= 0 ? "S" + rowNum(lo, i) + " · " : "") + fmt(t);
   $("tc-label").textContent = fmt(t) + " / " + fmt(total);
 }
 
@@ -994,8 +1312,44 @@ function stepFrame(dir) {
 // Render: header, panels
 // ---------------------------------------------------------------------------
 
+// Item 10: a click must always land. Rebuilding a button between pointerdown and
+// click (e.g. a blur commits a field and re-renders) swallows the click, so
+// rebuilds wait until the pointer is released and its click has fired.
+let pointerHeld = false, heldTimer = null;
+const deferred = new Set();
+document.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0) return;
+  pointerHeld = true;
+  clearTimeout(heldTimer);
+  heldTimer = setTimeout(releasePointer, 4000);      // never stay frozen if an up event is lost
+}, true);
+function releasePointer() {
+  if (!pointerHeld) return;
+  pointerHeld = false;
+  clearTimeout(heldTimer);
+  setTimeout(flushDeferred, 0);                      // after the click event of this press
+}
+document.addEventListener("pointerup", releasePointer, true);
+document.addEventListener("pointercancel", releasePointer, true);
+document.addEventListener("pointermove", (e) => { if (pointerHeld && e.buttons === 0) releasePointer(); }, true);
+window.addEventListener("blur", releasePointer);
+function deferIfHeld(what) {
+  if (!pointerHeld) return false;
+  deferred.add(what);
+  return true;
+}
+function flushDeferred() {
+  if (pointerHeld || !deferred.size) return;
+  const d = new Set(deferred);
+  deferred.clear();
+  if (d.has("all")) { render(); return; }
+  if (d.has("shots")) renderShots();
+  if (d.has("decision")) renderDecision();
+}
+
 function render() {
   if (!P()) return;
+  if (deferIfHeld("all")) return;
   renderHeader();
   renderCast();
   renderStyle();
@@ -1018,6 +1372,8 @@ function renderHeader() {
     : st === "ok" ? "ComfyUI connected · " + location.host
       : st === "down" ? "ComfyUI disconnected — retrying…" : "Connecting…";
   $("restart-btn").disabled = !!S.restarting || S.conn !== "ok";
+  const memOff = !!S.busy || !!S.restarting || S.conn !== "ok" || !!S.freeing;
+  for (const id of ["free-vram", "free-ram", "clear-cache"]) $(id).disabled = memOff;
   if (!P()) return;
   const act = active();
   const approved = act.filter((s) => s.status === "approved").length;
@@ -1083,8 +1439,19 @@ function splitChoice(v) {
   return i < 0 ? ["", v] : [v.slice(0, i), v.slice(i + 1)];
 }
 
+/** Images in the same list and order as a reference's file dropdown: this
+ *  project's input folder first, then the input folder. [{sub, name}] */
+function refChoices() {
+  if (S.inputs) {
+    return (S.inputs.mine.images || []).map((name) => ({ sub: S.inputs.mine.subfolder || "", name }))
+      .concat((S.inputs.root.images || []).map((name) => ({ sub: "", name })));
+  }
+  return ((S.opts || {}).images || []).map((name) => ({ sub: "", name }));
+}
+
 function renderCast() {
   let n = 0;
+  const choices = refChoices();
   const cards = P().cast.map((c) => {
     const pic = c.bypassed ? "bypassed" : `<Picture ${++n}>`;
     const state = S.refState[c.id];
@@ -1099,8 +1466,11 @@ function renderCast() {
         <button class="ghost" data-action="relink" title="Pick the file again from the input folder">Relink…</button>
         <button class="ghost" data-action="bypass-cast">Bypass</button></div>` : "";
     const up = S.uploading[c.id] ? '<div class="drop-busy">Uploading…</div>' : "";
+    const steps = choices.length ? `<div class="ref-step">
+        <button class="icon xs" data-action="ref-step" data-dir="-1" title="Previous image in the list" aria-label="Previous image for ${esc(c.label)}">◀</button>
+        <button class="icon xs" data-action="ref-step" data-dir="1" title="Next image in the list" aria-label="Next image for ${esc(c.label)}">▶</button></div>` : "";
     return `<div class="card${c.bypassed ? " off" : ""}${missing && !c.bypassed ? " missing" : ""}${S.uploading[c.id] ? " uploading" : ""}" data-cast="${esc(c.id)}">${up}
-      <button class="thumb${missing ? " missing" : ""}${c.image ? "" : " empty"}" data-action="${c.image ? "view-image" : "pick-image"}" title="${missing ? "File not found" : c.image ? "Open full size · drop an image on this card to replace it" : "Choose an image, or drop one here"}" aria-label="${c.image ? `Open ${esc(c.label)} full size` : `Choose an image for ${esc(c.label)}`}">${thumb}</button>
+      <div class="thumb-col"><button class="thumb${missing ? " missing" : ""}${c.image ? "" : " empty"}" data-action="${c.image ? "view-image" : "pick-image"}" title="${missing ? "File not found" : c.image ? "Open full size · drop an image on this card to replace it" : "Choose an image, or drop one here"}" aria-label="${c.image ? `Open ${esc(c.label)} full size` : `Choose an image for ${esc(c.label)}`}">${thumb}</button>${steps}</div>
       <div class="card-body">
         <div class="card-top"><span class="pic">${esc(pic)}</span>
           <button class="label-view" data-action="edit-cast" title="Edit label and description">${esc(c.label) || '<i class="muted">no label</i>'}</button></div>
@@ -1152,8 +1522,63 @@ function joinMark(prev, s) {
     <span class="muted small">${esc(why)}</span></div>`;
 }
 
-function renderShots() {
+/** A Shot in the render that's running can't be edited until it finishes. */
+const inRender = (s) => !!S.busy && S.busy.kind !== "dry" && S.busy.kind !== "check" &&
+  !!S.busy.built && S.busy.built.chain.includes(s.id);
+
+/** The always-visible row of a (generated) Shot card: status, title, preview, tools. */
+function shotRowHTML(s) {
   const rid = renderingId();
+  const state = s.bypassed ? "bypassed" : s.id === rid ? "rendering" : s.status;
+  const L = LOOK[state];
+  const title = s.bypassed ? "Bypassed" : "Shot " + numOf(s.id);
+  const seed = s.shot_seed < 0 || s.shot_seed === "" ? "auto" : String(s.shot_seed);
+  const open = S.open === s.id;
+  const chipBorder = state === "queued" ? "#33363C" : "transparent";
+  const edited = s.status === "queued" && s.edit_from && !s.bypassed;
+  const flag = edited ? '<span class="flag edited" title="Edited since its take was rendered. Change it back to exactly what it was to keep that take.">edited</span>'
+    : s.was_approved && s.status !== "approved" ? '<span class="flag" title="Approved before; re-renders with its seed">was ✓</span>'
+      : s.was_rendered && s.status === "queued" ? '<span class="flag" title="Rendered before; re-renders with its seed">was ●</span>' : "";
+  const canReroll = !s.bypassed && s.status === "approved" && (!!s.take || !!lastRowFor(s.id));
+  const row = lastRowFor(s.id);
+  const cut = cutBefore(s)
+    ? (s.standalone
+      ? '<span class="flag cut" title="Rendered on its own, so it doesn\'t follow on from the Shot before it. Render or reroll the Shot before it to bridge into it, or Bridge here to continue this Shot from it.">↯ hard cut · standalone</span>'
+      : '<span class="flag cut" title="This Shot doesn\'t follow on from the take of the Shot before it, so the join is a hard cut.">↯ hard cut</span>') : "";
+  const standaloneTag = !cut && s.standalone && s.status !== "queued" && !s.bypassed
+    ? '<span class="flag standalone" title="Rendered on its own, from the references. The Shot before it bridges into it.">standalone</span>' : "";
+  const bridge = cut ? `<button class="ghost sm bridge" data-action="bridge" title="Re-render ${title} in place so it flows from the Shot before it${s.standalone ? " (it stops being standalone)" : ""}; the Shots after it stay">Bridge</button>` : "";
+  const canAlone = state === "queued" && s.kind !== "clip";
+  const aloneOff = !!S.busy || S.conn !== "ok" || missingRefs().length > 0;
+  const play = canAlone ? `<button class="sdot sdot-play" data-action="render-alone"${aloneOff ? " disabled" : ""}
+      title="Render this Shot on its own — a fresh start, not continued from the Shot before." aria-label="Render ${title} on its own">▶</button>` : "";
+  return `${play}<button class="shot-head${play ? " has-play" : ""}" data-action="toggle-shot" aria-expanded="${open}">
+          ${play ? "" : `<span class="sdot" style="background:${L.dot};color:${L.fg}">${L.icon}</span>`}
+          <span class="stitle">${title}</span>
+          <span class="smeta">${esc(s.seconds)}s · seed ${esc(seed)}</span>
+          <span class="sprev">${esc(s.text) || '<i class="muted">empty</i>'}</span>
+          ${flag}${cut}${standaloneTag}
+          <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span>
+        </button>
+        <div class="shot-tools">
+          ${bridge}
+          ${canReroll ? `<button class="icon lg reroll" data-action="reroll-shot" title="Reroll ${title} (new seed)" aria-label="Reroll ${title}">⟳</button>` : ""}
+          <button class="icon lg${s.bypassed ? " on" : ""}" data-action="bypass-shot" aria-pressed="${s.bypassed}" title="${s.bypassed ? "Turn shot back on" : "Bypass shot"}">${POWER}</button>
+          <button class="icon lg x" data-action="remove-shot" title="Remove" aria-label="Remove ${title}">${CROSS}</button>
+        </div>`;
+}
+
+/** While typing: only the Shot's row changes, never its fields. */
+function refreshShotRow(s) {
+  const el = document.querySelector(`.shot[data-shot="${CSS.escape(s.id)}"]`);
+  if (!el || s.kind === "clip") return;
+  const row = el.querySelector(":scope > .shot-row");
+  if (row) row.innerHTML = shotRowHTML(s);
+  el.classList.toggle("review", !s.bypassed && s.status === "review");
+}
+
+function renderShots() {
+  if (deferIfHeld("shots")) return;
   let prevActive = null;
   $("shots").innerHTML = P().shots.map((s) => {
     let mark = "";
@@ -1162,25 +1587,18 @@ function renderShots() {
       prevActive = s;
     }
     if (s.kind === "clip") return mark + clipCard(s);
+    const rid = renderingId();
     const state = s.bypassed ? "bypassed" : s.id === rid ? "rendering" : s.status;
-    const L = LOOK[state];
     const title = s.bypassed ? "Bypassed" : "Shot " + numOf(s.id);
-    const seed = s.shot_seed < 0 || s.shot_seed === "" ? "auto" : String(s.shot_seed);
     const open = S.open === s.id;
-    const chipBorder = state === "queued" ? "#33363C" : "transparent";
-    const flag = s.was_approved && s.status !== "approved" ? '<span class="flag" title="Approved before; re-renders with its seed">was ✓</span>'
-      : s.was_rendered && s.status === "queued" ? '<span class="flag" title="Rendered before; re-renders with its seed">was ●</span>' : "";
     const canReroll = !s.bypassed && s.status === "approved" && (!!s.take || !!lastRowFor(s.id));
-    const row = lastRowFor(s.id);
-    const cut = !s.bypassed && s.status !== "queued" && row && row.seam === "mismatch"
-      ? '<span class="flag cut" title="This Shot was continued from a different take of the Shot before it, so the join is a hard cut.">↯ hard cut</span>' : "";
-    const bridge = cut ? `<button class="ghost sm bridge" data-action="bridge" title="Re-render ${title} in place so it flows from the Shot before it; the Shots after it stay">Bridge</button>` : "";
     const takes = !s.bypassed && s.status !== "queued" ? takeNav(s) : "";
+    const ro = inRender(s) ? ' readonly title="Part of the render in progress; edit it when it finishes"' : "";
     const body = open ? `<div class="shot-body">
-        <textarea class="field" data-shot-field="text" rows="6" aria-label="${title} text">${esc(s.text)}</textarea>
+        <textarea class="field" data-shot-field="text" rows="6" aria-label="${title} text"${ro}>${esc(s.text)}</textarea>
         <div class="shot-opts">
-          <label class="lbl-row">Seconds <input type="number" step="0.1" min="0.1" data-shot-field="seconds" value="${esc(s.seconds)}" style="width:72px"></label>
-          <label class="lbl-row">Seed <input class="mono" data-shot-field="shot_seed" value="${s.shot_seed < 0 ? "" : esc(s.shot_seed)}" placeholder="auto" style="width:120px"></label>
+          <label class="lbl-row">Seconds <input type="number" step="0.1" min="0.1" data-shot-field="seconds" value="${esc(s.seconds)}" style="width:72px"${ro}></label>
+          <label class="lbl-row">Seed <input class="mono" data-shot-field="shot_seed" value="${s.shot_seed < 0 ? "" : esc(s.shot_seed)}" placeholder="auto" style="width:120px"${ro}></label>
           <button class="ghost sm" data-action="wrap" data-before="&lt;d&gt;[English] " data-after="&lt;/d&gt;">Wrap &lt;d&gt; dialogue</button>
           <button class="ghost sm" data-action="wrap" data-before="&quot;" data-after="&quot;">Wrap "on-screen text"</button>
           ${canReroll ? '<button class="ghost sm" data-action="reroll-shot">⟳ Reroll this Shot</button>' : ""}
@@ -1188,6 +1606,8 @@ function renderShots() {
         <div class="shot-opts shot-more">
           ${takes}
           <span class="push"></span>
+          ${!s.bypassed && s.status !== "queued" ? `<button class="ghost sm" data-action="clear-render"${inRender(s) ? " disabled" : ""}
+            title="Back to not rendered: keeps the prompt, length and seed. The take stays in Take history.">Clear render</button>` : ""}
           <button class="ghost sm" data-action="insert-before" title="Insert a new Shot before this one">⊕ Shot before</button>
           <button class="ghost sm" data-action="insert-after" title="Insert a new Shot after this one">⊕ Shot after</button>
           <button class="ghost sm" data-action="insert-clip-after" title="Insert a video clip after this Shot">⊕ Clip after</button>
@@ -1195,24 +1615,15 @@ function renderShots() {
         </div>
         </div>` : "";
     return mark + `<div class="shot${state === "review" ? " review" : ""}${s.bypassed ? " off" : ""}" data-shot="${esc(s.id)}">
-      <div class="shot-row">
-        <button class="shot-head" data-action="toggle-shot" aria-expanded="${open}">
-          <span class="sdot" style="background:${L.dot};color:${L.fg}">${L.icon}</span>
-          <span class="stitle">${title}</span>
-          <span class="smeta">${esc(s.seconds)}s · seed ${esc(seed)}</span>
-          <span class="sprev">${esc(s.text) || '<i class="muted">empty</i>'}</span>
-          ${flag}${cut}
-          <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span>
-        </button>
-        <div class="shot-tools">
-          ${bridge}
-          ${canReroll ? `<button class="icon lg reroll" data-action="reroll-shot" title="Reroll ${title} (new seed)" aria-label="Reroll ${title}">⟳</button>` : ""}
-          <button class="icon lg${s.bypassed ? " on" : ""}" data-action="bypass-shot" aria-pressed="${s.bypassed}" title="${s.bypassed ? "Turn shot back on" : "Bypass shot"}">${POWER}</button>
-          <button class="icon lg x" data-action="remove-shot" title="Remove" aria-label="Remove ${title}">${CROSS}</button>
-        </div>
-      </div>${body}</div>`;
+      <div class="shot-row">${shotRowHTML(s)}</div>${body}</div>`;
   }).join("");
   $("add-shot").innerHTML = `${PLUS} Add Shot ${active().length + 1}`;
+  const off = !!S.busy || S.conn !== "ok" || missingRefs().length > 0;
+  const nAll = toRender().length, nOdd = oddToRender().length;
+  $("render-all").textContent = `▶ Render all${nAll ? ` (${nAll})` : ""}`;
+  $("render-all").disabled = off || !nAll;
+  $("render-odd").textContent = `▶ Render odd Shots${nOdd ? ` (${nOdd})` : ""}`;
+  $("render-odd").disabled = off || !nOdd;
   const first = $("add-first");
   first.hidden = !P().shots.length;
   first.innerHTML = `${PLUS} Add shot before Shot 1`;
@@ -1260,7 +1671,7 @@ function renderViewer() {
     const band = r.kind === "clip"
       ? `<div class="clip-band" style="left:${pct}%;width:${((r.end - r.start) / total) * 100}%" title="Clip"></div>` : "";
     return band + `<div class="tick${r.kind === "clip" ? " clip" : ""}" style="left:calc(${pct}% - .5px)"><div></div></div>` +
-      `<div class="tick-label${r.kind === "clip" ? " clip" : ""}" style="left:calc(${pct}% + 4px)">${r.kind === "clip" ? "▶" : "S"}${i + 1}</div>`;
+      `<div class="tick-label${r.kind === "clip" ? " clip" : ""}" style="left:calc(${pct}% + 4px)">${r.kind === "clip" ? "▶" : "S"}${rowNum(lo, i)}</div>`;
   }).join("") : "";
   // loop band + note
   const L = loopRange();
@@ -1272,7 +1683,7 @@ function renderViewer() {
     const rv = reviewShot();
     note.hidden = false;
     note.textContent = `Looping ${fmt(L.a)} → ${fmt(L.b)}` + (L.prev
-      ? ` · last half of Shot ${L.i}, the seam, then ${titleOf(rv)}` : ` · ${titleOf(rv)}`);
+      ? ` · last half of ${L.prevTitle}, the seam, then ${titleOf(rv)}` : ` · ${titleOf(rv)}`);
   } else {
     band.hidden = true;
     note.hidden = true;
@@ -1290,6 +1701,7 @@ function renderViewer() {
 function renderDecision() {
   const el = $("decision");
   if (!P()) return;
+  if (deferIfHeld("decision")) return;
   const errBox = S.error ? `<div class="err" role="alert"><span>${esc(S.error)}</span>
       <button class="icon x" data-action="dismiss-error" aria-label="Dismiss">${CROSS}</button></div>` : "";
   const b = S.busy;
@@ -1304,7 +1716,7 @@ function renderDecision() {
     layoutStage();
     return;
   }
-  const rv = reviewShot(), nx = nextQueued(), lo = last();
+  const rv = reviewShot(), nx = nextToRender(), lo = last();
   let line;
   if (rv && nx) line = `Happy with ${titleOf(rv)}? Continue approves it and renders ${titleOf(nx)}.`;
   else if (rv && renderedAfter(rv).length) line = `Happy with this take of ${titleOf(rv)}? Approve keeps it; the Shots after it are unchanged.`;
@@ -1312,7 +1724,11 @@ function renderDecision() {
   else if (nx && numOf(nx.id) === 1 && !active().some((s) => s.status === "approved")) {
     line = nx.was_approved ? "A shared change needs every shot rendered again. Render Shot 1 to start."
       : "Render Shot 1 to start. Each Continue approves the shot you're reviewing and renders the next.";
-  } else if (nx && lastRowFor(nx.id)) line = `${titleOf(nx)} needs rendering again — it or a shot before it changed.`;
+  } else if (nx && nx.cleared) line = `${titleOf(nx)} was cleared. Render it${pinnedNote(nx) ? ` (${pinnedNote(nx)})` : ""}, or press its ▶ to render it on its own.`;
+  else if (nx && nx.edit_from) line = `${titleOf(nx)} was edited. Render it, or change it back exactly to keep its take.`;
+  else if (nx && nx.standalone && !pinnedNote(nx)) line = `${titleOf(nx)} renders on its own first, so the Shot before it can bridge into it.`;
+  else if (nx && nx.standalone) line = `${titleOf(nx)} is standalone. Render it pinned to the Shots around it, or on its own again.`;
+  else if (nx && lastRowFor(nx.id)) line = `${titleOf(nx)} needs rendering again — it or a shot before it changed.`;
   else if (nx) line = `${titleOf(nx)} is next. Render it when you're ready.`;
   else if (active().length) line = "All shots approved. Add a shot to keep going.";
   else line = "Add a shot to start.";
@@ -1335,11 +1751,17 @@ function renderDecision() {
   if (stale && !rv) line = "The timeline changed since the last preview. Update it: every Shot loads its take, nothing is sampled.";
   // [ ✓ Approve 25% ][ main action 50% ][ ⟳ Reroll 25% ]
   let mainLabel, mainAction, mainOff = false;
-  if (rv && nx) { mainLabel = `✓ Approve & render ${titleOf(nx)}`; mainAction = "primary"; }
+  const reviews = active().filter((s) => s.status === "review");
+  if (rv && reviews.length > 1) {
+    // several Shots rendered at once (Render all / Render odd Shots): review them one by one
+    if (!missing.length) line = `${reviews.length} Shots to review. Happy with ${titleOf(rv)}? Approve it and go on to ${titleOf(reviews[1])}.`;
+    mainLabel = `✓ Approve & review ${titleOf(reviews[1])}`;
+    mainAction = "approve-next";
+  } else if (rv && nx) { mainLabel = `✓ Approve & render ${titleOf(nx)}`; mainAction = "primary"; }
   else if (rv && stale) { mainLabel = "✓ Approve & update preview"; mainAction = "primary"; }
   else if (rv && vsrOk) { mainLabel = `✓ Approve & upscale final (${v.scale}×)`; mainAction = "approve-final"; }
   else if (rv) { mainLabel = "✓ Approve & finish"; mainAction = "primary"; }
-  else if (nx) { mainLabel = "▶ Render " + titleOf(nx); mainAction = "primary"; }
+  else if (nx) { mainLabel = "▶ Render " + titleOf(nx) + (nx.standalone && !pinnedNote(nx) ? " on its own" : ""); mainAction = "primary"; }
   else if (stale) { mainLabel = "▶ Update preview"; mainAction = "primary"; }
   else if (allDone && vsrOk) { mainLabel = `⤢ Upscale final video (${v.scale}× ${v.quality})${fin ? " again" : ""}`; mainAction = "final"; }
   else { mainLabel = "All done"; mainAction = "primary"; mainOff = true; }
@@ -1360,10 +1782,12 @@ function renderDecision() {
  *  follow the next Shot can re-render in one queue. Returns the last of that
  *  run, when it's more than just the next Shot. */
 function throughTarget() {
-  const act = active(), nx = nextQueued();
-  if (!nx) return null;
+  const act = active(), nx = nextToRender();
+  if (!nx || nx.standalone) return null;
   let i = act.indexOf(nx), lastKept = null;
-  while (i < act.length && act[i].status === "queued" && (act[i].was_approved || act[i].was_rendered)) lastKept = act[i++];
+  // stops before a standalone Shot: it renders on its own, not continued
+  while (i < act.length && act[i].status === "queued" && (act[i].was_approved || act[i].was_rendered) &&
+         !act[i].standalone) lastKept = act[i++];
   return lastKept && act.indexOf(lastKept) > act.indexOf(nx) ? lastKept : null;
 }
 
@@ -1535,6 +1959,8 @@ function renderSettings() {
   $("settings").innerHTML = `
     <div class="seed-row">
       <label class="lbl">Seed · fixed <input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-describedby="seed-help"></label>
+      <button class="ghost sm reset-seeds" data-action="reset-seeds"${P().shots.some((x) => x.kind !== "clip" && Number(x.shot_seed) >= 0) ? "" : " disabled"}
+        title="Put the Shots' own seeds back to auto, so they follow this seed again">Reset Shot seeds</button>
       <span class="muted small" id="seed-help">Feeds every Shot left on auto. Type a seed to go back to it; use Reroll for new takes.</span>
     </div>
     <div class="grid3">
@@ -1556,6 +1982,8 @@ function renderSettings() {
       <label class="lbl-row">Quality <select data-vsr="quality"${vsrOk ? "" : " disabled"}>${["LOW", "MEDIUM", "HIGH", "ULTRA"].map((q) =>
         `<option${vsr.quality === q ? " selected" : ""}>${q}</option>`).join("")}</select></label>
     </div>
+    <label class="check-row prores-row${vsrOk ? "" : " off"}"><input type="checkbox" data-outfile="prores_master"${s.prores_master ? " checked" : ""}${vsrOk ? "" : " disabled"}>
+      <span>Final video: also save a ProRes master <span class="muted small">· 10-bit ProRes 422 HQ .mov with sound, next to the upscaled MP4 (large files)</span></span></label>
     ${P().shots.some((x) => x.kind === "clip" && !x.bypassed) ? `<div class="vsr-row${s.clip_pixels ? "" : " off"}">
       ${switchHTML(!!s.clip_pixels, 'data-action="clip-pixels" aria-label="Original clip pixels in the final video"', true)}
       <div class="vsr-text"><div>Final video: original clip pixels</div>
@@ -1566,6 +1994,13 @@ function renderSettings() {
         <button data-action="ref-size" data-v="match" aria-pressed="${s.ref_image_size === "match"}">Match · lighter on VRAM</button>
         <button data-action="ref-size" data-v="max" aria-pressed="${s.ref_image_size === "max"}">Max · best identity</button>
       </div></div>
+    <div class="out-files">
+      <label class="check-row"><input type="checkbox" data-outfile="save_png"${s.save_png ? " checked" : ""}>
+        <span>Save PNG <span class="muted small">· the first frame (with the workflow) next to each video</span></span></label>
+      <label class="check-row"><input type="checkbox" data-outfile="save_noaudio"${s.save_noaudio ? " checked" : ""}>
+        <span>Save audio-less MP4 <span class="muted small">· a copy without sound, besides the video with sound</span></span></label>
+      <div class="muted small">Videos are saved in output/longshot/${esc(P().slug)}/videos.</div>
+    </div>
     <div class="seg-store">
       <span class="grow">Saved takes: ${S.segStats ? `${S.segStats.files} file${S.segStats.files === 1 ? "" : "s"} · ${(S.segStats.bytes / 1048576).toFixed(1)} MB` : "—"}
         <span class="muted"> · output/longshot/${esc(P().slug)}/takes</span></span>
@@ -1671,7 +2106,15 @@ function renderPlan() {
       status = dry ? what(dry) + pinText(dry) : "will render";
       color = "#A3A6AD";
     }
-    if ((dry || row) && (dry || row).seam === "mismatch") color = "#FFB4A8";
+    if (s.status !== "queued" && !row && !dry && s.take) {
+      // not in the last render (it showed one standalone Shot): its take is still there
+      len = s.seconds + "s";
+      status = `take · seed ${s.shot_seed}`;
+      color = s.status === "approved" ? "#9FE0C2" : "#FFD08A";
+    }
+    if (s.standalone && s.status !== "queued") status += " · standalone";
+    if (cutBefore(s) && !/hard cut/.test(status)) status += " · cut before it";
+    if (((dry || row) && (dry || row).seam === "mismatch") || cutBefore(s)) color = "#FFB4A8";
     return `<div class="plan-row"><span>Seg ${k + 1}</span><span class="muted">${esc(len)}</span><span style="color:${color}">${esc(status)}</span></div>`;
   }).join("");
 }
@@ -1691,8 +2134,25 @@ document.addEventListener("click", async (e) => {
   switch (a) {
     case "primary": primary(); break;
     case "approve": { const rv = reviewShot(); if (rv && !busyGuard()) { rv.status = "approved"; rv.was_approved = false; commit(); } break; }
+    case "approve-next": {
+      const rv = reviewShot();
+      if (!rv || busyGuard()) break;
+      rv.status = "approved"; rv.was_approved = false;
+      const nextRv = reviewShot();
+      if (nextRv) {
+        S.open = nextRv.id;
+        const row = lastRowFor(nextRv.id);
+        if (row && video.src) { video.pause(); video.currentTime = row.start + 0.04; updateTime(); }
+      }
+      commit();
+      break;
+    }
     case "approve-final": { const rv = reviewShot(); if (rv) { rv.status = "approved"; rv.was_approved = false; } if (previewStale()) refreshPreview(); else upscaleFinal(); break; }
     case "bridge": bridgeShot(shotOf(el)); break;
+    case "render-alone": renderAlone(shotOf(el)); break;
+    case "clear-render": clearRender(shotOf(el)); break;
+    case "render-all": renderAll(); break;
+    case "render-odd": renderOdd(); break;
     case "reroll": reroll(); break;
     case "stop": stop(); break;
     case "dry-run": dryRun(); break;
@@ -1745,23 +2205,42 @@ document.addEventListener("click", async (e) => {
     case "mb-add": if (MB.shown) mbChangeFolders("add", MB.shown); break;
     case "mb-remove": if (confirm("Stop looking for models in this folder? The files stay where they are.")) mbChangeFolders("remove", el.dataset.path); break;
     case "wrap": wrap(el); break;
-    case "bypass-cast": { if (busyGuard()) return; const c = castOf(el); c.bypassed = !c.bypassed; sharedChanged("Cast & Scenes"); commit(); break; }
+    case "bypass-cast": {
+      if (busyGuard()) return;
+      const c = castOf(el);
+      const mode = await askRefChange(`${c.bypassed ? "Turn on" : "Bypass"} ${c.label || "this reference"}?`);
+      if (!mode) return;
+      c.bypassed = !c.bypassed;
+      applyRefChange(mode, "Cast & Scenes");
+      commit();
+      break;
+    }
     case "remove-cast": {
       if (busyGuard()) return;
       const c = castOf(el);
-      if (!confirm(`Remove ${c.label || "this reference"}?`)) return;
+      let mode = "all";
+      if (!c.bypassed && approvedShots().length) {
+        mode = await askRefChange(`Remove ${c.label || "this reference"}?`);
+        if (!mode) return;
+      } else if (!confirm(`Remove ${c.label || "this reference"}?`)) return;
       p.cast = p.cast.filter((x) => x.id !== c.id);
-      if (!c.bypassed) sharedChanged("Cast & Scenes");
+      if (!c.bypassed) applyRefChange(mode, "Cast & Scenes");
       commit();
       break;
     }
     case "add-cast": {
       if (busyGuard()) return;
       p.cast.push({ id: uid("c"), label: "<new>", desc: "", role: "appearance", image: "", bypassed: false });
-      sharedChanged("Cast & Scenes");
+      // an empty card changes nothing yet; choosing its picture asks about approved Shots
+      if (approvedShots().length) { S.dry = null; S.gen++; } else sharedChanged("Cast & Scenes");
       commit();
       break;
     }
+    case "ref-step": stepRef(castOf(el), +el.dataset.dir); break;
+    case "reset-seeds": resetShotSeeds(); break;
+    case "free-vram": freeMemory("vram"); break;
+    case "free-ram": freeMemory("ram"); break;
+    case "clear-cache": freeMemory("cache"); break;
     case "audio-preview": previewing() ? stopPreview() : startPreview(); break;
     case "pick-audio": pickAudio(); break;
     case "pick-image": { const c = castOf(el); if (c) pickImages(c.id); break; }
@@ -1789,15 +2268,42 @@ document.addEventListener("click", async (e) => {
       commit();
       break;
     }
-    case "turbo-on": if (busyGuard()) return; p.settings.turbo.on = !p.settings.turbo.on; sharedChanged("Turbo"); commit(); break;
-    case "lora-on": { if (busyGuard()) return; const l = p.settings.loras[+el.dataset.i]; l.on = !l.on; if (l.name || !l.on) sharedChanged("LoRAs"); commit(); break; }
-    case "steps20": p.settings.steps = 20; sharedChanged("Steps"); commit(); break;
-    case "ref-size":
-      if (busyGuard() || p.settings.ref_image_size === el.dataset.v) return;
-      p.settings.ref_image_size = el.dataset.v;
-      sharedChanged("Reference image size");
+    case "turbo-on": {
+      if (busyGuard()) return;
+      const mode = await askSettingChange(p.settings.turbo.on ? "Turn Turbo off" : "Turn Turbo on");
+      if (!mode) return;
+      p.settings.turbo.on = !p.settings.turbo.on;
+      applyRefChange(mode, "Turbo");
       commit();
       break;
+    }
+    case "lora-on": {
+      if (busyGuard()) return;
+      const l = p.settings.loras[+el.dataset.i];
+      let mode = "all";
+      if (l.name || l.on) { mode = await askSettingChange(`${l.on ? "Turn off" : "Turn on"} LoRA ${+el.dataset.i + 1}`); if (!mode) return; }
+      l.on = !l.on;
+      if (l.name || !l.on) applyRefChange(mode, "LoRAs");
+      commit();
+      break;
+    }
+    case "steps20": {
+      const mode = await askSettingChange("Set 20 steps");
+      if (!mode) return;
+      p.settings.steps = 20;
+      applyRefChange(mode, "Steps");
+      commit();
+      break;
+    }
+    case "ref-size": {
+      if (busyGuard() || p.settings.ref_image_size === el.dataset.v) return;
+      const mode = await askSettingChange("Change the reference image size");
+      if (!mode) return;
+      p.settings.ref_image_size = el.dataset.v;
+      applyRefChange(mode, "Reference image size");
+      commit();
+      break;
+    }
     case "play": togglePlay(); break;
     case "step": stepFrame(+el.dataset.dir); break;
     case "jump": { const L = loopRange(); if (L) { video.pause(); video.currentTime = p.last_output.plan[L.i].start; updateTime(); } break; }
@@ -1855,7 +2361,7 @@ document.addEventListener("input", (e) => {
   }
   if (el.id === "editor-desc") autoGrow(el);
   else if (el.dataset.style) { p.style[el.dataset.style] = el.value; scheduleSave(); }
-  else if (el.dataset.shotField === "text") { shotOf(el).text = el.value; scheduleSave(); }
+  else if (el.dataset.shotField) shotInput(el);
   else if (el.type === "range" && el.nextElementSibling && el.nextElementSibling.tagName === "OUTPUT") {
     el.nextElementSibling.textContent = Number(el.value).toFixed(2);
   }
@@ -1864,7 +2370,7 @@ document.addEventListener("input", (e) => {
 const committed = new WeakMap();      // element -> value when focused, to see real changes
 document.addEventListener("focusin", (e) => { committed.set(e.target, e.target.value); });
 
-document.addEventListener("change", (e) => {
+document.addEventListener("change", async (e) => {
   const el = e.target;
   const p = P();
   if (!p) return;
@@ -1873,6 +2379,10 @@ document.addEventListener("change", (e) => {
   committed.set(el, el.value);
   if (el.dataset.relink) { relinkFromSelect(el); return; }
   if (el.dataset.baseSeed !== undefined) { changeBaseSeed(el); return; }
+  if (el.dataset.outfile) {        // which files a render keeps: nothing re-renders
+    p.settings[el.dataset.outfile] = el.checked;
+    return commit();
+  }
   if (el.dataset.vsr) {            // post-process only: no Shot re-renders
     const k = el.dataset.vsr;
     p.settings.rtx_vsr[k] = k === "scale" ? Number(el.value) : el.value;
@@ -1886,12 +2396,20 @@ document.addEventListener("change", (e) => {
   if (el.dataset.field) {
     const c = castOf(el);
     c[el.dataset.field] = el.value;
-    if (changed && !c.bypassed) sharedChanged("Cast & Scenes");
+    if (changed && !c.bypassed) applyRefChange((await askRefChange("Change this reference?")) || "keep", "Cast & Scenes");
     return commit();
   }
   if (el.dataset.style) {
-    p.style[el.dataset.style] = el.value;
-    if (changed) sharedChanged("Style & Sound");
+    const k = el.dataset.style;
+    if (changed) {
+      const mode = await askSettingChange("Change Style & Sound");
+      if (!mode) {                                  // put the text back as it was
+        if (before !== undefined) { p.style[k] = before; el.value = before; committed.set(el, before); }
+        return commit();
+      }
+      p.style[k] = el.value;
+      applyRefChange(mode, "Style & Sound");
+    } else p.style[k] = el.value;
     return commit();
   }
   if (el.dataset.shotField) {
@@ -1900,15 +2418,19 @@ document.addEventListener("change", (e) => {
       toast("This shot is part of the render in progress; edit it when it finishes.");
       return render();
     }
+    // The value is already in the project (typing commits it, item 9). Leaving
+    // the field only tidies an unfinished number; it never rebuilds the page,
+    // so a click on Render right from the field lands the first time (item 10).
     const k = el.dataset.shotField;
-    if (k === "seconds") s.seconds = Math.max(0.1, parseFloat(el.value) || 5);
-    else if (k === "shot_seed") {
-      const v = el.value.trim().toLowerCase();
-      const n = v === "" || v === "auto" ? -1 : parseInt(v, 10);
-      s.shot_seed = Number.isFinite(n) && n >= -1 ? n : s.shot_seed;
-    } else s.text = el.value;
-    if (changed && !s.bypassed) editInPlace(s, k);
-    return commit();
+    if (S.bad[s.id + ":" + k]) {
+      delete S.bad[s.id + ":" + k];
+      if (k === "seconds") { el.value = s.seconds; }
+      else if (k === "shot_seed") { el.value = s.shot_seed < 0 ? "" : s.shot_seed; }
+      liveEdit(s);
+    }
+    if (changed && !s.bypassed) shotEdited(s, k);
+    scheduleSave();
+    return;
   }
   if (el.dataset.clipFile !== undefined) {
     const sh = shotOf(el);
@@ -1944,23 +2466,97 @@ document.addEventListener("change", (e) => {
   }
   if (el.dataset.set) {
     const k = el.dataset.set;
-    p.settings[k] = el.dataset.num !== undefined ? Number(el.value) : el.value;
+    const v = el.dataset.num !== undefined ? Number(el.value) : el.value;
+    if (changed && KEEPABLE[k]) {
+      // approved takes don't depend on it: they can be kept (item 2, round 5)
+      const mode = await askSettingChange(`Change ${KEEPABLE[k]}`);
+      if (!mode) return render();
+      p.settings[k] = v;
+      applyRefChange(mode, KEEPABLE[k][0].toUpperCase() + KEEPABLE[k].slice(1));
+      return commit();
+    }
+    p.settings[k] = v;               // size and overlap: old takes can't be used, everything renders again
     if (changed) sharedChanged("Settings");
     return commit();
   }
   if (el.dataset.turbo) {
     const k = el.dataset.turbo;
+    let mode = "all";
+    if (changed) { mode = await askSettingChange(k === "strength" ? "Change the Turbo strength" : "Change the Turbo LoRA"); if (!mode) return render(); }
     p.settings.turbo[k] = k === "strength" ? Number(el.value) : el.value;
-    if (changed) sharedChanged("Turbo LoRA");
+    if (changed) applyRefChange(mode, "Turbo LoRA");
     return commit();
   }
   if (el.dataset.lora !== undefined) {
     const l = p.settings.loras[+el.dataset.lora];
+    let mode = "all";
+    if (changed && l.on) { mode = await askSettingChange(`Change LoRA ${+el.dataset.lora + 1}`); if (!mode) return render(); }
     l[el.dataset.k] = el.dataset.k === "strength" ? Number(el.value) : el.value || null;
-    if (changed && l.on) sharedChanged("LoRAs");
+    if (changed && l.on) applyRefChange(mode, "LoRAs");
     return commit();
   }
 });
+
+/** Item 9: a Shot's text, seconds or seed take effect while typing. A Shot that
+ *  no longer matches its take shows "▶ Render Shot N"; typing it back to
+ *  exactly what was rendered brings back its take and its state. */
+function shotInput(el) {
+  const s = shotOf(el);
+  if (!s || el.readOnly) return;
+  const k = el.dataset.shotField, key = s.id + ":" + k;
+  delete S.bad[key];
+  if (k === "text") s.text = el.value;
+  else if (k === "seconds") {
+    const v = parseFloat(el.value);
+    if (Number.isFinite(v) && v >= 0.1) s.seconds = v; else S.bad[key] = true;
+  } else if (k === "shot_seed") {
+    const v = el.value.trim().toLowerCase();
+    const n = v === "" || v === "auto" ? -1 : /^\d+$/.test(v) ? Number(v) : NaN;
+    if (Number.isSafeInteger(n) && n >= -1) s.shot_seed = n; else S.bad[key] = true;
+  }
+  liveEdit(s);
+  scheduleSave();
+}
+
+function matchesRendered(s) {
+  const r = s.rendered;
+  if (!r || Object.keys(S.bad).some((k) => k.startsWith(s.id + ":"))) return false;
+  return s.text === r.text && Number(s.seconds) === Number(r.seconds) && Number(s.shot_seed) === Number(r.seed);
+}
+
+function liveEdit(s) {
+  if (!s.bypassed && s.kind !== "clip") {
+    const same = matchesRendered(s);
+    const f = s.edit_from;
+    if (s.status !== "queued" && !same) {
+      s.edit_from = { status: s.status, was_approved: s.was_approved, was_rendered: s.was_rendered, take: s.take, gen: S.gen };
+      s.status = "queued";
+      S.dry = null;
+    } else if (s.status === "queued" && same && f && f.gen === S.gen && f.take === s.take && s.take) {
+      Object.assign(s, { status: f.status, was_approved: f.was_approved, was_rendered: f.was_rendered, edit_from: null });
+      S.dry = null;
+    }
+  }
+  refreshShotRow(s);
+  renderDecision();
+  renderPlan();
+  renderHeader();
+  renderViewer();
+}
+
+/** Leaving an edited Shot's field: say what the edit will do (once per edit). */
+function shotEdited(s, field) {
+  if (s.status !== "queued" || !s.edit_from || s.edit_from.told) return;
+  s.edit_from.told = true;
+  if (field === "seconds" && syncAfter(s, `${titleOf(s)} changed length`)) { render(); return; }
+  const after = renderedAfter(s);
+  if (after.length) {
+    const n0 = numOf(after[0].id), n1 = numOf(after[after.length - 1].id);
+    const range = after.length > 1 ? `Shots ${n0}–${n1}` : `Shot ${n0}`;
+    toast(`${titleOf(s)} will re-render in place; ${range} keep${after.length > 1 ? "" : "s"} ${after.length > 1 ? "their takes" : "its take"}.`,
+      { label: `Re-render ${range} too`, fn: () => { rippleAfter(s); commit(); } });
+  }
+}
 
 function wrap(btn) {
   const box = btn.closest("[data-shot]").querySelector("textarea");
@@ -2065,7 +2661,7 @@ async function duplicateProject() {
 
 async function renameProject() {
   if (busyGuard()) return;
-  const name = (prompt("Rename the project. Its input and takes folders are renamed too:", P().name) || "").trim();
+  const name = (prompt("Rename the project. Its input, takes and videos folders are renamed too:", P().name) || "").trim();
   if (!name || name === P().name) return;
   await saveNow();
   let res;
@@ -2086,8 +2682,8 @@ async function openList() {
   const rows = S.projects.map((p) => {
     const v = p.video;
     const thumb = v && v.workflow
-      ? `<img alt="" loading="lazy" src="${esc(viewURL({ filename: v.workflow, subfolder: v.subfolder, type: v.type || "output" }))}">`
-      : "no video";
+      ? `<img alt="" loading="lazy" src="${esc(viewURL({ filename: v.workflow, subfolder: v.subfolder, type: v.type || "output" }))}" onerror="this.replaceWith(document.createTextNode('no preview'))">`
+      : v && v.filename ? `<video muted playsinline preload="metadata" src="${esc(viewURL(v))}#t=0.5"></video>` : "no video";
     return `<button class="proj-row${p.slug === P().slug ? " current" : ""}" data-action="open-project" data-slug="${esc(p.slug)}">
       <span class="proj-thumb">${thumb}</span>
       <span class="proj-meta"><b>${esc(p.name)}</b>
@@ -2117,13 +2713,14 @@ const mbSize = (b) => (b >= 1073741824 ? (b / 1073741824).toFixed(1) + " GB" : M
 async function exportDialog() {
   if (busyGuard()) return;
   await saveNow();
-  let est = { references: 0, takes: 0, video: 0 };
+  let est = { references: 0, takes: 0, videos: 0, video_files: 0 };
   try { est = await api(`/longshot/export/${encodeURIComponent(P().slug)}/estimate`); } catch (e) { /* sizes unknown */ }
   showModal(`Export · ${P().name}`, "", `
     <p class="muted small">One .zip with the project and every file it uses: reference images, the song and video clips. Model files aren't included; the other machine finds its own by name.</p>
     <label class="check-row"><input type="checkbox" checked disabled> Project and references <span class="muted small">· ${mbSize(est.references)}</span></label>
     <label class="check-row"><input type="checkbox" id="exp-takes" checked> Include takes <span class="muted small">· ${mbSize(est.takes)} · approved Shots open already rendered, with their take history</span></label>
-    <label class="check-row"><input type="checkbox" id="exp-video"${est.video ? "" : " disabled"}> Include the last preview video <span class="muted small">· ${est.video ? mbSize(est.video) : "none yet"}</span></label>
+    <label class="check-row"><input type="checkbox" id="exp-video"${est.video_files ? "" : " disabled"}> Include videos <span class="muted small">· ${est.video_files
+      ? `${est.video_files} file${est.video_files === 1 ? "" : "s"} · ${mbSize(est.videos)} · everything in output/longshot/${esc(P().slug)}/videos` : "none yet"}</span></label>
     <div class="dialog-actions"><button class="ghost" data-action="close-modal">Cancel</button>
       <button class="primary sm-primary" data-action="export-go">Export .zip</button></div>`);
 }
@@ -2167,6 +2764,7 @@ async function importZip(file) {
   const miss = (data.missing || []).length;
   toast(`Imported "${P().name}": ${data.files} file${data.files === 1 ? "" : "s"}` +
     (data.takes ? `, ${data.takes} take${data.takes === 1 ? "" : "s"}` : "") +
+    (data.videos ? `, ${data.videos} video${data.videos === 1 ? "" : "s"}` : "") +
     (miss ? `. ${miss} file${miss > 1 ? "s were" : " was"} missing from the export.` : "."));
 }
 
@@ -2203,10 +2801,15 @@ async function relinkFromSelect(el) {
   const key = isAudio ? "audio" : item.id;
   if (busyGuard()) { render(); return; }
   if (!el.value) {
+    let mode = "all";
+    if (!isAudio && !item.bypassed) {
+      mode = await askRefChange(`Clear ${item.label || "this reference"}'s picture?`);
+      if (!mode) { render(); return; }
+    }
     if (isAudio) { p.audio.file = null; p.audio.subfolder = ""; p.audio.sha256 = null; }
     else { item.image = ""; }
     S.refState[key] = undefined;
-    if (!isAudio && !item.bypassed) sharedChanged("Cast & Scenes");
+    if (!isAudio && !item.bypassed) applyRefChange(mode, "Cast & Scenes");
     if (isAudio && (p.audio.lip_sync || p.audio.voice_ref)) sharedChanged("Audio");
     return commit();
   }
@@ -2215,6 +2818,11 @@ async function relinkFromSelect(el) {
   try { info = (await api("/longshot/check-inputs", { method: "POST", body: { files: [{ key, name, subfolder: sub }] } })).files[0]; }
   catch (e) { /* treat as ok; the render will say if not */ }
   const same = !!item.sha256 && info.sha256 === item.sha256;
+  let mode = "all";
+  if (!isAudio && !same && !item.bypassed) {
+    mode = await askRefChange(`Use ${name} for ${item.label || "this reference"}?`);
+    if (!mode) { render(); return; }
+  }
   if (isAudio) Object.assign(item, { file: name });
   else Object.assign(item, { image: name });
   Object.assign(item, { subfolder: sub, original_name: name, sha256: info.sha256 || null,
@@ -2222,8 +2830,41 @@ async function relinkFromSelect(el) {
   S.refState[key] = info.state === "missing" || info.state === "invalid" ? info.state : "ok";
   S.refInfo[key] = info;
   if (same) toast("Relinked — it's the same file, so nothing re-renders.");
-  else if (isAudio ? (p.audio.lip_sync || p.audio.voice_ref) : !item.bypassed) sharedChanged(isAudio ? "Audio" : "Cast & Scenes");
+  else if (isAudio) { if (p.audio.lip_sync || p.audio.voice_ref) sharedChanged("Audio"); }
+  else if (!item.bypassed) applyRefChange(mode, "Cast & Scenes");
   commit();
+}
+
+/** Item 7: ◀ ▶ under a reference step through the same list as its dropdown,
+ *  wrapping at both ends. Approved Shots are kept (toast offers re-render all). */
+const stepSeq = {};
+async function stepRef(c, dir) {
+  if (!c || busyGuard() || S.uploading[c.id]) return;
+  const list = refChoices();
+  if (!list.length) return;
+  const cur = c.image ? list.findIndex((x) => x.sub === (c.subfolder || "") && x.name === c.image) : -1;
+  const i = cur < 0 ? (dir > 0 ? 0 : list.length - 1) : (cur + dir + list.length) % list.length;
+  const pick = list[i];
+  const before = c.sha256;
+  Object.assign(c, { image: pick.name, subfolder: pick.sub, original_name: pick.name, sha256: null, size_bytes: null });
+  S.refState[c.id] = "ok";
+  const seq = (stepSeq[c.id] = (stepSeq[c.id] || 0) + 1);
+  renderCast();
+  let info = null;
+  try {
+    info = (await api("/longshot/check-inputs", { method: "POST",
+      body: { files: [{ key: c.id, name: pick.name, subfolder: pick.sub }] } })).files[0];
+  } catch (e) { /* the render will say if the file is unreadable */ }
+  if (stepSeq[c.id] !== seq || !P().cast.includes(c)) return;      // a later step took over
+  if (info) {
+    Object.assign(c, { sha256: info.sha256 || null, size_bytes: info.size_bytes ?? null });
+    S.refState[c.id] = info.state === "missing" || info.state === "invalid" ? info.state : "ok";
+    S.refInfo[c.id] = info;
+  }
+  const same = !!before && !!info && info.sha256 === before;
+  if (!same && !c.bypassed) refChangedQuietly("Cast & Scenes");
+  commit();
+  if (editing && editing.id === c.id) showEditorImage(c);
 }
 
 // ---------------------------------------------------------------------------
@@ -2279,23 +2920,34 @@ async function addImages(fileList, targetId) {
   });
   cards.forEach((c) => { S.uploading[c.id] = true; });
   render();
-  let shared = false, same = 0;
+  let shared = false, same = 0, mode = "all";
   const failed = [];
-  await Promise.all(list.map(async (f, i) => {
-    const c = cards[i];
-    try {
-      const unchanged = applyUpload(c, await uploadImage(f));
-      if (target && unchanged) same++;            // a new reference always changes the prompt
-      else if (!c.bypassed) shared = true;
-    } catch (e) {
-      failed.push(`${f.name}: ${e.message}`);
-      if (!target) p.cast.splice(p.cast.indexOf(c), 1);
-    } finally { delete S.uploading[c.id]; }
+  if (target && editing && editing.id === target.id) showEditorImage(target);
+  const uploaded = await Promise.all(list.map(async (f, i) => {
+    try { return await uploadImage(f); }
+    catch (e) { failed.push(`${f.name}: ${e.message}`); return null; }
   }));
+  // a different picture with approved Shots: keep them (default) or re-render all
+  const changes = uploaded.some((info, i) => info && !(target && !!target.sha256 && info.sha256 === target.sha256) && !cards[i].bypassed);
+  if (changes) mode = (await askRefChange(target ? `Replace ${target.label || "this reference"}'s picture?`
+    : `Add ${uploaded.filter(Boolean).length > 1 ? "these references" : "this reference"}?`)) || (target ? null : "keep");
+  uploaded.forEach((info, i) => {
+    const c = cards[i];
+    delete S.uploading[c.id];
+    if (!info || (target && !mode)) {
+      if (!target) p.cast.splice(p.cast.indexOf(c), 1);
+      return;
+    }
+    const unchanged = applyUpload(c, info);
+    if (target && unchanged) same++;            // a new reference always changes the prompt
+    else if (!c.bypassed) shared = true;
+  });
   await loadInputs();
-  if (shared) sharedChanged("Cast & Scenes");
+  if (shared) applyRefChange(mode || "keep", "Cast & Scenes");
   commit();
+  if (target && editing && editing.id === target.id) showEditorImage(target);
   const notes = [];
+  if (target && changes && !mode) notes.push("Kept the picture it had.");
   if (failed.length) notes.push(`Couldn't upload ${failed.join("; ")}`);
   else if (target && same) notes.push("Same picture as before, so nothing re-renders.");
   else if (list.length > 1 && !shared) notes.push(`Added ${list.length} references.`);
@@ -2362,6 +3014,10 @@ const DROP_PANELS = ["#cast-panel", "#audio-panel", "#shots-panel"];
  *  the Audio panel (the song), or the Shots list (a video clip). */
 function dropTargetOf(e) {
   if (!P() || !e.target.closest) return null;
+  if (editing && !$("editor").hidden) {
+    // Item 8: anywhere on the open editor replaces its image; nothing behind it
+    return e.target.closest("#editor") ? { zone: "cast", el: $("editor").querySelector(".editor"), id: editing.id } : null;
+  }
   const cast = e.target.closest("#cast-panel");
   if (cast) {
     const card = e.target.closest("[data-cast]");
@@ -2430,7 +3086,8 @@ async function openFolder(which) {
   const lo = last();
   try {
     await api("/longshot/open-folder", { method: "POST",
-      body: { which, project: P().slug, select: which === "output" && lo && lo.video ? lo.video.filename : null } });
+      body: { which, project: P().slug, select: which === "output" && lo && lo.video ? lo.video.filename : null,
+        subfolder: which === "output" && lo && lo.video ? lo.video.subfolder : null } });
   } catch (e) { toast(e.message); }
 }
 
@@ -2469,10 +3126,13 @@ function showModal(title, text, html) {
 // ---------------------------------------------------------------------------
 
 let confirmResolve = null;
-function confirmBox({ title, body, yes = "Continue", no = "Cancel", check = null }) {
+function confirmBox({ title, body, yes = "Continue", no = "Cancel", check = null, alt = null }) {
   return new Promise((resolve) => {
+    if (confirmResolve) confirmDone(false);           // only one question at a time
     $("confirm-title").textContent = title;
     $("confirm-body").textContent = body;
+    $("confirm-alt").hidden = !alt;                   // a second answer: resolves "alt"
+    $("confirm-alt").textContent = alt || "";
     const row = $("confirm-check-row");
     row.hidden = !check;
     if (check) { $("confirm-check-label").textContent = check; $("confirm-check").checked = false; }
@@ -2494,6 +3154,7 @@ function confirmDone(v) {
 }
 $("confirm-yes").addEventListener("click", () => confirmDone(true));
 $("confirm-no").addEventListener("click", () => confirmDone(false));
+$("confirm-alt").addEventListener("click", () => confirmDone("alt"));
 $("confirm").addEventListener("click", (e) => { if (e.target === $("confirm")) confirmDone(false); });
 
 /** "about N min" for re-rendering these Shots, from measured speed. */
@@ -2540,6 +3201,7 @@ async function changeBaseSeed(el) {
   if (affected.length && !(await confirmShared("the seed", affected))) { el.value = s.seed; return; }
   s.seed = n;
   if (firstAuto >= 0) {
+    S.gen++;
     for (const x of act.slice(firstAuto)) {
       if (x.status === "approved") x.was_approved = true;
       else if (x.status === "review") x.was_rendered = true;
@@ -2567,16 +3229,23 @@ function openEditor(c) {
   $("editor-pic").textContent = picOf(c);
   $("editor-label").value = c.label;
   $("editor-desc").value = c.desc;
-  const missing = ["missing", "invalid"].includes(S.refState[c.id]);
-  $("editor-img").innerHTML = c.image && !missing
-    ? `<img alt="" src="${esc(viewURL({ filename: c.image, subfolder: c.subfolder, type: "input" }))}">`
-    : `<span>${missing ? "Missing: " + esc(c.original_name || c.image) : "No image chosen"}</span>`;
-  $("editor-file").textContent = c.image ? (c.subfolder ? c.subfolder + "/" : "") + c.image : "";
+  showEditorImage(c);
   $("editor").hidden = false;
   autoGrow($("editor-desc"));
   const d = $("editor-desc");
   d.focus();
   d.selectionStart = d.selectionEnd = d.value.length;
+}
+
+/** The editor's picture (and file name), e.g. after an image is dropped on it. */
+function showEditorImage(c) {
+  const missing = ["missing", "invalid"].includes(S.refState[c.id]);
+  $("editor-img").innerHTML = S.uploading[c.id] ? "<span>Uploading…</span>"
+    : c.image && !missing
+      ? `<img alt="" src="${esc(viewURL({ filename: c.image, subfolder: c.subfolder, type: "input" }))}">`
+      : `<span>${missing ? "Missing: " + esc(c.original_name || c.image) : "No image chosen"}</span>`;
+  $("editor-file").textContent = c.image ? (c.subfolder ? c.subfolder + "/" : "") + c.image +
+    " · drop an image here to replace it" : "Drop an image here to use it";
 }
 
 function editorDirty() {
@@ -2591,10 +3260,15 @@ async function editorSave() {
   if (!c) return closeEditor();
   if (!editorDirty()) return closeEditor();
   if (busyGuard()) return;
-  if (!c.bypassed && !(await confirmShared("this reference"))) return;     // stays open
+  let mode = "all";
+  if (!c.bypassed) {
+    if (approvedShots().length) mode = await askRefChange("Save this reference?");
+    else if (!(await confirmShared("this reference"))) mode = null;
+    if (!mode) return;                                                      // stays open
+  }
   c.label = $("editor-label").value;
   c.desc = $("editor-desc").value;
-  if (!c.bypassed) sharedChanged("Cast & Scenes", true);
+  if (!c.bypassed) applyRefChange(mode, "Cast & Scenes", true);
   closeEditor();
   commit();
 }
@@ -2762,6 +3436,66 @@ function renderStats(d) {
   el.hidden = !out.length;
 }
 
+/** Item 5. ComfyUI handles /free flags in its prompt worker when idle, so the
+ *  chips are refreshed a few times over the next seconds. */
+async function freeMemory(what) {
+  if (busyGuard() || S.freeing) return;
+  S.freeing = true;
+  renderHeader();
+  try {
+    if (what === "cache") {
+      const r = await api("/longshot/clear-cache", { method: "POST" });
+      toast(r.cleared ? `Cleared ${r.cleared} Shot piece${r.cleared > 1 ? "s" : ""} from Long Shot's memory. Saved takes on disk stay.`
+        : "Long Shot's memory was already empty.");
+    } else {
+      await api("/free", { method: "POST", body: what === "ram" ? { unload_models: true, free_memory: true } : { unload_models: true } });
+      toast(what === "ram" ? "Models unloaded and ComfyUI's cache cleared. The next render loads the models from disk."
+        : "Models moved out of VRAM. They stay in RAM, so the next render starts quickly.");
+    }
+  } catch (e) { toast(e.message); }
+  S.freeing = false;
+  renderHeader();
+  for (let i = 1; i <= 6; i++) {
+    setTimeout(async () => { try { renderStats(await api("/longshot/stats")); } catch (e) { /* busy */ } }, i * 500);
+  }
+}
+
+/** Item 2: Shots' own seeds back to auto. */
+async function resetShotSeeds() {
+  if (busyGuard()) return;
+  const shots = P().shots.filter((s) => s.kind !== "clip");
+  if (!shots.some((s) => Number(s.shot_seed) >= 0)) { toast("Every Shot is already on auto."); return; }
+  const act = active().filter((s) => s.kind !== "clip");
+  const approved = act.filter((s) => s.status === "approved");
+  let which = shots;
+  if (approved.length) {
+    const rest = act.filter((s) => s.status !== "approved");
+    const ans = await confirmBox({ title: "Reset Shot seeds to auto?",
+      body: `${approved.length} Shot${approved.length > 1 ? "s are" : " is"} approved. All Shots: every Shot goes back to auto and ` +
+        "renders again, approved ones too (their takes stay in Take history). Only Shots not yet rendered: approved Shots keep " +
+        "their seeds and takes; Shots under review count as not rendered and render again.",
+      yes: `Only Shots not yet rendered (${rest.length})`, alt: `All Shots (${act.length})`, no: "Cancel" });
+    if (!ans) return;
+    which = ans === "alt" ? shots : shots.filter((s) => s.bypassed || s.status !== "approved");
+  }
+  S.gen++;
+  S.dry = null;
+  let again = 0;
+  for (const s of which) {
+    s.shot_seed = -1;
+    s.edit_from = null;
+    delete S.bad[s.id + ":shot_seed"];
+    if (s.status !== "queued" && !s.bypassed) {
+      if (s.status === "approved") s.was_approved = true; else s.was_rendered = true;
+      s.status = "queued";
+      again++;
+    }
+  }
+  commit();
+  const n = which.filter((s) => !s.bypassed).length;
+  toast(`Seeds back to auto on ${n} Shot${n === 1 ? "" : "s"}` + (again ? `; ${again} will render again.` : "."));
+}
+
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible") return;
   pollStats();
@@ -2911,16 +3645,21 @@ async function mbChangeFolders(action, path) {
   if (action === "add") toast("Folder added. ComfyUI lists its files now, and the Studio adds it again after a restart.");
 }
 
-function mbPick(name) {
+async function mbPick(name) {
   const p = P(), s = p.settings, t = MB.target;
   const before = currentFor(t);
   $("modal").hidden = true;
   MB = null;
   if (before === name) return;
-  if (t === "turbo") { s.turbo.lora = name; if (s.turbo.on) sharedChanged("Turbo LoRA"); }
-  else if (t === "melband") { p.audio.melband_model = name; if (p.audio.voice_ref) sharedChanged("Audio"); }
-  else if (t.startsWith("lora:")) { const l = s.loras[+t.slice(5)]; l.name = name; if (l.on) sharedChanged("LoRAs"); }
-  else { s[t] = name; sharedChanged("Settings"); }
+  if (t === "melband") { p.audio.melband_model = name; if (p.audio.voice_ref) sharedChanged("Audio"); return commit(); }
+  const matters = t === "turbo" ? s.turbo.on : t.startsWith("lora:") ? s.loras[+t.slice(5)].on : true;
+  const what = t === "turbo" ? "the Turbo LoRA" : t.startsWith("lora:") ? `LoRA ${+t.slice(5) + 1}` : KEEPABLE[t] || "the model";
+  let mode = "all";
+  if (matters) { mode = await askSettingChange(`Change ${what}`); if (!mode) return render(); }
+  if (t === "turbo") s.turbo.lora = name;
+  else if (t.startsWith("lora:")) s.loras[+t.slice(5)].name = name;
+  else s[t] = name;
+  if (matters) applyRefChange(mode, what[0].toUpperCase() + what.slice(1));
   commit();
 }
 
@@ -2944,6 +3683,7 @@ function bridgeAround(s) {
   if (i < 0) return [];
   const out = [];
   const prev = act[i - 1], next = act[i + 1];
+  S.gen++;
   if (prev && prev.kind !== "clip" && s.join !== "cut" && prev.status !== "queued") { prev.status = "queued"; out.push(prev); }
   if (next && next.kind !== "clip" && next.join !== "cut" && next.status !== "queued") { next.status = "queued"; out.push(next); }
   S.dry = null;
@@ -3166,6 +3906,9 @@ function useTake(s, name) {
   if (t.seed !== null && t.seed !== undefined) s.shot_seed = t.seed;
   s.window = t.window_frames;
   s.take_seconds = Number(s.seconds);
+  s.rendered = { text: s.text, seconds: Number(s.seconds), seed: Number(s.shot_seed) };
+  s.edit_from = null;
+  Object.keys(S.bad).forEach((k) => { if (k.startsWith(s.id + ":")) delete S.bad[k]; });
   if (s.status === "queued") s.status = "review";
   S.dry = null;
   commit();
@@ -3218,6 +3961,7 @@ function renderedAfter(s) {
 
 /** Round 1 behaviour, on request: the Shots after `s` render again too. */
 function rippleAfter(s) {
+  S.gen++;
   for (const x of renderedAfter(s)) {
     if (x.status === "approved") x.was_approved = true;
     else x.was_rendered = true;
@@ -3236,12 +3980,41 @@ function bridgeShot(s) {
   s.was_approved = false;
   S.dry = null;
   render();
-  queue({ upto: s.id, kind: "reroll", label: `Bridging into ${titleOf(s)}`,
+  queue({ upto: s.id, kind: "reroll", trimLeft: true, label: `Bridging into ${titleOf(s)}`,
     note: "In place · the Shots around it keep their takes", onDone: onRendered(s.id) });
 }
 
 async function rerollShot(s) {
   if (!s || busyGuard()) return;
+  let alone = false;
+  if (s.standalone) {
+    const mode = await askStandalone(s, "Reroll");
+    if (!mode || S.busy) return;
+    alone = mode === "alone";
+  }
+  if (s.standalone && !alone) {
+    // pinned in place to the rendered Shots around it; it stops being standalone
+    rememberTake(s);
+    s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
+    s.status = "queued";
+    s.was_approved = false;
+    S.dry = null;
+    render();
+    queue({ upto: s.id, kind: "reroll", trimLeft: true, label: `Re-rolling Shot ${numOf(s.id)} · ${pinnedNote(s)} · seed ${s.shot_seed}`,
+      note: "In place · the Shots around it keep their takes", onDone: onRendered(s.id) });
+    return;
+  }
+  if (s.standalone) {
+    rememberTake(s);
+    s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
+    s.status = "queued";
+    s.was_approved = false;
+    S.dry = null;
+    render();
+    queue({ upto: s.id, kind: "reroll", standalone: true, label: `Re-rolling Shot ${numOf(s.id)} on its own · seed ${s.shot_seed}`,
+      note: "A fresh start · no pins to the Shots around it", onDone: onRendered(s.id, true) });
+    return;
+  }
   const after = renderedAfter(s);
   if (after.length) {
     const a = numOf(after[0].id), z = numOf(after[after.length - 1].id);
@@ -3260,7 +4033,7 @@ async function rerollShot(s) {
   S.dry = null;
   const n = numOf(s.id);
   render();
-  queue({ upto: s.id, kind: "reroll", label: `Re-rolling Shot ${n} · seed ${s.shot_seed}`,
+  queue({ upto: s.id, kind: "reroll", trimLeft: true, label: `Re-rolling Shot ${n} · seed ${s.shot_seed}`,
     note: renderedAfter(s).length ? "In place · the Shots around it keep their takes" : "",
     onDone: onRendered(s.id) });
 }
@@ -3296,12 +4069,14 @@ function upscaleFinal() {
       if (!video) throw new Error("Video Combine saved no file.");
       const lo = last();
       const source_at = lo ? lo.source_at : null;
-      P().final_output = { video, chain: built.chain, scale: v.scale, quality: v.quality,
+      const pr = built.nodes.prores ? outputs[built.nodes.prores] || {} : {};
+      const master = (pr.gifs || pr.videos || [])[0] || null;
+      P().final_output = { video, master, chain: built.chain, scale: v.scale, quality: v.quality,
         source_at, at: new Date().toISOString() };
       P().last_output = Object.assign({}, lo || {}, { video, plan: rows, chain: built.chain, text,
         size: [built.width, built.height], source_at });
       loadVideo(0);
-      toast(`Final video saved as ${video.filename}.`);
+      toast(`Final video saved as ${video.filename}` + (master ? ` and the ProRes master as ${master.filename}.` : "."));
     } });
 }
 

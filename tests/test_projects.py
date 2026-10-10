@@ -435,3 +435,150 @@ def test_probe_report_parsing_and_clip_lengths():
     assert info == {"duration": 12.48, "fps": 29.97, "width": 1920, "height": 1080, "has_audio": True}
     assert pj.parse_probe("Duration: 00:01:02.5\\n Stream #0:0: Video: vp9, 640x360, 25 fps")["has_audio"] is False
     assert pj.clip_frames(5.0) == 107 and pj.clip_frames(5.2) == 124 and pj.clip_frames(0.1) == 0
+
+
+# ---------------------------------------------------------------------------
+# Round 4: videos in the project folder, side files of a render
+# ---------------------------------------------------------------------------
+
+def _render_files(folder, stem="Demo", n=1, ext="mp4"):
+    """What Video Combine writes for one render."""
+    os.makedirs(folder, exist_ok=True)
+    names = [f"{stem}_{n:05}.png", f"{stem}_{n:05}.{ext}", f"{stem}_{n:05}-audio.{ext}"]
+    for f in names:
+        with open(os.path.join(folder, f), "wb") as fh:
+            fh.write(b"x" * 10)
+    return names
+
+
+def test_side_files_of_a_render_png_and_silent_video(tmp_path):
+    out = str(tmp_path / "output")
+    vids = os.path.join(out, "longshot", "demo", "videos")
+    png, silent, loud = _render_files(vids)
+    other = _render_files(vids, n=2)                       # an earlier render: never touched
+    entry = {"filename": loud, "subfolder": "longshot/demo/videos", "type": "output"}
+    assert pj.render_side_files(out, [entry]) == []
+    assert [os.path.basename(p) for p in pj.render_side_files(out, [entry], png=True)] == [png]
+    assert [os.path.basename(p) for p in pj.render_side_files(out, [entry], noaudio=True)] == [silent]
+    removed = pj.remove_render_side_files(out, [entry], png=True, noaudio=True)
+    assert removed == [f"longshot/demo/videos/{png}", f"longshot/demo/videos/{silent}"]
+    assert sorted(os.listdir(vids)) == sorted([loud] + other)
+
+
+def test_side_files_never_include_the_video_the_player_uses(tmp_path):
+    out = str(tmp_path / "output")
+    vids = os.path.join(out, "longshot", "demo", "videos")
+    png, silent, loud = _render_files(vids)
+    os.remove(os.path.join(vids, loud))                    # a render with no sound: the silent
+    entry = {"filename": silent, "subfolder": "longshot/demo/videos", "type": "output"}
+    assert pj.render_side_files(out, [entry], noaudio=True) == []      # file is the video
+    assert [os.path.basename(p) for p in pj.render_side_files(out, [entry], png=True)] == [png]
+
+
+@pytest.mark.parametrize("entry", [
+    {"filename": "Demo_00001-audio.mp4", "subfolder": "", "type": "output"},          # output root
+    {"filename": "Demo_00001-audio.mp4", "subfolder": "other", "type": "output"},
+    {"filename": "Demo_00001-audio.mp4", "subfolder": "longshot/../other", "type": "output"},
+    {"filename": "Demo_00001-audio.mp4", "subfolder": "longshot/demo/videos", "type": "temp"},
+    {"filename": "../Demo_00001-audio.mp4", "subfolder": "longshot/demo/videos", "type": "output"},
+    {"filename": "notes.txt", "subfolder": "longshot/demo/videos", "type": "output"},
+    {"filename": "Demo_00009-audio.mp4", "subfolder": "longshot/demo/videos", "type": "output"},  # no such render
+    "not a dict",
+])
+def test_side_files_only_inside_output_longshot(tmp_path, entry):
+    out = str(tmp_path / "output")
+    for folder in (out, os.path.join(out, "other"), os.path.join(out, "longshot", "demo", "videos")):
+        _render_files(folder)
+    assert pj.render_side_files(out, [entry], png=True, noaudio=True) == []
+
+
+def test_old_renders_in_output_longshot_can_be_cleaned_too(tmp_path):
+    out = str(tmp_path / "output")
+    png, silent, loud = _render_files(os.path.join(out, "longshot"))
+    entry = {"filename": loud, "subfolder": "longshot", "type": "output"}
+    assert len(pj.render_side_files(out, [entry], png=True, noaudio=True)) == 2
+
+
+def test_rename_moves_the_videos_and_the_player_follows(tmp_path, store):
+    inp, out, _ = _project_with_files(tmp_path, store)
+    _render_files(os.path.join(out, "longshot", "demo", "videos"))
+    _render_files(os.path.join(out, "longshot"), stem="Old")           # a 0.5 render
+    p = store.load("demo")
+    p["last_output"] = {"video": {"filename": "Demo_00001-audio.mp4", "subfolder": "longshot/demo/videos",
+                                  "type": "output", "workflow": "Demo_00001.png"}, "plan": [], "chain": []}
+    p["final_output"] = {"video": {"filename": "Old_00001-audio.mp4", "subfolder": "longshot",
+                                   "type": "output"},
+                         "master": {"filename": "Demo_00001-audio.mp4", "subfolder": "longshot\\demo\\videos"}}
+    store.save("demo", p)
+    new, _ = pj.rename_project(store, inp, out, "demo", "Chase")
+    p = store.load(new)
+    assert p["last_output"]["video"]["subfolder"] == "longshot/chase/videos"
+    assert p["final_output"]["video"]["subfolder"] == "longshot"          # old renders stay put
+    assert p["final_output"]["master"]["subfolder"] == "longshot/chase/videos"
+    assert os.path.isfile(os.path.join(out, "longshot", "chase", "videos", "Demo_00001-audio.mp4"))
+    assert os.path.isfile(os.path.join(out, "longshot", "Old_00001-audio.mp4"))
+    assert pj.list_videos(out, "chase") == ["Demo_00001-audio.mp4", "Demo_00001.mp4"]
+
+
+def test_export_with_videos_and_import_restores_them(tmp_path, store):
+    inp, out, take = _project_with_files(tmp_path, store)
+    vids = os.path.join(out, "longshot", "demo", "videos")
+    _render_files(vids)
+    _render_files(os.path.join(out, "longshot"), stem="Old")
+    p = store.load("demo")
+    p["last_output"] = {"video": {"filename": "Old_00001-audio.mp4", "subfolder": "longshot",
+                                  "type": "output", "workflow": "Old_00001.png"},
+                        "plan": [{"id": "s1"}], "chain": ["s1"]}
+    p["final_output"] = {"video": {"filename": "Demo_00001-audio.mp4", "subfolder": "longshot/demo/videos",
+                                   "type": "output"}, "chain": ["s1"]}
+    store.save("demo", p)
+    est = pj.export_estimate(inp, out, "demo", store.load("demo"))
+    assert est["video_files"] == 3 and est["videos"] == 30      # 2 in videos/ + the older last preview
+    assert est["takes"] == 4
+
+    no_v = str(tmp_path / "plain.zip")
+    man = pj.export_project(inp, out, store.load("demo"), no_v, takes=True)
+    assert man["videos"] == []
+    with_v = str(tmp_path / "full.zip")
+    man = pj.export_project(inp, out, store.load("demo"), with_v, takes=True, video=True)
+    assert sorted(man["videos"]) == ["Demo_00001-audio.mp4", "Demo_00001.mp4", "Old_00001-audio.mp4"]
+    assert man["player"] == {"last_output.video": "videos/Old_00001-audio.mp4",
+                             "final_output.video": "videos/Demo_00001-audio.mp4"}
+
+    other = pj.ProjectStore(str(tmp_path / "o" / "projects"))
+    inp2, out2 = str(tmp_path / "o" / "input"), str(tmp_path / "o" / "output")
+    slug, summary = pj.import_project(other, inp2, out2, no_v)
+    q = other.load(slug)
+    assert summary["videos"] == 0 and q["last_output"] is None and q["final_output"] is None
+    slug, summary = pj.import_project(other, inp2, out2, with_v)
+    q = other.load(slug)
+    assert summary["videos"] == 3
+    assert sorted(os.listdir(os.path.join(out2, "longshot", slug, "videos"))) == \
+        ["Demo_00001-audio.mp4", "Demo_00001.mp4", "Old_00001-audio.mp4"]
+    assert q["last_output"]["video"] == {"filename": "Old_00001-audio.mp4", "type": "output",
+                                         "subfolder": f"longshot/{slug}/videos", "workflow": None}
+    assert q["last_output"]["plan"] == [{"id": "s1"}]
+    assert q["final_output"]["video"]["subfolder"] == f"longshot/{slug}/videos"
+
+
+def test_import_of_a_0_5_export_puts_its_preview_in_the_videos_folder(tmp_path, store):
+    import zipfile
+    dest = tmp_path / "old.zip"
+    project = {"name": "Old one", "cast": [], "shots": [],
+               "last_output": {"video": {"filename": "Old_00001-audio.mp4", "subfolder": "longshot"},
+                               "plan": [], "chain": []}}
+    with zipfile.ZipFile(dest, "w") as z:
+        z.writestr("project.json", json.dumps(project))
+        z.writestr("manifest.json", json.dumps({"format": 1, "files": [], "takes": [],
+                                                "video": "video/Old_00001-audio.mp4"}))
+        z.writestr("video/Old_00001-audio.mp4", b"vid")
+    out = str(tmp_path / "output")
+    slug, summary = pj.import_project(store, str(tmp_path / "input"), out, str(dest))
+    assert summary["videos"] == 1
+    v = store.load(slug)["last_output"]["video"]
+    assert v["subfolder"] == f"longshot/{slug}/videos" and v["filename"] == "Old_00001-audio.mp4"
+    assert os.path.isfile(os.path.join(out, "longshot", slug, "videos", "Old_00001-audio.mp4"))
+
+
+def test_studio_version():
+    assert pj.STUDIO_VERSION == "0.6.3"

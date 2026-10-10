@@ -11,6 +11,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PKG_DIR = os.path.dirname(HERE)
 sys.path.insert(0, os.path.dirname(PKG_DIR))
 srv = importlib.import_module(os.path.basename(PKG_DIR) + ".studio_server")
+gb = importlib.import_module(os.path.basename(PKG_DIR) + ".graph_builder")
 
 
 @pytest.mark.parametrize("remote,headers,local", [
@@ -32,6 +33,57 @@ def test_folder_for_only_knows_two_folders(tmp_path):
     for bad in ("", None, "/etc", "../output", "user"):
         with pytest.raises(ValueError):
             srv.folder_for(bad, out, inp)
+
+
+def test_output_folder_is_the_projects_videos_folder_when_it_has_one(tmp_path):
+    out, inp = str(tmp_path / "out"), str(tmp_path / "in")
+    assert srv.folder_for("output", out, inp, "demo") == os.path.join(out, "longshot")
+    os.makedirs(os.path.join(out, "longshot", "demo", "videos"))
+    videos = os.path.join(out, "longshot", "demo", "videos")
+    assert srv.folder_for("output", out, inp, "demo") == videos
+    assert srv.folder_for("output", out, inp, "demo", "longshot/demo/videos") == videos
+    # the last video is an older render in output/longshot: open that folder
+    assert srv.folder_for("output", out, inp, "demo", "longshot") == os.path.join(out, "longshot")
+    assert srv.folder_for("output", out, inp, "../x", "longshot/demo/videos") == os.path.join(out, "longshot")
+
+
+def test_video_entries_collects_every_video_combine_result():
+    outputs = {"longshot": {"plan_json": [1]}, "combine": {"gifs": [{"filename": "a-audio.mp4"}]},
+               "combine_prores": {"gifs": [{"filename": "b-audio.mov"}]}, "x": None,
+               "y": {"videos": [{"filename": "c.mp4"}, "junk"]}}
+    assert [e["filename"] for e in srv.video_entries(outputs)] == ["a-audio.mp4", "b-audio.mov", "c.mp4"]
+    assert srv.video_entries(None) == []
+
+
+def test_cleanup_skips_video_combines_served_from_comfyuis_cache():
+    entry = {"outputs": {"combine": {"gifs": [{"filename": "old-audio.mp4"}]},
+                         "combine_prores": {"gifs": [{"filename": "new-audio.mov"}]}},
+             "status": {"messages": [["execution_start", {}],
+                                     ["execution_cached", {"nodes": ["unet", "combine"]}]]}}
+    assert list(srv.fresh_outputs(entry)) == ["combine_prores"]
+    assert srv.fresh_outputs({"outputs": {"a": {}}}) == {"a": {}}
+
+
+def test_clear_longshot_cache_finds_the_loaded_module(monkeypatch):
+    import types
+    mod = types.ModuleType("fake_longshot.nodes")
+    mod._SEGMENT_CACHE = {"a": 1, "b": 2}
+    mod.clear_segment_cache = lambda: mod._SEGMENT_CACHE.clear()
+    monkeypatch.setitem(sys.modules, "fake_longshot.nodes", mod)
+    monkeypatch.setattr(srv, "longshot_module", lambda: mod)
+    assert srv.clear_longshot_cache() == 2 and mod._SEGMENT_CACHE == {}
+
+
+def test_the_prores_format_file_is_valid_and_ten_bit():
+    path = os.path.join(PKG_DIR, "video_formats", gb.PRORES_FORMAT_FILE)
+    with open(path, encoding="utf-8") as fh:
+        f = json.load(fh)
+    main = f["main_pass"]
+    assert main[main.index("-c:v") + 1] == "prores_ks" and main[main.index("-profile:v") + 1] == "hq"
+    assert main[main.index("-pix_fmt") + 1] == "yuv422p10le"
+    assert f["input_color_depth"] == "16bit" and f["extension"] == "mov"
+    assert f["audio_pass"][:2] == ["-c:a", "pcm_s16le"] and "use_metadata_tags" in f["audio_pass"]
+    assert f["save_metadata"][0] == "save_metadata"
 
 
 def test_selectable_rejects_anything_but_a_file_in_the_folder(tmp_path):

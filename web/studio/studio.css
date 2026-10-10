@@ -485,3 +485,41 @@ kbd { font-family: var(--mono); font-size: 11px; color: var(--muted); }
   border-right: 1px solid #8FD3F0; pointer-events: none; }
 .tick.clip div { background: #8FD3F0 !important; }
 .tick-label.clip { color: #8FD3F0; }
+
+/* Round 4 ---------------------------------------------------------------- */
+.mem-btns { display: flex; gap: 4px; align-items: center; }
+.ghost.xs { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
+.ghost.xs:disabled { opacity: .45; cursor: default; }
+@media (max-width: 900px) { .mem-btns { display: none; } }
+.thumb-col { display: flex; flex-direction: column; align-items: center; gap: 4px; flex: none; }
+.ref-step { display: flex; gap: 4px; }
+.icon.xs { width: 30px; height: 20px; font-size: 9px; border: 1px solid var(--line-2); color: var(--sub); }
+.icon.xs:hover { border-color: var(--line-3); color: var(--text); }
+.out-files { margin-top: 14px; display: flex; flex-direction: column; gap: 0; }
+.out-files .check-row, .prores-row { margin: 4px 0; align-items: flex-start; }
+.out-files .check-row input, .prores-row input { margin-top: 2px; }
+.prores-row { margin-top: 10px; }
+.prores-row.off { opacity: .55; }
+.reset-seeds { align-self: flex-end; margin-bottom: 2px; white-space: nowrap; }
+.flag.edited { color: var(--amber-lt); border-color: var(--amber-line); }
+.editor { position: relative; }
+.editor.drop-target { outline: 2px dashed var(--amber); outline-offset: 3px; }
+.editor.drop-target::after { content: "Drop to replace the image"; position: absolute; inset: 0; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center; background: rgba(23, 24, 27, .78);
+  color: var(--amber-lt); font-size: 15px; pointer-events: none; }
+.proj-thumb video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.seed-row { grid-template-columns: minmax(0, 180px) auto; justify-content: start; }
+.seed-row #seed-help { grid-column: 1 / -1; padding-bottom: 0; }
+@media (max-width: 520px) { .seed-row { grid-template-columns: 1fr; } .reset-seeds { justify-self: start; } }
+.confirm { max-width: 560px; }
+.seed-row .reset-seeds { justify-self: start; width: auto; }
+
+/* Round 4b: render a Shot on its own */
+.sdot-play { margin-left: 14px; border: 1px solid #3A6B55; background: #16261F; color: #9FE0C2; cursor: pointer;
+  padding: 0; font-size: 10px; line-height: 1; }
+.sdot-play:hover:not(:disabled) { background: #1C3A2E; border-color: #9FE0C2; }
+.sdot-play:disabled { opacity: .4; cursor: default; }
+.shot-head.has-play { padding-left: 12px; }
+.flag.standalone { color: #8FD3F0; }
+.render-btns { gap: 6px; }
+.render-btns button:disabled { opacity: .45; cursor: default; }

@@ -48,7 +48,7 @@ def check_wiring(prompt):
         assert src in prompt, f"{nid}.{name} -> missing node {src}"
         assert idx >= 0
         used.add(src)
-    dangling = set(prompt) - used - {"combine"}
+    dangling = set(prompt) - used - {"combine", "combine_prores"}
     assert not dangling, f"nodes that feed nothing: {dangling}"
 
 
@@ -143,7 +143,7 @@ def test_sample_builds_the_reference_workflow():
     assert p["builder"]["inputs"]["shots"] == ["shot6", 0]
 
     c = p["combine"]["inputs"]
-    assert c["filename_prefix"] == "longshot/Sample project"
+    assert c["filename_prefix"] == "longshot/sample-project/videos/Sample project"
     assert c["format"] == "video/nvenc_h264-mp4" and c["frame_rate"] == 24
     assert c["audio"] == ["decode_audio", 0] and c["images"] == ["decode", 0]
     assert (c["pix_fmt"], c["bitrate"], c["megabit"], c["save_metadata"], c["pingpong"],
@@ -559,12 +559,17 @@ def test_safe_name(name, want):
     assert gb.safe_name(name) == want
 
 
-def test_output_prefix_stays_in_the_longshot_folder():
+def test_output_prefix_stays_in_the_project_videos_folder():
     p = sample()
     p["name"] = "../../escape/me"
     prefix = build(p).prompt["combine"]["inputs"]["filename_prefix"]
-    assert prefix == "longshot/_escape_me"
-    assert prefix.count("/") == 1
+    assert prefix == "longshot/sample-project/videos/_escape_me"
+    assert prefix.count("/") == 3
+    # a slug that isn't one is never used as a folder: the name's slug is
+    p["slug"] = "../../etc"
+    prefix = build(p).prompt["combine"]["inputs"]["filename_prefix"]
+    assert prefix == "longshot/escape-me/videos/_escape_me"
+    assert gb.videos_subfolder(p) == "longshot/escape-me/videos"
 
 
 def test_task_types_map_to_the_three_slots():
@@ -708,8 +713,8 @@ def test_upscale_final_forces_rtx_and_names_the_file():
     assert "vsr" not in preview
     assert final["vsr"]["inputs"]["resize_type.scale"] == 3 and final["vsr"]["inputs"]["quality"] == "HIGH"
     assert final["combine"]["inputs"]["images"] == ["vsr", 0]
-    assert final["combine"]["inputs"]["filename_prefix"] == "longshot/Sample project_final"
-    assert preview["combine"]["inputs"]["filename_prefix"] == "longshot/Sample project"
+    assert final["combine"]["inputs"]["filename_prefix"] == "longshot/sample-project/videos/Sample project_final"
+    assert preview["combine"]["inputs"]["filename_prefix"] == "longshot/sample-project/videos/Sample project"
     assert final["longshot"] == preview["longshot"], "the final reuses every segment"
 
 
@@ -780,3 +785,83 @@ def test_clips_load_scaled_to_cover_the_film():
     assert tall["custom_height"] == 0 and tall["custom_width"] > 0
     unknown = build(with_clip()).prompt["clipload3"]["inputs"]
     assert (unknown["custom_width"], unknown["custom_height"]) == (0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Round 4: ProRes master next to the upscaled final
+# ---------------------------------------------------------------------------
+
+def test_prores_master_only_on_the_final_and_only_when_asked():
+    p = sample()
+    assert "combine_prores" not in build(p, final=True).prompt
+    p["settings"]["prores_master"] = True
+    assert "combine_prores" not in build(p).prompt          # previews never write a master
+    b = build(p, final=True)
+    final = b.prompt
+    check_wiring(final)
+    m, c = final["combine_prores"]["inputs"], final["combine"]["inputs"]
+    assert m["format"] == gb.PRORES == "video/h3-prores-422hq-10bit.json"
+    assert m["images"] == c["images"] == ["vsr", 0]          # the same upscaled frames
+    assert m["audio"] == c["audio"]                          # and the same sound
+    assert m["save_metadata"] is True and m["save_output"] is True and m["frame_rate"] == 24
+    assert m["filename_prefix"] == "longshot/sample-project/videos/Sample project_final_master"
+    assert b.nodes["prores"] == "combine_prores"
+    assert final["longshot"] == build(p).prompt["longshot"], "the master reuses every segment"
+
+
+def test_prores_master_carries_the_song_when_it_replaces_the_audio():
+    p = sample()
+    p["settings"]["prores_master"] = True
+    p["audio"].update(file="song.mp3", final_override=True)
+    final = build(p, final=True).prompt
+    assert final["combine_prores"]["inputs"]["audio"] == ["audio", 0]
+
+
+def test_prores_master_falls_back_to_vhs_prores_with_a_warning():
+    p = sample()
+    p["settings"]["prores_master"] = True
+    env = gb.Env(video_formats=[gb.H264, gb.VHS_PRORES])
+    b = build(p, final=True, env=env)
+    m = b.prompt["combine_prores"]["inputs"]
+    assert m["format"] == gb.VHS_PRORES and m["profile"] == "hq"
+    assert any("8-bit" in w for w in b.warnings)
+    with pytest.raises(gb.BuildError, match="no ProRes format"):
+        build(p, final=True, env=gb.Env(video_formats=[gb.H264]))
+    # the Studio's own format is used when VHS lists it
+    b = build(p, final=True, env=gb.Env(video_formats=[gb.H264, gb.VHS_PRORES, gb.PRORES]))
+    assert b.prompt["combine_prores"]["inputs"]["format"] == gb.PRORES
+    assert not any("ProRes" in w for w in b.warnings)
+
+
+# ---------------------------------------------------------------------------
+# Round 4b: a Shot rendered on its own
+# ---------------------------------------------------------------------------
+
+def test_standalone_render_sends_a_one_shot_timeline():
+    p = sample()
+    b = build(p, upto="s3", standalone=True)
+    shots = of_class(b.prompt, "MiniMaxH3TimelineShot")
+    assert b.chain == ["s3"] and len(shots) == 1
+    s = shots["shot1"]["inputs"]
+    assert s["shot_id"] == "s3" and "shots" not in s and s["lock"] == ""
+    assert s["text"] == p["shots"][2]["text"]
+    check_wiring(b.prompt)
+    # the same project and cache, so the take lands with the others
+    assert b.prompt["longshot"]["inputs"]["cache_name"] == build(p).prompt["longshot"]["inputs"]["cache_name"]
+
+
+def test_a_standalone_take_is_sent_as_a_lock_in_later_chains():
+    p = sample()
+    p["shots"][2].update(lock="s3__99__0123abcd.safetensors", standalone=True)
+    shots = build(p, upto="s4").prompt
+    assert shots["shot3"]["inputs"]["lock"] == "s3__99__0123abcd.safetensors"
+    assert shots["shot3"]["inputs"]["shots"] == ["shot2", 0]
+
+
+def test_standalone_needs_a_generated_shot():
+    p = sample()
+    with pytest.raises(gb.BuildError, match="needs the Shot"):
+        build(p, standalone=True)
+    p["shots"][2].update(kind="clip", clip={"file": "x.mp4", "frames": 22})
+    with pytest.raises(gb.BuildError, match="clip"):
+        build(p, upto="s3", standalone=True)
