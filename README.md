@@ -64,7 +64,7 @@ without it, pick another under **Advanced**.
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/r34vtraining/H3_Longshot_Studio
+git clone https://github.com/r34vtraining/Longshot_Studio
 git clone https://github.com/r34vtraining/H3_Prompt_Compiler
 git clone https://github.com/r34vtraining/H3_Longshot
 git clone https://github.com/kijai/ComfyUI-KJNodes
