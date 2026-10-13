@@ -1223,7 +1223,47 @@ function jobOpts(job) {
 
 const Q_ICON = { waiting: "○", running: "◌", done: "✓", failed: "!", stopped: "■", skipped: "–" };
 
+// ---------------------------------------------------------------------------
+// Keep awake (0.8.4): while the queue has work, the ComfyUI machine is asked
+// not to sleep (a heartbeat; released ~2 min after the tab goes away), and this
+// tab keeps its own screen on with the browser's wake lock while it's visible.
+// ---------------------------------------------------------------------------
+const AW = { on: false, sent: 0, lock: null, held: false, how: "", pending: false };
+const queueHasWork = () => !!S.busy || !!S.chunking ||
+  Q.jobs.some((j) => j.state === "running" || (j.state === "waiting" && !Q.paused));
+async function syncAwake() {
+  const want = queueHasWork();
+  if (!AW.pending && (want !== AW.on || (want && Date.now() - AW.sent > 25000))) {
+    AW.pending = true;
+    try {
+      const r = await api("/longshot/keep-awake", { method: "POST", body: { on: want } });
+      AW.held = !!r.held || want; AW.how = r.how || "";
+      AW.on = want; AW.sent = Date.now();
+    } catch (e) { /* ComfyUI away: tried again on the next tick */ }
+    AW.pending = false;
+  }
+  try {
+    if (want && !AW.lock && navigator.wakeLock && document.visibilityState === "visible") {
+      AW.lock = await navigator.wakeLock.request("screen");
+      AW.lock.addEventListener("release", () => { AW.lock = null; renderAwake(); });
+    } else if (!want && AW.lock) { await AW.lock.release(); AW.lock = null; }
+  } catch (e) { AW.lock = null; }      // not allowed here (no HTTPS on another device, battery saver…)
+  renderAwake();
+}
+function renderAwake() {
+  const el = $("awake");
+  if (!el) return;
+  const on = AW.on || !!AW.lock;
+  el.hidden = !on;
+  el.title = on ? [AW.on ? `The ComfyUI machine stays awake while the queue has work (${AW.how || "requested"}).` : "",
+    AW.lock ? "This screen stays on while the tab is visible." : "This screen may sleep (the tab is hidden, or the browser doesn't allow it); the queue runs from this tab, so keep it awake."]
+    .filter(Boolean).join(" ") : "";
+}
+setInterval(syncAwake, 30000);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") syncAwake(); });
+
 function renderQueue() {
+  setTimeout(syncAwake, 0);
   if (S.swapped || !$("queue")) return;
   const wait = waitingJobs().length, live = Q.jobs.filter(liveJob).length;
   $("queue-count").textContent = live ? `· ${live} to go${Q.paused ? " · paused" : ""}` : Q.paused ? "· paused" : "";
@@ -2941,6 +2981,45 @@ function renderStyle() {
   fitAll($("style"));
 }
 
+/** Retention: with the mouse resting on the field, the markers it takes (0.8.4).
+ *  Read-only: it never edits the text; gone on moving off or typing. */
+const RET_HINT = `<div class="rh-h">Pictures and subjects</div>
+  <div class="rh-row"><code>fully_preserved</code><span>kept exactly: face, outfit, shape, colours</span></div>
+  <div class="rh-row"><code>partially_preserved</code><span>kept, with some features free to change</span></div>
+  <div class="rh-row"><code>attribute_transfer</code><span>only some attributes carried over (style, colour, costume)</span></div>
+  <div class="rh-row"><code>weak_reference</code><span>loose guidance only</span></div>
+  <div class="rh-h">Audio</div>
+  <div class="rh-row"><code>fully_copy</code><span>the sound used as is</span></div>
+  <div class="rh-row"><code>partially_copy</code><span>part of it used as is</span></div>
+  <div class="rh-row"><code>reference</code><span>its timbre, style or rhythm only</span></div>
+  <div class="rh-row"><code>weak_reference</code><span>loose guidance only</span></div>
+  <div class="rh-h">One line per label</div>
+  <div class="rh-ex"><code>&lt;Luma&gt; (appears in [Shot 1]): fully_preserved - face and pajamas.</code></div>
+  <div class="rh-note">Never write (S1) here.</div>`;
+let rhTimer = null;
+function hideRetHint() { clearTimeout(rhTimer); const h = $("ret-hint"); if (h) h.hidden = true; }
+document.addEventListener("mousemove", (e) => {
+  const el = e.target && e.target.id === "f-retention" ? e.target : null;
+  clearTimeout(rhTimer);
+  const h = $("ret-hint");
+  if (!el) { if (h && !h.hidden && !(e.target.closest && e.target.closest("#ret-hint"))) h.hidden = true; return; }
+  if (h && !h.hidden) return;                    // already showing: stays while the mouse is on the field
+  rhTimer = setTimeout(() => {
+    let box = $("ret-hint");
+    if (!box) { box = document.createElement("div"); box.id = "ret-hint"; box.className = "ret-hint"; document.body.appendChild(box); }
+    box.innerHTML = RET_HINT;
+    const r = el.getBoundingClientRect();
+    box.hidden = false;
+    const w = box.offsetWidth, hh = box.offsetHeight;
+    let top = r.bottom + 6, left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8));
+    if (top + hh > window.innerHeight - 8) top = Math.max(8, r.top - hh - 6);
+    box.style.top = top + "px";
+    box.style.left = left + "px";
+  }, 500);
+});
+document.addEventListener("keydown", (e) => { if (e.target && e.target.id === "f-retention") hideRetHint(); }, true);
+document.addEventListener("scroll", hideRetHint, true);
+
 /** Style & Sound and Shot prompt boxes: as tall as their text (the rows attribute
  *  is the least), on open, while typing and after every redraw. */
 function fitText(el) {
@@ -3342,8 +3421,8 @@ function renderViewer() {
   // Open output folder always works (local only): the latest video, else the clips folder
   for (const el of document.querySelectorAll('[data-which="output"]')) {
     el.removeAttribute("disabled");
-    el.title = hasFile ? "Open the output folder with the latest video selected"
-      : "Open this project's clips folder with the Shot in focus selected";
+    el.title = "Open Approved_Clips with the Shot in focus selected (before any export: " +
+      (hasFile ? "the latest video)" : "the clips folder)");
   }
   $("download").toggleAttribute("disabled", !hasFile);
   $("download").hidden = S.local || !hasFile;
@@ -4909,17 +4988,22 @@ async function clearSegments() {
 
 async function openFolder(which) {
   const lo = last();
-  let select = null, subfolder = null;
-  if (which === "output" && lo && lo.video) { select = lo.video.filename; subfolder = lo.video.subfolder; }
-  else if (which === "output") {
-    // no stitched video (renders save per-take clips): the clips folder, the focused Shot's clip selected
-    subfolder = `longshot/${P().slug}/clips`;
+  let select = null, subfolder = null, fallback = null;
+  if (which === "output") {
+    // 0.8.4: Approved_Clips first, with the focused Shot's exported clip selected
     const s = shotById(S.focus) || reviewShot();
-    const key = s && s.kind !== "clip" && s.take ? takeStem(s.take) : null;
-    if (key && S.clips[key]) select = key + ".mp4";
+    const ap = s ? approvedForExport().find((x) => x.s.id === s.id) : null;
+    subfolder = `longshot/${P().slug}/Approved_Clips`;
+    select = ap ? ap.name + ".mp4" : null;
+    // nothing exported yet: the latest video, else the clips folder with the focused Shot's clip
+    if (lo && lo.video) fallback = { subfolder: lo.video.subfolder, select: lo.video.filename };
+    else {
+      const key = s && s.kind !== "clip" && s.take ? takeStem(s.take) : null;
+      fallback = { subfolder: `longshot/${P().slug}/clips`, select: key && S.clips[key] ? key + ".mp4" : null };
+    }
   }
   try {
-    await api("/longshot/open-folder", { method: "POST", body: { which, project: P().slug, select, subfolder } });
+    await api("/longshot/open-folder", { method: "POST", body: { which, project: P().slug, select, subfolder, fallback } });
   } catch (e) { toast(e.message); }
 }
 

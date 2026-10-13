@@ -17,6 +17,7 @@
     DELETE /longshot/takes/<slug>/<name>    delete one take (loopback only)
     POST /longshot/clear-segments  {project} (loopback only)
     POST /longshot/open-folder     {"which": "output"|"input", "select", "project", "subfolder"} (loopback only)
+    POST /longshot/keep-awake      {on}: keep the machine awake while the queue has work
     POST /longshot/restart         restart ComfyUI (relaunches itself, like ComfyUI-Manager)
     POST /longshot/cleanup-outputs {prompt_id, png, noaudio}: delete a finished render's
                                    first-frame PNG and/or silent video (output/longshot only)
@@ -106,6 +107,22 @@ def folder_for(which, output_dir, input_dir, project=None, subfolder=None):
                 return sub
         return input_dir
     raise ValueError("which must be 'output' or 'input'")
+
+
+def open_target(output_dir, input_dir, body):
+    """(folder, select) for an open-folder request. The output button asks for
+    the project's Approved_Clips first (0.8.4); when that folder doesn't exist
+    yet it uses the request's fallback (the latest video, or the clips folder)."""
+    which, project = body.get("which"), body.get("project")
+    folder = folder_for(which, output_dir, input_dir, project, body.get("subfolder"))
+    select = body.get("select")
+    fb = body.get("fallback")
+    sub = str(body.get("subfolder") or "").replace("\\", "/").strip("/")
+    if which == "output" and isinstance(fb, dict) and pj.is_slug(project) and \
+            sub == pj.approved_subfolder(project) and folder != pj.approved_folder(output_dir, project):
+        folder = folder_for(which, output_dir, input_dir, project, fb.get("subfolder"))
+        select = fb.get("select")
+    return folder, select
 
 
 def selectable(folder, name):
@@ -734,6 +751,114 @@ def bring_to_front(folder, before, platform=None, wait=4.0):
 # Routes
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Keep awake (0.8.4): while the Studio's queue has work, the ComfyUI machine
+# doesn't go to sleep. The browser sends a heartbeat; ComfyUI's own queue
+# counts too (the last job keeps running if the tab closes). One thread holds
+# the OS request, so it's released the moment neither is true, or about
+# KEEP_AWAKE_TTL seconds after the last heartbeat.
+# ---------------------------------------------------------------------------
+
+KEEP_AWAKE_TTL = 120.0
+
+
+class KeepAwake:
+    ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_AWAYMODE_REQUIRED = 0x80000000, 0x00000001, 0x00000040
+
+    def __init__(self, platform=None, clock=None, busy=None):
+        import threading
+        import time
+        self.platform = platform or sys.platform
+        self.clock = clock or time.monotonic
+        self.busy = busy or comfy_queue_busy
+        self.until = 0.0
+        self.held = False
+        self.proc = None
+        self.lock = threading.Lock()
+        self.thread = None
+        self.wake = threading.Event()
+
+    def beat(self, on):
+        """A heartbeat from the browser: on = its queue has work."""
+        with self.lock:
+            self.until = self.clock() + KEEP_AWAKE_TTL if on else 0.0
+        self._ensure_thread()
+        self.wake.set()
+        return self.state()
+
+    def wanted(self):
+        return self.clock() < self.until or bool(self.busy())
+
+    def state(self):
+        return {"held": self.held, "how": self.how()}
+
+    def how(self):
+        if self.platform == "win32":
+            return "Windows: system sleep blocked (the screen can still turn off)"
+        if self.platform == "darwin":
+            return "macOS: caffeinate -i"
+        return "Linux: systemd-inhibit (sleep)" if shutil.which("systemd-inhibit") else "not supported here"
+
+    def _ensure_thread(self):
+        import threading
+        if self.thread is None or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self._run, name="longshot-keep-awake", daemon=True)
+            self.thread.start()
+
+    def _run(self):
+        # SetThreadExecutionState holds for the thread that calls it: this one.
+        while True:
+            want = self.wanted()
+            if want != self.held:
+                try:
+                    self._apply(want)
+                    self.held = want
+                    logger.info("Long Shot Studio: %s", "the queue has work, keeping this machine awake."
+                                if want else "the queue is idle, sleep is allowed again.")
+                except Exception as err:      # never break a render over this
+                    logger.warning("Long Shot Studio: couldn't change the sleep setting: %s", err)
+                    self.held = want
+            elif want and self.platform == "win32":
+                try:
+                    self._apply(True)        # refresh, harmless
+                except Exception:
+                    pass
+            if not want and self.clock() >= self.until and not self.busy():
+                self.wake.wait(30)
+            else:
+                self.wake.wait(20)
+            self.wake.clear()
+
+    def _apply(self, on):
+        if self.platform == "win32":
+            import ctypes
+            flags = self.ES_CONTINUOUS | (self.ES_SYSTEM_REQUIRED if on else 0)
+            ctypes.windll.kernel32.SetThreadExecutionState(flags)
+            return
+        if on and self.proc is None:
+            if self.platform == "darwin" and shutil.which("caffeinate"):
+                self.proc = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+            elif shutil.which("systemd-inhibit"):
+                self.proc = subprocess.Popen(["systemd-inhibit", "--what=sleep:idle", "--who=H3 Long Shot Studio",
+                                              "--why=Renders in the queue", "sleep", "infinity"])
+        elif not on and self.proc is not None:
+            self.proc.terminate()
+            self.proc = None
+
+
+def comfy_queue_busy():
+    """ComfyUI has prompts running or waiting."""
+    try:
+        from server import PromptServer
+        q = PromptServer.instance.prompt_queue
+        return bool(q.get_tasks_remaining())
+    except Exception:
+        return False
+
+
+KEEP_AWAKE = KeepAwake()
+
+
 def register(routes=None):
     """Attach the routes to ComfyUI's PromptServer. False when there is none
     (tests, scripts)."""
@@ -1240,13 +1365,12 @@ def register(routes=None):
             body = {}
         import folder_paths
         try:
-            folder = folder_for(body.get("which"), folder_paths.get_output_directory(),
-                                folder_paths.get_input_directory(), body.get("project"),
-                                body.get("subfolder"))
+            folder, wanted = open_target(folder_paths.get_output_directory(),
+                                         folder_paths.get_input_directory(), body)
         except ValueError as err:
             return error(err)
         os.makedirs(folder, exist_ok=True)
-        select = selectable(folder, body.get("select"))
+        select = selectable(folder, wanted)
         before = explorer_snapshot()
         try:
             launch(open_command(folder, select))
@@ -1412,6 +1536,15 @@ def register(routes=None):
         if n is None:
             return error("The H3 Long Shot pack isn't loaded.", 404)
         return web.json_response({"cleared": n})
+
+    @routes.post("/longshot/keep-awake")
+    async def keep_awake(request):
+        """{on}: the browser's queue has work (a heartbeat every ~30 s)."""
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        return web.json_response(KEEP_AWAKE.beat(bool(body.get("on"))))
 
     @routes.post("/longshot/restart")
     async def restart(request):
