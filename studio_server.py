@@ -278,6 +278,19 @@ def _timeline_shot_inputs():
         return None
 
 
+def longshot_version():
+    """H3 Long Shot's version as a tuple, (0,) when it can't be read."""
+    try:
+        import importlib
+        import nodes as comfy_nodes
+        cls = comfy_nodes.NODE_CLASS_MAPPINGS.get("MiniMaxH3LongShot")
+        pkg = cls.__module__.rsplit(".", 1)[0]
+        v = importlib.import_module(pkg + ".store").LONGSHOT_VERSION
+        return tuple(int(x) for x in str(v).split("."))
+    except Exception:
+        return (0,)
+
+
 def current_env():
     return gb.Env(classes=set(_node_classes()), video_formats=video_formats(),
                   shot_inputs=_timeline_shot_inputs())
@@ -562,6 +575,8 @@ def options_payload():
         "video_formats": video_formats(),
         "nvenc": nvenc_available(),
         "output_subfolder": gb.OUTPUT_SUBFOLDER,
+        "longshot_version": ".".join(str(x) for x in longshot_version()),
+        "max_shots": gb.MAX_SHOTS,
     }
 
 

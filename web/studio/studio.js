@@ -893,8 +893,40 @@ const vsrChunkS = () => {
 };
 const filmSeconds = () => active().reduce((a, s) => a + ((lastRowFor(s.id) || {}).seconds || Number(s.seconds) || 0), 0);
 
-/** A whole-film job: in chunks when it upscales and the film is longer than one chunk. */
-function wholeQueue(opts) {
+/** Decode runs (0.8.5): Shots joined Continuous or Bridge decode in one piece; a
+ *  new run starts at each Cut or Context join, and where a Shot is left out (a
+ *  preview's gap). Each run decodes alone; the pieces are joined at those cuts. */
+function decodeRuns(omit) {
+  const skip = new Set(omit || []);
+  const runs = [];
+  let prevIn = false;
+  for (const s of active()) {
+    if (skip.has(s.id)) { prevIn = false; continue; }
+    if (!runs.length || !prevIn || isCut(s)) runs.push([]);
+    runs[runs.length - 1].push(s.id);
+    prevIn = true;
+  }
+  return runs;
+}
+/** Long Shot 1.6.10+ encodes a run's frames without upscaling (Upscale Chunk at scale 1). */
+function runsSupported() {
+  const v = String((S.opts || {}).longshot_version || "0").split(".").map(Number);
+  const want = [1, 6, 10];
+  for (let i = 0; i < 3; i++) { if ((v[i] || 0) !== want[i]) return (v[i] || 0) > want[i]; }
+  return true;
+}
+/** GB of system RAM to decode `ids` in one piece (float32 frames, as ComfyUI holds them). */
+function decodeGB(ids) {
+  const size = sizeOf(P().settings);
+  if (!size) return 0;
+  const secs = ids.reduce((a, id) => { const x = shotById(id); return a + ((lastRowFor(id) || {}).seconds || Number(x && x.seconds) || 0); }, 0);
+  const frames = Math.round(secs * FPS) + (Number(P().settings.overlap) || 22);
+  return frames * size[0] * size[1] * 3 * 4 / 1024 ** 3;
+}
+
+/** A whole-film job: run by run (split only at cuts), and in chunks when it
+ *  upscales; one file at the end. A film with no cuts and no upscale: one go. */
+async function wholeQueue(opts) {
   const v = P().settings.rtx_vsr || {};
   const upscales = opts.kind === "final" || !!v.on;
   const J = S.joinPending;
@@ -908,20 +940,50 @@ function wholeQueue(opts) {
     return chunkJoin(J, true);
   }
   S.joinPending = null;
-  if (!upscales || filmSeconds() <= vsrChunkS() + 0.5) return runNow(opts);
-  const C = { opts, slug: P().slug, jobId: opts.jobId || null, L: Math.max(24, Math.round(vsrChunkS() * FPS)), n: 0, k: 0,
-    files: [], masters: [], audio: null, prefix: null, done: null };
+  const runs = runsSupported() ? decodeRuns(opts.omit) : null;
+  const multi = !!runs && runs.length > 1;
+  // RAM: the longest run is decoded in one piece; stop before it, not partway through
+  const ram = S.sys && S.sys.ram ? S.sys.ram.total / 1024 ** 3 : 0;
+  if (ram) {
+    const pieces = runs || [active().filter((x) => !(opts.omit || []).includes(x.id)).map((x) => x.id)];
+    const worst = pieces.map((ids) => ({ ids, gb: decodeGB(ids) })).sort((a, b) => b.gb - a.gb)[0];
+    if (worst && worst.gb + 6 > ram) {
+      const a = numOf(worst.ids[0]), b = numOf(worst.ids[worst.ids.length - 1]);
+      S.error = `Shots ${a}–${b} decode in one piece and need about ${Math.round(worst.gb)} GB of RAM; this machine has ` +
+        `${Math.round(ram)} GB. Put a Cut or Context join inside that stretch (each starts a new decode run), or lower the resolution.`;
+      render();
+      return;
+    }
+  }
+  if (!multi && (!upscales || filmSeconds() <= vsrChunkS() + 0.5)) return runNow(opts);
+  const C = { opts, slug: P().slug, jobId: opts.jobId || null, upscales,
+    L: upscales ? Math.max(24, Math.round(vsrChunkS() * FPS)) : 10_000_000,
+    runs: multi ? runs : [null], r: 0, c: 0, nr: 0, n: 0, k: 0,
+    trim: Number(P().settings.overlap) || 22,                       // a run after a cut drops its hidden overlap
+    song: !!(P().audio.final_override && P().audio.file),           // the song is the whole film's sound
+    files: [], masters: [], audio: null, audios: [], prefix: null, done: null,
+    rowsAll: [], chainAll: [], texts: [], offset: 0 };
   S.chunking = C;
   return chunkRun(C);
 }
 
 async function chunkRun(C, inCtx = true) {
   if (!inCtx) return inProject(C.slug, () => chunkRun(C, true));
-  const i = C.k, o = C.opts;
-  await runNow(Object.assign({}, o, {
-    chunk: { index: i, start: i * C.L, length: C.L, audio: i === 0 },
-    label: `${o.label} · chunk ${i + 1}${C.n ? " of " + C.n : ""}`,
-    note: i === 0 ? "Decoding the film, then upscaling it a chunk at a time" : "The decoded film is reused · upscaling the next chunk",
+  const i = C.k, o = C.opts, run = C.runs[C.r], trim = C.r > 0 ? C.trim : 0;
+  const extra = {};
+  if (run) {
+    extra.omit = active().map((x) => x.id).filter((id) => !run.includes(id));
+    extra.upto = run[run.length - 1];
+  }
+  const span = !run ? "" : run.length === 1 ? `Shot ${numOf(run[0])}` : `Shots ${numOf(run[0])}–${numOf(run[run.length - 1])}`;
+  const runTxt = C.runs.length > 1 ? ` · run ${C.r + 1} of ${C.runs.length} (${span})` : "";
+  const chunkTxt = C.upscales ? ` · chunk ${C.c + 1}${C.nr ? " of " + C.nr : ""}` : "";
+  await runNow(Object.assign({}, o, extra, {
+    chunk: { index: i, start: trim + C.c * C.L, length: C.L, audio: C.c === 0 && (C.r === 0 || !C.song) },
+    label: `${o.label}${runTxt}${chunkTxt}`,
+    note: C.c > 0 ? "The decoded run is reused · upscaling the next chunk"
+      : C.runs.length > 1 ? `Decoding ${span} in one piece (a continuous run)${C.upscales ? ", then upscaling it a chunk at a time" : ""}`
+        : "Decoding the film, then upscaling it a chunk at a time",
     onDone: (res) => chunkDone(C, res),
   }));
   if (!S.busy && S.chunking === C && C.k === i) chunkEnd(C, false, S.error || "A chunk didn't start.");   // didn't start
@@ -931,21 +993,41 @@ function chunkDone(C, { rows, text, outputs, built, sent }) {
   const ui = outputs[built.nodes.chunk] || {};
   const fr = (ui.frame_range || [])[0], v = (ui.chunk_video || [])[0], m = (ui.chunk_master || [])[0];
   if (!fr || !v) throw new Error("The chunk saved no file. Update H3 Long Shot to 1.6.2 or later.");
-  C.n = Math.max(1, Math.ceil(fr.total / C.L));
+  const trim = C.r > 0 ? C.trim : 0;
+  if (C.c === 0) {
+    // this run's frames (after the overlap it hides), and its Shots' times on the whole film
+    const shown = Math.max(0, fr.total - trim);
+    C.nr = Math.max(1, Math.ceil(shown / C.L));
+    C.n += C.nr;
+    const shift = C.offset - trim / FPS;
+    (rows || []).forEach((r, i) => {
+      const x = Object.assign({}, r, { start: Math.max(C.offset, r.start + shift), end: r.end + shift });
+      if (i === 0 && C.r > 0) x.seam = "cut";
+      C.rowsAll.push(x);
+    });
+    C.chainAll.push(...built.chain);
+    if (text) C.texts.push(text);
+    C.offset += shown / FPS;
+  }
   C.files.push({ filename: v.filename, subfolder: v.subfolder });
   if (m) C.masters.push({ filename: m.filename, subfolder: m.subfolder });
   const a = built.nodes.audio_file && ((outputs[built.nodes.audio_file] || {}).longshot_audio || [])[0];
-  if (a) C.audio = { filename: a.filename, subfolder: a.subfolder };
+  if (a) {
+    if (C.song || C.runs.length === 1) C.audio = { filename: a.filename, subfolder: a.subfolder };
+    else C.audios.push({ filename: a.filename, subfolder: a.subfolder, skip: trim / FPS });
+  }
   C.prefix = built.filename_prefix;
   C.done = { rows, text, built, sent };
+  C.c++;
   C.k++;
 }
 
 async function chunkNext(C, ok) {
   if (S.chunking !== C) return;
   if (C.stopRequested) { chunkEnd(C, false, "Stopped."); return; }
-  if (!ok || !C.done || C.k === 0) { chunkEnd(C, false, S.lastSwapError || S.error || "The upscale stopped."); return; }
-  if (C.k < C.n) { chunkRun(C, false); return; }
+  if (!ok || !C.done || C.k === 0) { chunkEnd(C, false, S.lastSwapError || S.error || "The film stopped."); return; }
+  if (C.c < C.nr) { chunkRun(C, false); return; }
+  if (C.r + 1 < C.runs.length) { C.r++; C.c = 0; C.nr = 0; chunkRun(C, false); return; }    // the next run
   chunkJoin(C);
 }
 
@@ -954,25 +1036,29 @@ async function chunkNext(C, ok) {
 async function chunkJoin(C, inCtx = false) {
   if (!inCtx) return inProject(C.slug, () => chunkJoin(C, true));
   C.joining = true;
-  toast(`Joining ${C.n} chunks…`);
+  toast(C.runs.length > 1 ? `Joining ${C.runs.length} runs into one film…` : `Joining ${C.n} chunks…`);
   render();
-  const { rows, text, built, sent } = C.done;
+  const { sent } = C.done;
+  // the whole film's Shots and times, run after run
+  const built = Object.assign({}, C.done.built, { chain: C.chainAll.length ? C.chainAll : C.done.built.chain });
+  const rows = C.rowsAll.length ? C.rowsAll : C.done.rows;
+  const text = C.texts.join("\n\n") || C.done.text;
   const job = C.jobId && Q.jobs.find((j) => j.id === C.jobId);
   try {
     const out = await api(`/longshot/chunks/${encodeURIComponent(P().slug)}/join`, { method: "POST",
-      body: { prefix: C.prefix, chunks: C.files, audio: C.audio, masters: C.masters } });
+      body: { prefix: C.prefix, chunks: C.files, audio: C.audio || (C.audios.length ? C.audios : null), masters: C.masters } });
     const outputs = { [built.nodes.combine]: { gifs: [out.video] } };
     if (built.nodes.prores && out.master) outputs[built.nodes.prores] = { gifs: [out.master] };
     S.chunking = null;
     C.opts.onDone({ rows, text, outputs, built, sent });
   } catch (e) {
-    S.error = `Joining the upscaled chunks failed: ${e.message} The ${C.n} chunks are kept: ` +
-      `click ${C.opts.kind === "final" ? "Upscale final video" : "Update preview"} again to retry the join (nothing is upscaled again).`;
+    S.error = `Joining the film's pieces failed: ${e.message} The ${C.n} pieces are kept: ` +
+      `click ${C.opts.kind === "final" ? "Upscale final video" : "Update preview"} again to retry the join (nothing is decoded again).`;
     if (S.chunking === C) S.chunking = null;
     C.joining = false;
     S.joinPending = C;
     render();
-    if (job) endJob(job, "failed", "Joining the upscaled chunks failed: " + e.message);
+    if (job) endJob(job, "failed", "Joining the film's pieces failed: " + e.message);
     return;
   }
   render();
@@ -985,7 +1071,7 @@ function chunkEnd(C, ok, why) {
   if (S.chunking === C) S.chunking = null;
   if (!ok) {
     api(`/longshot/chunks/${encodeURIComponent(C.slug)}/discard`, { method: "POST", body: {} }).catch(() => {});
-    if (C.slug === P().slug && !S.error && C.k > 0) toast("The upscale stopped; its chunks were removed.");
+    if (C.slug === P().slug && !S.error && C.k > 0) toast("The film stopped; its pieces were removed.");
   }
   const job = C.jobId && Q.jobs.find((j) => j.id === C.jobId);
   if (job) endJob(job, ok ? "done" : /stopp/i.test(why || "") ? "stopped" : "failed", ok ? null : why);
@@ -3269,6 +3355,11 @@ function renderShots() {
   const tiles = (s) => s.bypassed ? "" : (slots.has(s.id) ? anchorSlot(s.id, "top") : "") +
     (s.id === lastId && slots.has("end") ? anchorSlot("end", "bottom") : "");
   $("shots-panel").classList.toggle("has-anchors", slots.size > 0);
+  // ⇅ (0.8.5): newest Shot on top; display only, kept per browser
+  const flip = store("h3studio.flipShots") === "1";
+  $("shots-panel").classList.toggle("flipped", flip);
+  $("flip-shots").setAttribute("aria-pressed", String(flip));
+  $("flip-shots").title = flip ? "Shot 1 on top again" : "Flip the list: newest Shot on top, Shot 1 at the bottom";
   $("shots-panel").classList.toggle("anchor-end", slots.has("end"));
   $("shots").innerHTML = P().shots.map((s) => {
     let mark = "";
@@ -3872,7 +3963,17 @@ function renderPlan() {
     if (cutBefore(s) && !/hard cut/.test(status)) status += " · cut before it";
     if (((dry || row) && (dry || row).seam === "mismatch") || cutBefore(s)) color = "#FFB4A8";
     return `<div class="plan-row${s.id === peekId ? " peek" : ""}"><span>Seg ${k + 1}</span><span class="muted">${esc(len)}</span><span style="color:${color}">${esc(status)}</span></div>`;
-  }).join("");
+  }).join("") + runsLine();
+}
+
+/** The Plan's last line: how the whole film decodes (0.8.5). */
+function runsLine() {
+  if (!runsSupported()) return "";
+  const runs = decodeRuns(active().filter((x) => !isRendered(x)).map((x) => x.id));
+  if (runs.length < 2) return "";
+  const r = (ids) => { const a = numOf(ids[0]), b = numOf(ids[ids.length - 1]); return a === b ? `${a}` : `${a}–${b}`; };
+  return `<div class="plan-runs muted small" title="Shots joined Continuous or Bridge decode together; each Cut or Context join starts a new run. One video file at the end.">` +
+    `Whole-film decode in ${runs.length} runs: Shots ${runs.map(r).join(" · ")}</div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -3999,6 +4100,7 @@ document.addEventListener("click", async (e) => {
       break;
     }
     case "ref-step": stepRef(castOf(el), +el.dataset.dir); break;
+    case "flip-shots": store("h3studio.flipShots", store("h3studio.flipShots") === "1" ? "0" : "1"); renderShots(); break;
     case "add-voice": pickVoices(null); break;
     case "voice-replace": { const v = voiceOf(el); if (v) pickVoices(v.id); break; }
     case "bypass-voice": {
@@ -5407,6 +5509,7 @@ async function pollStats() {
 }
 
 function renderStats(d) {
+  S.sys = d;
   const el = $("sysstats");
   const chip = (label, value, frac, title) =>
     `<span class="stat${frac !== null && frac >= 0.9 ? " hot" : ""}" title="${esc(title)}">${label} <b>${value}</b></span>`;

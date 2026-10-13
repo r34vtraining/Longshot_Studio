@@ -717,3 +717,19 @@ textarea.fit { resize: none; overflow: hidden; line-height: 1.5; }
 
 /* Keep awake while the queue has work */
 .awake { font-size: 12px; color: #FFD08A; border: 1px solid #6B4A12; border-radius: 10px; padding: 1px 8px; white-space: nowrap; }
+
+/* ⇅ Shots flipped: newest on top, Shot 1 at the bottom (display only) */
+.flip-btn { margin-left: 8px; padding: 2px 8px; }
+.flip-btn[aria-pressed="true"] { color: var(--amber); border-color: var(--amber); }
+#shots-panel.flipped { display: flex; flex-direction: column; }
+#shots-panel.flipped > .panel-head { order: 0; }
+#shots-panel.flipped > #add-shot { order: 1; margin-bottom: 8px; }
+#shots-panel.flipped > #shots { order: 2; }
+#shots-panel.flipped > .first-row { order: 3; margin-top: 8px; }
+#shots-panel.flipped .first-row .addtile.wide, #shots-panel.flipped .first-row .clip-tile { margin-bottom: 0; }
+#shots-panel.flipped .shot-list { flex-direction: column-reverse; }
+/* each anchor tile sits on its join: the join before a Shot is now below it */
+#shots-panel.flipped .anchor-slot.top { top: auto; bottom: -4px; transform: translateY(50%); }
+#shots-panel.flipped .anchor-slot.bottom { bottom: auto; top: -4px; transform: translateY(-50%); }
+#shots-panel.flipped.has-anchors .shot-list { padding-bottom: 26px; }
+#shots-panel.flipped.has-anchors.anchor-end .shot-list { padding-top: 48px; }

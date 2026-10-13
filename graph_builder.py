@@ -25,7 +25,7 @@ from . import projects as pj
 FPS = 24
 CUT_VERB = "the camera cuts to"
 MAX_REFERENCES = 9          # Long Shot's ref_images autogrow limit
-MAX_SHOTS = 64              # Long Shot's planner limit (1.6.1; 16 before)
+MAX_SHOTS = 256             # Long Shot's planner limit (1.6.10; 64 from 1.6.1, 16 before)
 MAX_SEED = 0xFFFFFFFFFFFFFFFF
 OUTPUT_SUBFOLDER = "longshot"
 VIDEOS_SUBFOLDER = "videos"     # output/longshot/<slug>/videos
@@ -527,8 +527,12 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             raise BuildError("A chunk needs index, start and length.") from None
         if chunk["start"] < 0 or chunk["length"] < 1 or not 0 <= chunk["index"] < 10000:
             raise BuildError("A chunk needs a start of 0 or more and a length of 1 or more.")
+        # a chunk upscales only when the render does; otherwise it's a piece of a film
+        # decoded run by run (Upscale Chunk at scale 1: frames encoded, no RTX)
+        chunk_up = upscale_final or bool((s.get("rtx_vsr") or {}).get("on"))
         need_classes = [c for c in need_classes if c not in ("RTXVideoSuperResolution", "VHS_VideoCombine")] + \
-            ["MiniMaxH3UpscaleChunk", "RTXVideoSuperResolution"] + (["MiniMaxH3SaveAudio"] if chunk["audio"] else [])
+            ["MiniMaxH3UpscaleChunk"] + (["RTXVideoSuperResolution"] if chunk_up else []) + \
+            (["MiniMaxH3SaveAudio"] if chunk["audio"] else [])
     missing = [c for c in dict.fromkeys(need_classes) if not env.has(c)]
     if missing:
         rows = [f"{c} — from {PACKS.get(c, 'ComfyUI core')}" for c in missing]
@@ -850,7 +854,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         # left in ComfyUI's cache, so chunks don't pile up in RAM. The sound goes
         # to a WAV once, with the first chunk.
         if not upscales:
-            raise BuildError("Chunks are for upscaled renders.")
+            vsr_scale, vsr_quality = 1.0, "ULTRA"     # Long Shot 1.6.10: encode only
         name = safe_name(project.get("name"))
         cprefix = f"{videos_subfolder(project)}/_chunks/{name}" + ("_final" if upscale_final else "") + \
             f"_c{chunk['index']:03d}"
@@ -863,8 +867,10 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         if master:
             ids["prores"] = "combine_prores"
         if chunk["audio"]:
+            # one WAV per decode run (0.8.5): the chunk that opens each run saves its sound
             g.add("save_audio", "MiniMaxH3SaveAudio", "Sound for the chunks", audio=out_audio,
-                  filename_prefix=f"{videos_subfolder(project)}/_chunks/{name}_audio")
+                  filename_prefix=f"{videos_subfolder(project)}/_chunks/{name}_audio" +
+                  (f"_c{chunk['index']:03d}" if chunk["index"] else ""))
             ids["audio_file"] = "save_audio"
         ids.update(longshot="longshot", builder="builder")
         return Build(prompt=g.nodes, width=width, height=height,

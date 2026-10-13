@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.8.4"
+STUDIO_VERSION = "0.8.5"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -631,6 +631,33 @@ def _next_number(folder, stem):
     return n + 1
 
 
+def _join_run_audio(output_dir, slug, parts, ffmpeg, run):
+    """[{filename, subfolder, skip}] -> one WAV in the chunks folder: each part
+    from `skip` seconds on (sample-exact), in order."""
+    files, skips = [], []
+    for p in parts:
+        files.append(_chunk_path(output_dir, slug, p))
+        try:
+            skips.append(max(0.0, float(p.get("skip") or 0)))
+        except (TypeError, ValueError):
+            raise ValueError("A run's sound needs a number of seconds to skip.") from None
+    out = os.path.join(chunks_folder(output_dir, slug), "film_audio.wav")
+    cmd = [ffmpeg, "-y", "-v", "error"]
+    for f in files:
+        cmd += ["-i", f]
+    chains = [f"[{i}:a]atrim=start={sk:.6f},asetpts=PTS-STARTPTS,aresample=48000,"
+              f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}]" for i, sk in enumerate(skips)]
+    graph = ";".join(chains) + ";" + "".join(f"[a{i}]" for i in range(len(files))) + \
+        f"concat=n={len(files)}:v=0:a=1[out]"
+    cmd += ["-filter_complex", graph, "-map", "[out]", "-c:a", "pcm_s24le", out]
+    res = run(cmd)
+    if getattr(res, "returncode", 1) != 0 or not os.path.isfile(out):
+        err = getattr(res, "stderr", b"") or b""
+        raise RuntimeError("Joining the sound of the runs failed: " +
+                           (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))[-600:])
+    return out
+
+
 def join_chunks(output_dir, slug, prefix, chunks, audio=None, masters=None, ffmpeg="ffmpeg", run=None):
     """Join chunk videos (in order) and the sound into videos/<Name>_NNNNN-audio.mp4
     (and the ProRes chunks into <Name>_master_NNNNN-audio.mov). The pictures are
@@ -649,7 +676,12 @@ def join_chunks(output_dir, slug, prefix, chunks, audio=None, masters=None, ffmp
     if not chunks:
         raise ValueError("No chunks to join.")
     vids = [_chunk_path(output_dir, slug, c) for c in chunks]
-    wav = _chunk_path(output_dir, slug, audio) if audio else None
+    if isinstance(audio, list):
+        # a film decoded run by run (0.8.5): each run's sound, its first `skip`
+        # seconds dropped (the hidden overlap after a cut), one after another
+        wav = _join_run_audio(output_dir, slug, audio, ffmpeg, run) if audio else None
+    else:
+        wav = _chunk_path(output_dir, slug, audio) if audio else None
     mast = [_chunk_path(output_dir, slug, c) for c in (masters or [])]
     folder = videos_folder(output_dir, slug)
     n = max(_next_number(folder, stem), _next_number(folder, stem + "_master"))
