@@ -7,8 +7,13 @@ thrown away.
 
 <img width="2166" height="1493" alt="H3 Long Shot Studio" src="https://github.com/user-attachments/assets/543bc5fd-05bf-45dd-9557-f36327e8c935" />
 
-## Features
+## What's new in 0.8.5
+1. Whole-film decodes (Update preview, Upscale final, ProRes master) run one continuous run at a time, split only at Cut and Context joins. Still one video file; RAM now limits the longest unbroken run, not the film.
+2. Before decoding, the Studio checks each run fits in RAM and names the Shots if one doesn't.
+3. Up to 256 Shots per project (was 64).
+4. ⇅ in the Shots header flips the list: newest Shot on top (remembered per browser).
 
+## Features
 **Generate**
 - Reference-to-video like the ComfyUI MiniMax H3 workflow: picture references for
   characters, outfits and places, plus audio references for character voices.
