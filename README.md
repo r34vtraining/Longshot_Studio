@@ -32,7 +32,7 @@ thrown away.
 - Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
 
-## What's new in 0.8.3
+## What's new in 0.8.4
 
 Needs H3 Long Shot **1.6.9 or later**.
 
