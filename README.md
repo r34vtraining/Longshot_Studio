@@ -38,11 +38,11 @@ Needs Long Shot **1.6.15 or later**.
 1. **Cast & Scenes folds** to one line with a summary ("4 pictures · 2 voices · 1 RefMod"), remembered per browser.
 2. **Hide the preview**: **▴ Hide preview** (under the timeline, right) folds the video, timeline and controls to one status line: *Rendering Shot 3 · step 12/30* (with a progress bar), *No Shot queued* or *Shot 3 completed*. Click it to show the preview again. Live preview pauses while it's hidden and comes back only if you had it on. Approve / Reroll stay as they are.
 3. **Restore references** on a Shot card: puts back the references its take was made with. Removed ones are added again where they were, bypassed ones turned on; the others stay. The Studio lists what comes back and which Shots render again (labels renumber) before it changes anything. Works for takes made from 0.8.13 on.
+4. **Live preview**: a switch next to Update preview shows the picture forming on the review screen while a Shot renders.
+4b. **Settings → Live preview quality**: one click installs the sharper preview decoder (taeh3, 22 MB); without it the preview is rough colours.
 
 ## Previous updates
 
-1. **Live preview**: a switch next to Update preview shows the picture forming on the review screen while a Shot renders.
-2. **Settings → Live preview quality**: one click installs the sharper preview decoder (taeh3, 22 MB); without it the preview is rough colours.
 3. An older ComfyUI (before 0.35.0) is named on the page, and renders stop with "update ComfyUI" instead of failing.
 4. Install notes for Windows portable, Desktop (port 8000) and git installs.
 5. Timeline mouse controls, editor style: scroll moves along the film, **Alt + scroll** zooms around the cursor, **Ctrl + scroll** makes the timeline taller or shorter to see more of each thumbnail (both remembered per browser).
