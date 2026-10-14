@@ -47,6 +47,38 @@ def test_output_folder_is_the_projects_videos_folder_when_it_has_one(tmp_path):
     assert srv.folder_for("output", out, inp, "../x", "longshot/demo/videos") == os.path.join(out, "longshot")
 
 
+def test_output_folder_can_be_the_projects_clips_folder(tmp_path):
+    out, inp = str(tmp_path / "out"), str(tmp_path / "in")
+    base = os.path.join(out, "longshot")
+    # no project folder yet: output/longshot
+    assert srv.folder_for("output", out, inp, "demo", "longshot/demo/clips") == base
+    os.makedirs(os.path.join(base, "demo"))
+    assert srv.folder_for("output", out, inp, "demo", "longshot/demo/clips") == os.path.join(base, "demo")
+    clips = os.path.join(base, "demo", "clips")
+    os.makedirs(clips)
+    assert srv.folder_for("output", out, inp, "demo", "longshot/demo/clips") == clips
+    # another project's clips folder is never picked by subfolder alone
+    os.makedirs(os.path.join(base, "other", "clips"))
+    assert srv.folder_for("output", out, inp, "demo", "longshot/other/clips") == base
+    assert srv.folder_for("output", out, inp, "../x", "longshot/demo/clips") == base
+
+
+def test_output_button_opens_approved_clips_first_then_falls_back(tmp_path):
+    out, inp = str(tmp_path / "out"), str(tmp_path / "in")
+    base = os.path.join(out, "longshot", "demo")
+    os.makedirs(os.path.join(base, "clips"))
+    body = {"which": "output", "project": "demo", "subfolder": "longshot/demo/Approved_Clips",
+            "select": "Shot 02 – seed 5.mp4",
+            "fallback": {"subfolder": "longshot/demo/clips", "select": "s2__5__aa.mp4"}}
+    # nothing exported yet: the fallback
+    assert srv.open_target(out, inp, body) == (os.path.join(base, "clips"), "s2__5__aa.mp4")
+    os.makedirs(os.path.join(base, "Approved_Clips"))
+    assert srv.open_target(out, inp, body) == (os.path.join(base, "Approved_Clips"), "Shot 02 – seed 5.mp4")
+    # a plain request is unchanged
+    plain = {"which": "output", "project": "demo", "subfolder": "longshot/demo/clips", "select": "x.mp4"}
+    assert srv.open_target(out, inp, plain) == (os.path.join(base, "clips"), "x.mp4")
+
+
 def test_video_entries_collects_every_video_combine_result():
     outputs = {"longshot": {"plan_json": [1]}, "combine": {"gifs": [{"filename": "a-audio.mp4"}]},
                "combine_prores": {"gifs": [{"filename": "b-audio.mov"}]}, "x": None,
@@ -158,3 +190,68 @@ def test_restart_command_relaunches_the_same_way():
         ["/usr/bin/python3", "main.py", "--cpu"]
     assert srv.restart_command("/py", ["/x/comfy/__main__.py", "--port", "8190"], "linux") == \
         ["/py", "-m", "comfy", "--port", "8190"]
+
+
+def test_pick_explorer_window():
+    wins = [(1, "Documents"), (2, "longshot"), (3, "input")]
+    assert srv.pick_window(wins, {1, 2, 3}, "input") == 3            # Explorer reused the window
+    assert srv.pick_window(wins + [(9, "clips")], {1, 2, 3}, "clips") == 9
+    assert srv.pick_window(wins + [(9, "C:\\out\\clips")], {1, 2, 3}, "clips") == 9
+    assert srv.pick_window(wins + [(9, "Quick access")], {1, 2, 3}, "videos") == 9  # the one new window
+    assert srv.pick_window(wins, {1, 2, 3}, "videos") is None        # not there yet: keep waiting
+
+
+def test_bring_to_front_only_on_windows():
+    assert srv.explorer_snapshot("linux") == set()
+    assert srv.bring_to_front("/o/x", set(), "linux") is None
+    assert srv.bring_to_front("/o/x", set(), "darwin") is None
+
+
+def test_open_folder_can_open_approved_clips(tmp_path):
+    out, inp = tmp_path / "out", tmp_path / "in"
+    (out / "longshot" / "p1" / "videos").mkdir(parents=True)
+    assert srv.folder_for("output", str(out), str(inp), "p1", "longshot/p1/Approved_Clips").endswith("longshot")
+    (out / "longshot" / "p1" / "Approved_Clips").mkdir()
+    assert srv.folder_for("output", str(out), str(inp), "p1", "longshot/p1/Approved_Clips") == \
+        str(out / "longshot" / "p1" / "Approved_Clips")
+
+
+def test_keep_awake_holds_while_the_queue_has_work_and_lets_go_after():
+    now = [1000.0]
+    busy = [False]
+    calls = []
+    ka = srv.KeepAwake(platform="test", clock=lambda: now[0], busy=lambda: busy[0])
+    ka._apply = lambda on: calls.append(on)
+    ka._ensure_thread = lambda: None            # drive it by hand
+    ka.beat(True)
+    assert ka.wanted()
+    now[0] += srv.KEEP_AWAKE_TTL - 1
+    assert ka.wanted()
+    now[0] += 2                                  # no heartbeat: the tab closed
+    assert not ka.wanted()
+    busy[0] = True                               # ComfyUI still runs the last job
+    assert ka.wanted()
+    busy[0] = False
+    ka.beat(True)
+    ka.beat(False)                               # queue empty or paused: right away
+    assert not ka.wanted()
+
+
+def test_install_pack_clones_only_known_packs(tmp_path):
+    calls = []
+    class R:
+        returncode = 0
+        stderr = b""
+    def run(cmd):
+        calls.append(cmd)
+        if cmd[1] == "clone":
+            os.makedirs(cmd[-1])
+            open(os.path.join(cmd[-1], "requirements.txt"), "w").close()
+        return R()
+    out = srv.install_pack("refmod", str(tmp_path), run=run, git="git", python="py")
+    assert calls[0][:4] == ["git", "clone", "--depth", "1"] and calls[0][4].endswith("/ComfyUI-MiniMaxH3Mod")
+    assert calls[1][:4] == ["py", "-m", "pip", "install"] and out["cloned"] and out["pip"]
+    again = srv.install_pack("refmod", str(tmp_path), run=run, git="git", python="py")
+    assert not again["cloned"]                                     # already there: no second clone
+    with pytest.raises(ValueError):
+        srv.install_pack("https://evil.example/x", str(tmp_path), run=run, git="git")

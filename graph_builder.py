@@ -8,10 +8,10 @@ The graph is built from scratch every time, mirroring the reference
 H3 Ref2V Long Shot workflow:
 
     UNETLoader -> [Sage] -> SigmaShift -> [Turbo LoRA] -> [LoRA x3] -> BasicScheduler
-    LoadImage -> ImageResizeKJv2 -> Long Shot ref_images.ref_image_k
+    LoadImage -> ImageScaleToMaxDimension (core) -> Long Shot ref_images.ref_image_k
     Subject chain + Shot chain -> Ref Prompt Builder r2v -> long_shot -> Long Shot
-    Long Shot -> VAEDecode + VAEDecodeAudio -> VHS_VideoCombine [+ ProRes master]
-    [VHS_LoadAudioUpload -> Song Track / MelBand vocals / Video Combine audio]
+    Long Shot -> VAEDecode + VAEDecodeAudio -> MiniMax H3 Save Video [+ ProRes master]
+    [LoadAudio -> TrimAudioDuration -> Song Track / Save Video audio]   (0.8.7: no Video Helper Suite)
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ PACKS = {
     "MiniMaxH3Clip": "H3 Long Shot 1.5.0+ (github.com/r34vtraining/H3_Longshot)",
     "MiniMaxH3ClipShot": "H3 Long Shot 1.5.0+ (github.com/r34vtraining/H3_Longshot)",
     "MiniMaxH3ClipPixels": "H3 Long Shot 1.5.0+ (github.com/r34vtraining/H3_Longshot)",
-    "VHS_LoadVideo": "ComfyUI-VideoHelperSuite",
+    "MiniMaxH3LoadVideo": "H3 Long Shot 1.6.11+",
     "MiniMaxH3Subject": "H3 Prompt Compiler (github.com/r34vtraining/H3_Prompt_Compiler)",
     "MiniMaxH3RefPromptBuilder": "H3 Prompt Compiler (github.com/r34vtraining/H3_Prompt_Compiler)",
     "MiniMaxH3LongShot": "H3 Long Shot 1.4.0+ (github.com/r34vtraining/H3_Longshot)",
@@ -64,10 +64,12 @@ PACKS = {
     "MiniMaxH3SigmaShift": "ComfyUI core (update ComfyUI)",
     "MiniMaxH3TurboLoRA": "ComfyUI-MiniMax-H3-Turbo",
     "PathchSageAttentionKJ": "ComfyUI-KJNodes",
-    "ImageResizeKJv2": "ComfyUI-KJNodes",
-    "VHS_VideoCombine": "ComfyUI-VideoHelperSuite",
-    "VHS_LoadAudioUpload": "ComfyUI-VideoHelperSuite",
+    "ImageScaleToMaxDimension": "ComfyUI core (update ComfyUI)",
+    "MiniMaxH3SaveVideo": "H3 Long Shot 1.6.11+",
+    "LoadAudio": "ComfyUI core",
+    "TrimAudioDuration": "ComfyUI core (update ComfyUI)",
     "MelBandRoFormerModelLoader": "ComfyUI-MelBandRoFormer",
+    "MiniMaxH3RefModsLoader": "ComfyUI-MiniMaxH3Mod",
     "MelBandRoFormerSampler": "ComfyUI-MelBandRoFormer",
     "RTXVideoSuperResolution": "ComfyUI-NVIDIA-RTX-VSR-Pro (RTX Video Super Resolution)",
 }
@@ -101,9 +103,13 @@ def _clip_nodes(g, n, shot, prev, vae, avae, width, height):
             ch = height + 8
         else:
             cw = width + 8
-    load = g.add(f"clipload{n}", "VHS_LoadVideo", f"[Shot {n}] clip video", video=path,
-                 force_rate=FPS, custom_width=cw, custom_height=ch, frame_load_cap=frames,
-                 skip_first_frames=skip, select_every_nth=1)
+    # both sides (0.8.7, Long Shot's Load Video): the other one from the clip's aspect
+    if cw and isinstance(sw, (int, float)) and sw > 0:
+        ch = round(cw * sh / sw)
+    elif ch and isinstance(sh, (int, float)) and sh > 0:
+        cw = round(ch * sw / sh)
+    load = g.add(f"clipload{n}", "MiniMaxH3LoadVideo", f"[Shot {n}] clip video", video=path,
+                 force_rate=FPS, width=cw, height=ch, frame_load_cap=frames, skip_first_frames=skip)
     mode = "clip" if clip.get("audio", "clip") == "clip" and clip.get("has_audio", True) else "mute"
     inputs = dict(images=[load[0], 0], vae=vae, audio_vae=avae, width=width, height=height,
                   frames=frames, audio_mode=mode)
@@ -127,6 +133,7 @@ class Env:
     classes: set | None = None
     video_formats: list | None = None
     shot_inputs: set | None = None      # MiniMax H3 Timeline Shot's optional inputs
+    nvenc: bool | None = None           # ffmpeg can encode with h264_nvenc here
 
     def has(self, cls: str) -> bool:
         return self.classes is None or cls in self.classes
@@ -233,6 +240,29 @@ def voice_retention(project: dict) -> list:
     return out
 
 
+MAX_REFMODS = 8             # Load H3 RefMods' slots
+_REFMOD_KIND = {"image": "Picture", "video": "Video", "audio": "Audio"}
+
+
+def active_refmods(project: dict) -> list:
+    """RefMod cards (0.8.6) that are on and name a RefMod."""
+    return [m for m in project.get("refmods") or []
+            if isinstance(m, dict) and not m.get("bypassed") and m.get("name") and float(m.get("strength", 1) or 0) > 0]
+
+
+def refmod_labels(project: dict) -> list:
+    """Each active RefMod's label, numbered after the native references by kind,
+    as Long Shot presents them (pictures after the Cast, audio after the voices)."""
+    counts = {"image": len(active_cast(project)), "video": 0,
+              "audio": len(audio_labels(project)) + (1 if (project.get("audio") or {}).get("voice_ref") else 0)}
+    out = []
+    for m in active_refmods(project):
+        kind = m.get("kind") if m.get("kind") in _REFMOD_KIND else "image"
+        counts[kind] += 1
+        out.append(f"<{_REFMOD_KIND[kind]} {counts[kind]}>")
+    return out
+
+
 def picture_label(k: int) -> str:
     """<Picture N> for the k-th (0-based) non-bypassed cast entry. Never stored."""
     return f"<Picture {k + 1}>"
@@ -328,23 +358,23 @@ def clips_subfolder(project: dict) -> str:
     return f"{OUTPUT_SUBFOLDER}/{project_slug(project)}/{CLIPS_SUBFOLDER}"
 
 
+def _codec(fmt):
+    return "h264_nvenc" if fmt == NVENC else "libx264"
+
+
 def _clip_save(g, n, project, images, audio, fmt, name):
-    """Video Combine for one take's own clip (no metadata: it's a working file)."""
-    quality = dict(bitrate=8, megabit=True) if fmt == NVENC else dict(crf=19)
-    return g.add(f"clipsave{n}", "VHS_VideoCombine", f"Clip {name}", frame_rate=FPS, loop_count=0,
-                 filename_prefix=f"{clips_subfolder(project)}/{name}", format=fmt, pix_fmt="yuv420p",
-                 **quality, save_metadata=False, pingpong=False, save_output=True,
-                 images=images, audio=audio)
+    """One take's own clip, through Long Shot's Save Video (0.8.7, was Video Combine)."""
+    return g.add(f"clipsave{n}", "MiniMaxH3SaveVideo", f"Clip {name}", images=images, audio=audio,
+                 filename_prefix=f"{clips_subfolder(project)}/{name}", codec=_codec(fmt), frame_rate=float(FPS))
 
 
 def _video_format(env, warnings):
-    fmt = NVENC
-    if env.video_formats is not None and NVENC not in env.video_formats:
-        if H264 not in env.video_formats:
-            raise BuildError("Video Helper Suite offers neither nvenc nor h264 mp4 output.")
-        fmt = H264
+    """NVENC when this machine's ffmpeg can use it, else software h264."""
+    no = env.nvenc is False or (env.video_formats is not None and NVENC not in env.video_formats)
+    if no:
         warnings.append("NVENC isn't available; saving with the software h264 encoder.")
-    return fmt
+        return H264
+    return NVENC
 
 
 def _maybe_vsr(g, n, s, images):
@@ -366,7 +396,7 @@ def build_take_clips(project: dict, takes: list, env: Env | None = None) -> Buil
     Nothing samples and nothing is stitched."""
     env = env or Env()
     s = project.get("settings") or {}
-    need = ["MiniMaxH3Take", "VAELoader", "VAEDecode", "VAEDecodeAudio", "VHS_VideoCombine"]
+    need = ["MiniMaxH3Take", "VAELoader", "VAEDecode", "VAEDecodeAudio", "MiniMaxH3SaveVideo"]
     if (s.get("rtx_vsr") or {}).get("on"):
         need.append("RTXVideoSuperResolution")
     missing = [c for c in need if not env.has(c)]
@@ -453,11 +483,11 @@ def required_classes(project: dict, dry_run: bool = False, final: bool = False) 
     a = project.get("audio") or {}
     need = ["UNETLoader", "MiniMaxH3SigmaShift", "CLIPLoader", "VAELoader", "BasicScheduler",
             "KSamplerSelect", "RandomNoise", "MiniMaxH3TimelineShot", "MiniMaxH3RefPromptBuilder",
-            "MiniMaxH3LongShot", "VAEDecode", "VHS_VideoCombine"]
+            "MiniMaxH3LongShot", "VAEDecode", "MiniMaxH3SaveVideo"]
     if not a.get("final_override"):
         need.append("VAEDecodeAudio")
     if active_cast(project):
-        need += ["LoadImage", "ImageResizeKJv2", "MiniMaxH3Subject"]
+        need += ["LoadImage", "ImageScaleToMaxDimension", "MiniMaxH3Subject"]
     if (s.get("turbo") or {}).get("on"):
         need.append("MiniMaxH3TurboLoRA")
     if any(l.get("on") and l.get("name") for l in s.get("loras") or []):
@@ -465,15 +495,17 @@ def required_classes(project: dict, dry_run: bool = False, final: bool = False) 
     if final or (s.get("rtx_vsr") or {}).get("on"):
         need.append("RTXVideoSuperResolution")
     if any(sh.get("kind") == "clip" for sh in active_shots(project)):
-        need += ["VHS_LoadVideo", "MiniMaxH3Clip", "MiniMaxH3ClipShot"]
+        need += ["MiniMaxH3LoadVideo", "MiniMaxH3Clip", "MiniMaxH3ClipShot"]
         if final and s.get("clip_pixels"):
             need.append("MiniMaxH3ClipPixels")
     if a.get("lip_sync") or a.get("voice_ref") or a.get("final_override") or active_voices(project):
-        need.append("VHS_LoadAudioUpload")
+        need += ["LoadAudio", "TrimAudioDuration"]
     if a.get("lip_sync"):
         need.append("MiniMaxH3SongTrack")
     if a.get("voice_ref"):
         need += ["MelBandRoFormerModelLoader", "MelBandRoFormerSampler"]
+    if active_refmods(project):
+        need += ["MiniMaxH3RefModsLoader", "MiniMaxH3Subject"]
     return need
 
 
@@ -530,9 +562,11 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         # a chunk upscales only when the render does; otherwise it's a piece of a film
         # decoded run by run (Upscale Chunk at scale 1: frames encoded, no RTX)
         chunk_up = upscale_final or bool((s.get("rtx_vsr") or {}).get("on"))
-        need_classes = [c for c in need_classes if c not in ("RTXVideoSuperResolution", "VHS_VideoCombine")] + \
+        need_classes = [c for c in need_classes if c not in ("RTXVideoSuperResolution", "MiniMaxH3SaveVideo")] + \
             ["MiniMaxH3UpscaleChunk"] + (["RTXVideoSuperResolution"] if chunk_up else []) + \
             (["MiniMaxH3SaveAudio"] if chunk["audio"] else [])
+    if "MiniMaxH3TurboLoRA" in need_classes and not env.has("MiniMaxH3TurboLoRA"):
+        need_classes = [c for c in need_classes if c != "MiniMaxH3TurboLoRA"] + ["LoraLoaderModelOnly"]
     missing = [c for c in dict.fromkeys(need_classes) if not env.has(c)]
     if missing:
         rows = [f"{c} — from {PACKS.get(c, 'ComfyUI core')}" for c in missing]
@@ -577,12 +611,11 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                   unet_name=s["model"], weight_dtype=s.get("weight_dtype", "default"))
     sage = s.get("sage_attention", "auto")
     if sage and sage not in ("disabled", "off", False):
+        # optional (0.8.6): KJNodes' patch when it's installed; otherwise ComfyUI's
+        # own --use-sage-attention launch flag does it, and nothing is added here
         if env.has("PathchSageAttentionKJ"):
             model = g.add("sage", "PathchSageAttentionKJ", "Patch Sage Attention KJ",
                           model=model, sage_attention=sage, allow_compile=False)
-        else:
-            warnings.append("KJNodes' Patch Sage Attention isn't installed; rendering "
-                            "without SageAttention (slower).")
     model = g.add("shift", "MiniMaxH3SigmaShift", "ModelSamplingMiniMaxH3", model=model,
                   shift_video=_num(s.get("shift_video", 12), "Video shift", 0.01, 100),
                   shift_audio=_num(s.get("shift_audio", 3), "Audio shift", 0.01, 100))
@@ -590,11 +623,19 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
     if turbo.get("on"):
         if not turbo.get("lora"):
             raise BuildError("Turbo is on but no Turbo LoRA file is chosen.")
-        # low_vram: newer Turbo builds require it; older ones ignore extra inputs.
-        model = g.add("turbo", "MiniMaxH3TurboLoRA", "MiniMax-H3 Turbo LoRA", model=model,
-                      lora_name=turbo["lora"],
-                      strength=_num(turbo.get("strength", 1.0), "Turbo strength", -10, 10),
-                      low_vram=bool(turbo.get("low_vram", False)))
+        strength = _num(turbo.get("strength", 1.0), "Turbo strength", -10, 10)
+        if env.has("MiniMaxH3TurboLoRA"):
+            # low_vram: newer Turbo builds require it; older ones ignore extra inputs.
+            model = g.add("turbo", "MiniMaxH3TurboLoRA", "MiniMax-H3 Turbo LoRA", model=model,
+                          lora_name=turbo["lora"], strength=strength,
+                          low_vram=bool(turbo.get("low_vram", False)))
+        else:
+            # 0.8.6: without the Turbo pack, ComfyUI's own LoRA loader (it maps H3's keys).
+            # On the pruned H3 checkpoints the timestep part of the LoRA needs the pack.
+            model = g.add("turbo", "LoraLoaderModelOnly", "Turbo LoRA (stock loader)", model=model,
+                          lora_name=turbo["lora"], strength_model=strength)
+            warnings.append("Turbo LoRA through ComfyUI's stock loader. For full Turbo support "
+                            "(pruned checkpoints), install ComfyUI-MiniMax-H3-Turbo.")
     elif steps < 20:
         warnings.append(f"Turbo is off and steps are at {steps}. Without Turbo, H3 needs "
                         "about 20 steps or more.")
@@ -613,7 +654,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
     vae = g.add("vae_video", "VAELoader", "Video VAE", vae_name=s["video_vae"])
     avae = g.add("vae_audio", "VAELoader", "Audio VAE", vae_name=s["audio_vae"])
     sigmas = g.add("scheduler", "BasicScheduler", "BasicScheduler", model=model,
-                   scheduler=s.get("scheduler", "beta57"), steps=steps, denoise=1.0)
+                   scheduler=s.get("scheduler", "beta"), steps=steps, denoise=1.0)
     sampler = g.add("sampler", "KSamplerSelect", "KSamplerSelect",
                     sampler_name=s.get("sampler", "er_sde"))
     noise = g.add("noise", "RandomNoise", "RandomNoise", noise_seed=base_seed)
@@ -641,11 +682,10 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             raise BuildError(f"{c.get('label') or pic}: {err}") from None
         img = g.add(f"img{k + 1}", "LoadImage", f"{pic} {c.get('label', '')}".strip(),
                     image=image)
+        # core resize (0.8.6, was KJNodes): the longer side to resize_px, proportions kept
         refs[f"ref_images.ref_image_{k}"] = g.add(
-            f"resize{k + 1}", "ImageResizeKJv2", f"Resize {pic}", image=img,
-            width=resize_px, height=resize_px, upscale_method="nearest-exact",
-            keep_proportion="resize", pad_color="0, 0, 0", crop_position="center",
-            divisible_by=2, device="cpu")
+            f"resize{k + 1}", "ImageScaleToMaxDimension", f"Resize {pic}", image=img,
+            upscale_method="lanczos", largest_size=resize_px)
         voice = voice_of.get(str(c.get("voice") or ""))
         inputs = dict(label=c.get("label") or pic, description=c.get("desc", ""),
                       role=c.get("role") or "appearance", reference=pic,
@@ -653,6 +693,28 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         if subjects is not None:
             inputs["subjects"] = subjects
         subjects = g.add(f"subject{k + 1}", "MiniMaxH3Subject", f"{pic} subject", **inputs)
+
+    # --- RefMods (0.8.6): Load H3 RefMods -> Long Shot refmods; each card is a subject
+    mods = active_refmods(project)
+    refmod_input = {}
+    if mods:
+        if len(mods) > MAX_REFMODS:
+            raise BuildError(f"Long Shot takes at most {MAX_REFMODS} RefMods; {len(mods)} are on. Bypass some.")
+        slots = {"show_info": False}
+        for i in range(1, MAX_REFMODS + 1):
+            m = mods[i - 1] if i <= len(mods) else None
+            slots[f"mod_{i}"] = str(m["name"]) if m else "(none)"
+            slots[f"strength_{i}"] = _num(m.get("strength", 1.0), "RefMod strength", 0, 1) if m else 1.0
+            slots[f"copies_{i}"] = 1
+        refmod_input["refmods"] = g.add("refmods", "MiniMaxH3RefModsLoader", "Load H3 RefMods", **slots)
+        for m, label in zip(mods, refmod_labels(project)):
+            role = {"audio": "voice timbre", "video": "motion"}.get(m.get("kind"), "appearance")
+            inputs = dict(label=m.get("label") or label, description=m.get("desc", ""), role=role,
+                          reference=label, role_2="-", reference_2="")
+            if subjects is not None:
+                inputs["subjects"] = subjects
+            subjects = g.add(f"subject_m{m.get('id') or label}"[:60].replace(" ", ""), "MiniMaxH3Subject",
+                             f"{label} subject (RefMod)", **inputs)
 
     # --- prompt ---------------------------------------------------------------
     # Timeline Shots (Long Shot 1.4): each carries its id, its locked take
@@ -759,10 +821,11 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             audio_value = pj.input_path_value(audio["file"], audio.get("subfolder", ""))
         except ValueError as err:
             raise BuildError(f"Audio file: {err}") from None
-        loader = g.add("audio", "VHS_LoadAudioUpload", "Load Audio (trimmed)",
-                       audio=audio_value,
-                       start_time=_num(audio.get("start", 0), "Audio start", 0, 1e7),
-                       duration=_num(audio.get("length", 0), "Audio length", 0, 1e7))
+        raw = g.add("audio_file", "LoadAudio", "Load Audio", audio=audio_value)
+        length = _num(audio.get("length", 0), "Audio length", 0, 1e7)
+        loader = g.add("audio", "TrimAudioDuration", "Trim Audio", audio=raw,
+                       start_index=_num(audio.get("start", 0), "Audio start", 0, 1e7),
+                       duration=length if length > 0 else 1e7)
         if lip:
             long_extra["song"] = g.add("song", "MiniMaxH3SongTrack", "MiniMax H3 Song Track",
                                        audio=loader, audio_vae=avae)
@@ -787,10 +850,12 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             value = pj.input_path_value(v["file"], v.get("subfolder", ""))
         except ValueError as err:
             raise BuildError(f"{v.get('label') or a_label}: {err}") from None
+        vraw = g.add(f"voicefile{k + 1}", "LoadAudio", f"{a_label} {v.get('label', '')}".strip(), audio=value)
+        vlen = _num(v.get("length", 0) or 0, f"{a_label} length", 0, 1e7)
         long_extra[f"ref_audios.ref_audio_{base + k}"] = g.add(
-            f"voice{k + 1}", "VHS_LoadAudioUpload", f"{a_label} {v.get('label', '')}".strip(), audio=value,
-            start_time=_num(v.get("start", 0) or 0, f"{a_label} start", 0, 1e7),
-            duration=_num(v.get("length", 0) or 0, f"{a_label} length", 0, 1e7))
+            f"voice{k + 1}", "TrimAudioDuration", f"Trim {a_label}", audio=vraw,
+            start_index=_num(v.get("start", 0) or 0, f"{a_label} start", 0, 1e7),
+            duration=vlen if vlen > 0 else 1e7)
 
     # --- Long Shot ---------------------------------------------------------------
     long_shot = g.add("longshot", "MiniMaxH3LongShot", "MiniMax H3 Long Shot",
@@ -800,7 +865,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                       reuse_segments=True, ref_image_size=ref_size,
                       save_to_disk=True,          # takes are what locked Shots load
                       cache_name=project_slug(project), audio_vae=avae,
-                      **long_extra, **refs)
+                      **long_extra, **refs, **refmod_input)
 
     # --- output: each new take's own clip (renders while reviewing) -----------------
     ids_in_chain = [str(x.get("id")) for x in chain if x.get("kind") != "clip"]
@@ -876,30 +941,13 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         return Build(prompt=g.nodes, width=width, height=height,
                      chain=[x.get("id") for x in chain], nodes=ids, filename_prefix=prefix,
                      video_format=fmt, warnings=warnings)
-    # nvenc takes a bitrate; the software h264 format takes a quality (crf) instead.
-    quality = dict(bitrate=8, megabit=True) if fmt == NVENC else dict(crf=19)
+    # 0.8.7: Long Shot's Save Video (was Video Combine): H.264 mp4, and the ProRes master
     sound = {} if out_audio is None else {"audio": out_audio}
-    combine = g.add("combine", "VHS_VideoCombine", "Video Combine",
-                    frame_rate=FPS, loop_count=0, filename_prefix=prefix, format=fmt,
-                    pix_fmt="yuv420p", **quality, save_metadata=True,
-                    pingpong=False, save_output=True, images=images, **sound)
-
+    g.add("combine", "MiniMaxH3SaveVideo", "Save Video", images=images, filename_prefix=prefix,
+          codec=_codec(fmt), frame_rate=float(FPS), **sound)
     if upscale_final and s.get("prores_master"):
-        # A second Video Combine on the same frames and sound: a ProRes 422 HQ
-        # master (.mov, PCM audio, workflow metadata) next to the mp4.
-        if env.video_formats is None or PRORES in env.video_formats:
-            pr_fmt, pr_extra = PRORES, dict(save_metadata=True)
-        elif VHS_PRORES in env.video_formats:
-            pr_fmt, pr_extra = VHS_PRORES, dict(profile="hq")
-            warnings.append("The Studio's 10-bit ProRes format isn't loaded (restart ComfyUI); "
-                            "the master is saved with Video Helper Suite's ProRes, from 8-bit "
-                            "frames in a 10-bit file.")
-        else:
-            raise BuildError("Video Helper Suite offers no ProRes format for the master file. "
-                             "Update ComfyUI-VideoHelperSuite, or turn the ProRes master off.")
-        g.add("combine_prores", "VHS_VideoCombine", "ProRes master",
-              frame_rate=FPS, loop_count=0, filename_prefix=prefix + "_master", format=pr_fmt,
-              **pr_extra, pingpong=False, save_output=True, images=images, **sound)
+        g.add("combine_prores", "MiniMaxH3SaveVideo", "ProRes master", images=images,
+              filename_prefix=prefix + "_master", codec="prores_hq", frame_rate=float(FPS), **sound)
         ids["prores"] = "combine_prores"
 
     ids.update(longshot="longshot", combine="combine", builder="builder")

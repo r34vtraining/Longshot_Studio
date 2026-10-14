@@ -383,6 +383,27 @@ def test_export_then_import_brings_everything(tmp_path, store):
     assert slug2 != slug
 
 
+def test_voice_references_travel_with_rename_and_export(tmp_path, store):
+    inp, out, _ = _project_with_files(tmp_path, store)
+    (tmp_path / "input" / "longshot" / "demo" / "luma.wav").write_bytes(b"voice")
+    p = store.load("demo")
+    p["voices"] = [{"id": "v1", "label": "<luma voice>", "file": "luma.wav", "subfolder": "longshot/demo"}]
+    p["cast"][0]["voice"] = "v1"
+    store.save("demo", p, force=True)
+    new, _ = pj.rename_project(store, inp, out, "demo", "Moved")
+    p = store.load(new)
+    assert p["voices"][0]["subfolder"] == "longshot/moved"
+    dest = str(tmp_path / "moved.zip")
+    man = pj.export_project(inp, out, p, dest, takes=False)
+    assert any(f["key"] == "voice:v1" for f in man["files"]) and not man["missing"]
+    other = pj.ProjectStore(str(tmp_path / "other" / "projects"))
+    inp2, out2 = str(tmp_path / "other" / "input"), str(tmp_path / "other" / "output")
+    slug, _ = pj.import_project(other, inp2, out2, dest)
+    q = other.load(slug)
+    assert q["voices"][0]["file"] == "luma.wav" and q["cast"][0]["voice"] == "v1"
+    assert os.path.isfile(os.path.join(inp2, "longshot", slug, "luma.wav"))
+
+
 def test_export_without_takes_imports_shots_to_render_again(tmp_path, store):
     inp, out, _ = _project_with_files(tmp_path, store)
     dest = str(tmp_path / "demo.zip")
@@ -581,4 +602,297 @@ def test_import_of_a_0_5_export_puts_its_preview_in_the_videos_folder(tmp_path, 
 
 
 def test_studio_version():
-    assert pj.STUDIO_VERSION == "0.6.3"
+    assert pj.STUDIO_VERSION == "0.8.7"
+
+
+# ---------------------------------------------------------------------------
+# Round 5: timeline clips, deleting videos, projects whose folders are gone
+# ---------------------------------------------------------------------------
+
+def _real_run(cmd):
+    import subprocess
+    return subprocess.run(cmd, capture_output=True).returncode == 0
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
+def test_cut_clips_makes_a_clip_and_thumbnail_per_take(tmp_path):
+    import subprocess
+    out = tmp_path / "output"
+    vids = out / "longshot" / "demo" / "videos"
+    vids.mkdir(parents=True)
+    src = vids / "Demo_00001-audio.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=4:size=160x96:rate=24",
+                    "-f", "lavfi", "-i", "sine=duration=4", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", str(src)], check=True)
+    video = {"filename": src.name, "subfolder": "longshot/demo/videos", "type": "output"}
+    idx = pj.cut_clips(str(out), "demo", video, [
+        {"key": "s1__1722__0123abcd", "start": 0, "end": 1.5},
+        {"key": "s2__1723__89abcdef", "start": 1.5, "end": 4.0},
+        {"key": "../evil", "start": 0, "end": 1},             # refused
+        {"key": "short", "start": 1, "end": 1.01}], _real_run, "ffmpeg")
+    assert sorted(idx) == ["s1__1722__0123abcd", "s2__1723__89abcdef"]
+    assert idx["s2__1723__89abcdef"]["dur"] == 2.5 and idx["s1__1722__0123abcd"]["thumb"]
+    clips = out / "longshot" / "demo" / "clips"
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+                            str(clips / "s2__1723__89abcdef.mp4")], capture_output=True, text=True).stdout
+    assert abs(float(probe) - 2.5) < 0.1
+    assert pj.clip_index(str(out), "demo") == idx
+    # a video outside output/longshot is refused
+    with pytest.raises(ValueError):
+        pj.cut_clips(str(out), "demo", {"filename": "x.mp4", "subfolder": ""}, [], _real_run)
+    # deleting the project's videos takes the clips with them
+    assert pj.delete_videos(str(out), "demo")
+    assert not vids.exists() and not clips.exists()
+    assert not pj.delete_videos(str(out), "demo")
+
+
+def test_clip_index_ignores_missing_files_and_bad_keys(tmp_path):
+    folder = tmp_path / "longshot" / "demo" / "clips"
+    folder.mkdir(parents=True)
+    (folder / "a.mp4").write_bytes(b"x")
+    (folder / "index.json").write_text(json.dumps({"a": {"dur": 1.2}, "gone": {"dur": 2}, "../x": {"dur": 1}}))
+    assert pj.clip_index(str(tmp_path), "demo") == {"a": {"dur": 1.2, "made": "", "thumb": False}}
+    assert pj.clip_index(str(tmp_path), "no-project") == {}
+
+
+def test_files_missing_flags_projects_whose_folders_were_deleted(tmp_path, store):
+    inp, out, take = _project_with_files(tmp_path, store)
+    p = store.load("demo")
+    assert not pj.files_missing(inp, out, "demo", p)
+    shutil.rmtree(os.path.join(out, "longshot", "demo"))
+    assert pj.files_missing(inp, out, "demo", p)                  # Shots have takes, folder gone
+    listing = store.list(check=lambda slug, pr: {"files_missing": pj.files_missing(inp, out, slug, pr)})
+    assert listing[0]["files_missing"] is True
+    p["shots"][0]["take"] = None
+    assert not pj.files_missing(inp, out, "demo", p)
+    shutil.rmtree(os.path.join(inp, "longshot", "demo"))
+    assert pj.files_missing(inp, out, "demo", p)                  # references lived in its input folder
+    assert not pj.files_missing(inp, out, "demo", {"cast": [], "shots": []})
+
+
+
+def _ffmpeg():
+    import shutil as sh
+    return sh.which("ffmpeg"), sh.which("ffprobe")
+
+
+def test_join_chunks_with_ffmpeg(tmp_path):
+    import subprocess
+    ff, fp = _ffmpeg()
+    if not ff or not fp:
+        pytest.skip("no ffmpeg")
+    slug = "joiny"
+    ch = tmp_path / "longshot" / slug / "videos" / "_chunks"
+    ch.mkdir(parents=True)
+    sub = f"longshot/{slug}/videos/_chunks"
+    chunks = []
+    for i, n in enumerate((48, 48, 20)):
+        f = ch / f"Film_final_c{i:03d}_00001.mp4"
+        subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", f"testsrc=size=64x48:rate=24", "-frames:v", str(n),
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(f)], check=True)
+        chunks.append({"filename": f.name, "subfolder": sub})
+    subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+                    "-t", "4.9", "-c:a", "pcm_f32le", str(ch / "Film_audio.wav")], check=True)
+    (tmp_path / "longshot" / slug / "videos" / "Film_final_00003-audio.mp4").write_bytes(b"x")
+    out = pj.join_chunks(str(tmp_path), slug, f"longshot/{slug}/videos/Film_final", chunks,
+                         {"filename": "Film_audio.wav", "subfolder": sub}, ffmpeg=ff)
+    v = out["video"]
+    assert v["filename"] == "Film_final_00004-audio.mp4" and v["subfolder"] == f"longshot/{slug}/videos"
+    assert out["master"] is None
+    probe = json.loads(subprocess.run([fp, "-v", "error", "-count_frames", "-show_streams", "-of", "json", v["fullpath"]],
+                                      capture_output=True, text=True).stdout)["streams"]
+    vid = next(x for x in probe if x["codec_type"] == "video")
+    aud = next(x for x in probe if x["codec_type"] == "audio")
+    assert int(vid["nb_read_frames"]) == 116 and aud["codec_name"] == "aac"
+    assert not ch.exists()                         # chunks removed after joining
+
+
+def test_join_runs_drops_each_runs_hidden_overlap_from_the_sound(tmp_path):
+    """0.8.5: a film decoded run by run: run 2's first 22 frames (its hidden
+    overlap after the cut) aren't in its picture piece, so its sound skips them too."""
+    import subprocess
+    ff, fp = _ffmpeg()
+    if not ff or not fp:
+        pytest.skip("no ffmpeg")
+    slug = "runs"
+    ch = tmp_path / "longshot" / slug / "videos" / "_chunks"
+    ch.mkdir(parents=True)
+    sub = f"longshot/{slug}/videos/_chunks"
+    chunks, audio = [], []
+    for i, (n, secs, skip) in enumerate(((48, 2.0, 0), (26, 22 / 24 + 26 / 24, 22 / 24))):
+        f = ch / f"Film_c{i:03d}_00001.mp4"
+        subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=24", "-frames:v", str(n),
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(f)], check=True)
+        chunks.append({"filename": f.name, "subfolder": sub})
+        w = ch / f"Film_audio_r{i}_00001.wav"
+        subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", f"sine=frequency={440 + 220 * i}:sample_rate=48000",
+                        "-t", f"{secs:.4f}", "-c:a", "pcm_f32le", str(w)], check=True)
+        audio.append({"filename": w.name, "subfolder": sub, "skip": skip})
+    out = pj.join_chunks(str(tmp_path), slug, f"longshot/{slug}/videos/Film", chunks, audio, ffmpeg=ff)
+    probe = json.loads(subprocess.run([fp, "-v", "error", "-count_frames", "-show_streams", "-of", "json",
+                                       out["video"]["fullpath"]], capture_output=True, text=True).stdout)["streams"]
+    vid = next(x for x in probe if x["codec_type"] == "video")
+    aud = next(x for x in probe if x["codec_type"] == "audio")
+    assert int(vid["nb_read_frames"]) == 74
+    assert abs(float(aud["duration"]) - 74 / 24) < 0.06       # 2 s + 26 frames, the overlap's sound gone
+    assert not ch.exists()
+
+
+def test_join_chunks_refuses_foreign_files(tmp_path):
+    slug = "joiny"
+    (tmp_path / "longshot" / slug / "videos" / "_chunks").mkdir(parents=True)
+    with pytest.raises(ValueError):
+        pj.join_chunks(str(tmp_path), slug, f"longshot/{slug}/videos/Film", [{"filename": "../x.mp4",
+                       "subfolder": f"longshot/{slug}/videos/_chunks"}])
+    with pytest.raises(ValueError):
+        pj.join_chunks(str(tmp_path), slug, "longshot/other/videos/Film", [{"filename": "a.mp4",
+                       "subfolder": f"longshot/{slug}/videos/_chunks"}])
+    with pytest.raises(ValueError):
+        pj.join_chunks(str(tmp_path), slug, f"longshot/{slug}/videos/Film", [{"filename": "a.mp4",
+                       "subfolder": "longshot/other/videos/_chunks"}])
+    assert pj.discard_chunks(str(tmp_path), slug) is True
+    assert pj.discard_chunks(str(tmp_path), slug) is False
+
+
+def test_join_chunks_with_a_real_world_project_name(tmp_path):
+    import subprocess
+    ff, fp = _ffmpeg()
+    if not ff:
+        pytest.skip("no ffmpeg")
+    slug, stem = "noras-film", "Nora's Long Film – take é (v2)"
+    ch = tmp_path / "longshot" / slug / "videos" / "_chunks"
+    ch.mkdir(parents=True)
+    sub = f"longshot/{slug}/videos/_chunks"
+    chunks = []
+    for i in range(2):
+        f = ch / f"{stem}_final_c{i:03d}_00001.mp4"
+        subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=24", "-frames:v", "24",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(f)], check=True)
+        chunks.append({"filename": f.name, "subfolder": sub})
+    subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", "sine=sample_rate=48000", "-t", "2",
+                    "-c:a", "pcm_f32le", str(ch / f"{stem}_audio.wav")], check=True)
+    out = pj.join_chunks(str(tmp_path), slug, f"longshot/{slug}/videos/{stem}_final", chunks,
+                         {"filename": f"{stem}_audio.wav", "subfolder": sub}, ffmpeg=ff)
+    assert out["video"]["filename"] == f"{stem}_final_00001-audio.mp4"
+    assert os.path.isfile(out["video"]["fullpath"]) and not ch.exists()
+    for bad in ("a/b", "..x", ".hidden", "a:b", "a*b", " lead", "trail "):
+        with pytest.raises(ValueError):
+            pj.join_chunks(str(tmp_path), slug, f"longshot/{slug}/videos/{bad}", chunks)
+
+
+def test_a_failed_join_keeps_the_chunks(tmp_path):
+    slug = "keep"
+    ch = tmp_path / "longshot" / slug / "videos" / "_chunks"
+    ch.mkdir(parents=True)
+    (ch / "F_c000_00001.mp4").write_bytes(b"not a video")
+    fail = lambda cmd: type("R", (), {"returncode": 1, "stderr": b"boom"})()
+    with pytest.raises(RuntimeError, match="boom"):
+        pj.join_chunks(str(tmp_path), slug, f"longshot/{slug}/videos/F", [{"filename": "F_c000_00001.mp4",
+                       "subfolder": f"longshot/{slug}/videos/_chunks"}], run=fail)
+    assert (ch / "F_c000_00001.mp4").is_file()
+
+
+def test_copy_approved_clips_whole(tmp_path):
+    slug = "expo"
+    clips = tmp_path / "longshot" / slug / "clips"
+    clips.mkdir(parents=True)
+    (clips / "s1__1722__aa.mp4").write_bytes(b"one")
+    (clips / "s3__99__bb.mp4").write_bytes(b"three")
+    folder = tmp_path / "longshot" / slug / "Approved_Clips"
+    folder.mkdir()
+    (folder / "Shot 09 – old.mp4").write_bytes(b"stale")
+    (folder / "notes.txt").write_text("mine")
+    names = pj.copy_approved(str(tmp_path), slug, [{"key": "s1__1722__aa", "name": "Shot 01 – seed 1722"},
+                                                   {"key": "s3__99__bb", "name": "Shot 02 – seed 99"}])
+    assert names == ["Shot 01 – seed 1722.mp4", "Shot 02 – seed 99.mp4"]
+    assert sorted(f.name for f in folder.iterdir()) == ["Shot 01 – seed 1722.mp4", "Shot 02 – seed 99.mp4", "notes.txt"]
+    assert (folder / "Shot 02 – seed 99.mp4").read_bytes() == b"three"       # the clip, whole
+    with pytest.raises(ValueError, match="isn't there"):
+        pj.copy_approved(str(tmp_path), slug, [{"key": "s9__1__cc", "name": "Shot 03"}])
+    for bad in ({"key": "../x", "name": "a"}, {"key": "s1__1722__aa", "name": "a/b"}, {"key": "s1__1722__aa", "name": "..x"}):
+        with pytest.raises(ValueError):
+            pj.copy_approved(str(tmp_path), slug, [bad])
+
+
+def test_mux_approved_adds_the_sound(tmp_path):
+    import subprocess
+    ff, fp = _ffmpeg()
+    if not ff or not fp:
+        pytest.skip("no ffmpeg")
+    slug = "expo"
+    work = tmp_path / "longshot" / slug / "Approved_Clips" / "_work"
+    work.mkdir(parents=True)
+    subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=24", "-frames:v", "36",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(work / "c001_00001.mp4")], check=True)
+    subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", "sine=sample_rate=48000", "-t", "1.45",
+                    "-c:a", "pcm_f32le", str(work / "c001_audio.wav")], check=True)    # a bit short, as the VAE's is
+    sub = f"longshot/{slug}/Approved_Clips/_work"
+    names = pj.mux_approved(str(tmp_path), slug, [{"name": "Shot 01 – seed 5",
+                                                    "video": {"filename": "c001_00001.mp4", "subfolder": sub},
+                                                    "audio": {"filename": "c001_audio.wav", "subfolder": sub}}], ffmpeg=ff)
+    assert names == ["Shot 01 – seed 5.mp4"]
+    out = tmp_path / "longshot" / slug / "Approved_Clips" / "Shot 01 – seed 5.mp4"
+    streams = json.loads(subprocess.run([fp, "-v", "error", "-count_frames", "-show_streams", "-of", "json", str(out)],
+                                        capture_output=True, text=True).stdout)["streams"]
+    assert {x["codec_type"] for x in streams} == {"video", "audio"}
+    assert int(next(x for x in streams if x["codec_type"] == "video")["nb_read_frames"]) == 36
+    assert not work.exists()
+    with pytest.raises(ValueError):
+        pj.mux_approved(str(tmp_path), slug, [{"name": "x", "video": {"filename": "a.mp4", "subfolder": "longshot/expo/videos"}}])
+
+
+def test_upscaled_export_keeps_clips_already_upscaled(tmp_path):
+    """Only new approved takes are upscaled again: the rest stay (renamed when
+    their number moved), stale files leave the folder, the clips folder stays."""
+    slug = "inc"
+    folder = tmp_path / "longshot" / slug / "Approved_Clips"
+    folder.mkdir(parents=True)
+    clips = tmp_path / "longshot" / slug / "clips"
+    clips.mkdir()
+    (clips / "s1__5__aa.mp4").write_bytes(b"clip")
+    for n in ("Shot 01 – seed 5", "Shot 02 – seed 6", "Shot 03 – seed 7"):
+        (folder / f"{n}.mp4").write_bytes(n.encode())
+    pj._write_manifest(str(folder), {
+        "Shot 01 – seed 5.mp4": {"key": "s1__5__aa", "sig": "2x ULTRA", "prores": False},
+        "Shot 02 – seed 6.mp4": {"key": "s2__6__bb", "sig": "2x ULTRA", "prores": False},
+        "Shot 03 – seed 7.mp4": {"key": "s3__7__cc", "sig": "2x ULTRA", "prores": False}})
+    # a Shot was inserted after Shot 1 and Shot 2 got a new take
+    r = pj.keep_upscaled(str(tmp_path), slug, [
+        {"key": "s1__5__aa", "name": "Shot 01 – seed 5"},
+        {"key": "s2__9__dd", "name": "Shot 03 – seed 9"},
+        {"key": "s3__7__cc", "name": "Shot 04 – seed 7"}], "2x ULTRA")
+    assert r["todo"] == ["s2__9__dd"]
+    assert sorted(r["kept"]) == ["Shot 01 – seed 5.mp4", "Shot 04 – seed 7.mp4"]
+    assert sorted(f.name for f in folder.iterdir() if f.suffix == ".mp4") == ["Shot 01 – seed 5.mp4", "Shot 04 – seed 7.mp4"]
+    assert (folder / "Shot 04 – seed 7.mp4").read_bytes() == "Shot 03 – seed 7".encode()
+    assert (clips / "s1__5__aa.mp4").exists()
+    man = pj._read_manifest(str(folder))
+    assert man["Shot 04 – seed 7.mp4"]["key"] == "s3__7__cc"
+    # other upscale settings: everything again; ProRes wanted but missing: again
+    assert pj.keep_upscaled(str(tmp_path), slug, [{"key": "s1__5__aa", "name": "Shot 01 – seed 5"}],
+                            "4x ULTRA")["todo"] == ["s1__5__aa"]
+    assert not any(f.suffix == ".mp4" for f in folder.iterdir())
+
+
+def test_context_frame_is_the_last_frame_of_the_take_before(tmp_path):
+    import subprocess
+    ff, _fp = _ffmpeg()
+    if not ff:
+        pytest.skip("no ffmpeg")
+    slug = "ctx"
+    clips = tmp_path / "out" / "longshot" / slug / "clips"
+    clips.mkdir(parents=True)
+    # 24 frames: red, then the last frame blue
+    subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", "color=red:size=32x32:rate=24:d=0.958",
+                    "-f", "lavfi", "-i", "color=blue:size=32x32:rate=24:d=0.042",
+                    "-filter_complex", "[0][1]concat=n=2:v=1", "-c:v", "libx264", "-pix_fmt", "yuv444p",
+                    "-qp", "0", str(clips / "s1__5__aa.mp4")], check=True)
+    info = pj.context_frame(str(tmp_path / "out"), str(tmp_path / "in"), slug,
+                            {"kind": "shot", "status": "review", "take": "s1__5__aa.safetensors"}, ffmpeg=ff)
+    assert info == {"file": "s1__5__aa_last.png", "subfolder": "longshot/ctx/context"}
+    png = tmp_path / "in" / "longshot" / slug / "context" / "s1__5__aa_last.png"
+    raw = subprocess.run([ff, "-v", "error", "-i", str(png), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                         capture_output=True).stdout
+    assert raw[2] > 200 and raw[0] < 60, "blue: the very last frame"
+    assert pj.context_frame(str(tmp_path / "out"), str(tmp_path / "in"), slug,
+                            {"kind": "shot", "take": "s2__6__bb.safetensors"}, ffmpeg=ff) is None, "no clip yet"

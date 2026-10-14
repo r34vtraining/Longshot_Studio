@@ -16,7 +16,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ESC[c]);
 const FPS = 24;
 const SEED_MAX = 4294967295;           // rerolls draw from 0 … 2^32 − 1
 const CORE_NODES = ["MiniMaxH3Shot", "MiniMaxH3Subject", "MiniMaxH3RefPromptBuilder",
-  "MiniMaxH3LongShot", "MiniMaxH3SigmaShift", "ImageResizeKJv2", "VHS_VideoCombine"];
+  "MiniMaxH3LongShot", "MiniMaxH3SigmaShift", "ImageScaleToMaxDimension", "MiniMaxH3SaveVideo"];
 
 function fmt(t) {
   t = Math.max(0, t || 0);
@@ -91,7 +91,7 @@ const DEFAULT_SETTINGS = {
   turbo: { on: true, lora: "", strength: 1.0 },
   loras: [0, 1, 2].map(() => ({ on: false, name: null, strength: 1.0 })),
   steps: 8, megapixels: 0.6, aspect: "16:9", ref_image_size: "match", ref_resize_px: 1500,
-  sampler: "er_sde", scheduler: "beta57", overlap: 22, seed: 1722, seed_mode: "increment",
+  sampler: "er_sde", scheduler: "beta", overlap: 22, seed: 1722, seed_mode: "increment",
   shift_video: 12, shift_audio: 3, sage_attention: "auto", save_segments: true,
   rtx_vsr: { on: false, scale: 2, quality: "ULTRA", chunk_s: 10 },   // chunk_s: upscale a chunk at a time
   save_png: false, save_noaudio: false,      // Video Combine's side files: deleted after each render
@@ -108,6 +108,11 @@ function normalize(p) {
     original_name: c.original_name || c.image || "", bypassed: !!c.bypassed,
     voice: c.voice || null }));          // voice reference id: "gets its voice timbre from"
   // voice references: audio cards in Cast & Scenes, <Audio N> after the song's vocals
+  // 0.8.6: the song's "Voice reference" route (MelBandRoFormer) is gone: voice cards replace it
+  if (p.audio && p.audio.voice_ref) { p.audio.voice_ref = false; p.voice_ref_dropped = true; }
+  p.refmods = (p.refmods || []).map((m) => ({ id: m.id || uid("m"), name: m.name || "", kind: ["image", "video", "audio"].includes(m.kind) ? m.kind : "image",
+    label: m.label || "", desc: m.desc || "", strength: Math.max(0, Math.min(1, m.strength === undefined ? 1 : Number(m.strength) || 0)),
+    bypassed: !!m.bypassed }));
   p.voices = (p.voices || []).map((v) => ({ id: v.id || uid("v"), label: v.label || "", file: v.file || "",
     subfolder: v.subfolder || "", type: "input", original_name: v.original_name || v.file || "",
     sha256: v.sha256 || null, size_bytes: v.size_bytes ?? null, start: Math.max(0, Number(v.start) || 0),
@@ -434,6 +439,18 @@ async function loadProject(slug) {
   S.bad = {};
   S.project = normalize(p);
   if (autoPickModels(S.project)) scheduleSave();
+  // 0.8.6: beta57 needs RES4LYF; without it, ComfyUI's own beta
+  const sch = S.project.settings.scheduler;
+  if (S.opts && Array.isArray(S.opts.schedulers) && !S.opts.schedulers.includes(sch) && S.opts.schedulers.includes("beta")) {
+    S.project.settings.scheduler = "beta";
+    scheduleSave();
+  }
+  if (S.project.voice_ref_dropped) {
+    delete S.project.voice_ref_dropped;
+    scheduleSave();
+    setTimeout(() => toast("This project used the song as a voice reference. That route is gone: add the vocal as an audio " +
+      "reference card in Cast & Scenes and link it in the character's editor."), 800);
+  }
   const relinked = relinkModels(S.project);
   if (relinked) {
     scheduleSave();
@@ -1985,8 +2002,9 @@ function onRendered(targetId, standalone = false, opts = {}) {
     }
     const target = targetId && P().shots.find((s) => s.id === targetId);
     if (target) { target.status = "review"; target.was_rendered = false; target.was_approved = false; }
-    // a Shot edited while this rendered no longer matches its new take
-    for (const s of P().shots) if (s.kind !== "clip" && s.status !== "queued" && s.rendered && !matchesRendered(s)) {
+    // a Shot edited while this rendered no longer matches its new take. Only its
+    // prompt changed (0.8.6): the take stays for review, flagged, with Re-render.
+    for (const s of P().shots) if (s.kind !== "clip" && s.status !== "queued" && s.rendered && !matchesRendered(s) && !promptOnlyChanged(s)) {
       s.edit_from = { status: s.status, was_approved: s.was_approved, was_rendered: s.was_rendered, take: s.take, gen: S.gen };
       s.status = "queued";
     }
@@ -2956,11 +2974,47 @@ function renderCast() {
         <button class="icon x" data-action="remove-cast" title="Remove" aria-label="Remove ${esc(c.label)}">${CROSS}</button>
       </div></div>`;
   });
-  for (const v of P().voices || []) cards.push(voiceCard(v));
+  // rows (0.8.6): pictures, then audio references, then RefMods, each starting its own row
   cards.push(`<button class="addtile" data-action="add-cast" data-drop="add">${PLUS} <span>Add reference · ${esc(`<Picture ${n + 1}>`)}<br><span class="muted small">or drop images here</span></span></button>`);
+  cards.push('<div class="cast-break"></div>');
+  for (const v of P().voices || []) cards.push(voiceCard(v));
   const nextA = (P().audio.voice_ref ? 1 : 0) + liveVoices().length + 1;
   cards.push(`<button class="addtile voice-add" data-action="add-voice">${PLUS} <span>Add audio reference · ${esc(`<Audio ${nextA}>`)}<br><span class="muted small">a voice timbre · or drop audio here</span></span></button>`);
+  cards.push('<div class="cast-break"></div>');
+  for (const m of P().refmods || []) cards.push(refmodCard(m));
+  cards.push(hasPack("refmod")
+    ? `<button class="addtile refmod-add" data-action="add-refmod">${PLUS} <span>Add RefMod<br><span class="muted small">a saved character, style or motion</span></span></button>`
+    : `<div class="addtile refmod-add install"><span><b>RefMods</b> · reusable characters, styles and motions saved as RefMods<br>${installBtn("refmod", "(Load H3 RefMods)")}</span></div>`);
   $("cast").innerHTML = cards.join("");
+}
+
+/** Optional packs (0.8.6): present when ComfyUI has their node. */
+const PACK_NODE = { turbo: "MiniMaxH3TurboLoRA", rtx: "RTXVideoSuperResolution", refmod: "MiniMaxH3RefModsLoader" };
+const PACK_WHAT = { turbo: "full Turbo support", rtx: "RTX upscaling", refmod: "RefMod support" };
+const hasPack = (k) => !S.opts || !S.opts.nodes || S.opts.nodes[PACK_NODE[k]] !== false;
+function packInfo(k) { return ((S.opts || {}).optional_packs || {})[k] || { folder: "", url: "" }; }
+function installBtn(k, note) {
+  return `<button class="install-btn" data-action="install-pack" data-pack="${k}">Click to install ${PACK_WHAT[k]}</button>` +
+    `<span class="muted small"> · installs ${esc(packInfo(k).folder)}${note ? " " + esc(note) : ""}</span>`;
+}
+async function installPack(k) {
+  const info = packInfo(k);
+  if (!S.local) {
+    showModal(`Install ${PACK_WHAT[k]}`, "", `<p>On the machine running ComfyUI, in <code>ComfyUI/custom_nodes</code>:</p>
+      <pre class="copy-line">git clone ${esc(info.url)}</pre><p class="muted small">Then restart ComfyUI and refresh this page.</p>`);
+    return;
+  }
+  const ok = await confirmBox({ title: `Install ${PACK_WHAT[k]}?`,
+    body: `Clones ${info.folder} into ComfyUI's custom_nodes folder (and installs its Python requirements), then ComfyUI needs a restart.`,
+    yes: "Install", no: "Cancel" });
+  if (!ok) return;
+  toast(`Installing ${info.folder}…`);
+  try { await api("/longshot/install-pack", { method: "POST", body: { pack: k } }); }
+  catch (e) {
+    showModal(`Install ${PACK_WHAT[k]}`, "", `<p>${esc(e.message)}</p><pre class="copy-line">git clone ${esc(info.url)}</pre>`);
+    return;
+  }
+  if (await confirmBox({ title: `${info.folder} is installed`, body: "Restart ComfyUI now to load it?", yes: "Restart ComfyUI", no: "Later" })) restartComfy();
 }
 
 /** On a picture card: the voice reference it gets its voice timbre from. */
@@ -2999,6 +3053,48 @@ function voiceCard(v) {
         <button class="icon x" data-action="remove-voice" title="Remove" aria-label="Remove ${esc(v.label || "this voice reference")}">${CROSS}</button>
       </div></div>`;
 }
+/** RefMods (0.8.6): <Picture|Video|Audio N>, numbered after the references of that kind. */
+const REFMOD_ICON = { image: "🖼", video: "🎞", audio: "🔊" };
+const liveRefmods = () => (P().refmods || []).filter((m) => !m.bypassed && m.name && m.strength > 0);
+function refmodLabelOf(m) {
+  const i = liveRefmods().indexOf(m);
+  if (i < 0) return null;
+  const counts = { image: liveCast().length, video: 0, audio: liveVoices().length };
+  let label = null;
+  liveRefmods().slice(0, i + 1).forEach((x) => { counts[x.kind] += 1; label = `<${{ image: "Picture", video: "Video", audio: "Audio" }[x.kind]} ${counts[x.kind]}>`; });
+  return label;
+}
+function refmodCard(m) {
+  const a = refmodLabelOf(m);
+  return `<div class="card refmod-card${m.bypassed ? " off" : ""}" data-refmod="${esc(m.id)}">
+      <div class="thumb-col"><div class="thumb refmod-thumb" title="RefMod (${esc(m.kind)}): no preview">${REFMOD_ICON[m.kind] || "🖼"}</div></div>
+      <div class="card-body">
+        <div class="card-top"><span class="pic">${esc(m.bypassed ? "bypassed" : a || "—")}</span>
+          <input class="inline refmod-label" data-refmod-field="label" value="${esc(m.label)}" placeholder="<name>" spellcheck="false" aria-label="RefMod label"></div>
+        <input class="inline refmod-desc" data-refmod-field="desc" value="${esc(m.desc)}" placeholder="Add a description…" aria-label="RefMod description">
+        <div class="muted small refmod-name">RefMod · ${esc(m.name)}</div>
+        <label class="lbl-row small">Strength <input type="number" min="0" max="1" step="0.05" data-refmod-field="strength" value="${esc(m.strength)}" style="width:64px"></label>
+      </div>
+      <div class="card-tools">
+        <button class="icon${m.bypassed ? " on" : ""}" data-action="bypass-refmod" aria-pressed="${m.bypassed}" title="${m.bypassed ? "Turn back on" : "Bypass"}">${POWER}</button>
+        <button class="icon x" data-action="remove-refmod" title="Remove" aria-label="Remove ${esc(m.label || m.name)}">${CROSS}</button>
+      </div></div>`;
+}
+function refmodOf(el) { const c = el.closest("[data-refmod]"); return c && (P().refmods || []).find((x) => x.id === c.dataset.refmod); }
+/** Pick a saved RefMod (Load H3 RefMods' list, with each one's kind). */
+async function pickRefmod() {
+  if (setupGuard()) return;
+  let lib = [];
+  try { lib = await api("/refmods/library"); } catch (e) { toast("Couldn't list the RefMods: " + e.message); return; }
+  const rows = (lib || []).map((x) => x.kind === "bundle"
+    ? `<div class="take-row"><span class="mono">${esc(x.name)}</span><span class="muted small">bundle · not supported yet</span></div>`
+    : `<div class="take-row"><span>${REFMOD_ICON[x.kind] || "🖼"} <span class="mono">${esc(x.name)}</span></span>
+        <span class="muted small">${esc(x.kind)}${x.description ? " · " + esc(x.description) : ""}</span>
+        <button class="ghost sm" data-action="use-refmod" data-name="${esc(x.name)}" data-kind="${esc(x.kind)}">Add</button></div>`).join("")
+    || '<div class="muted">No RefMods saved yet. Make one with the Extract H3 RefMod node (it saves into ComfyUI/models/mods).</div>';
+  showModal("Add a RefMod", "", `<div class="take-list">${rows}</div>`);
+}
+
 function voiceOf(el) { const c = el.closest("[data-voice]"); return c && voiceById(c.dataset.voice); }
 
 /** Dropping (or choosing) audio on Cast & Scenes: one voice reference per file,
@@ -3185,6 +3281,14 @@ function shotRowHTML(s) {
     ? (s.standalone
       ? '<span class="flag cut" title="Rendered on its own, so it doesn\'t follow on from the Shot before it. Render the Shot before it with its chip on Continuous or Bridge to join them.">↯ hard cut · standalone</span>'
       : '<span class="flag cut" title="This Shot doesn\'t follow on from the take of the Shot before it, so the join is a hard cut.">↯ hard cut</span>') : "";
+  // the prompt can be edited while the Shot renders (0.8.6): say what the take has
+  const sentText = inRender(s) && S.busy && S.busy.sent && S.busy.sent[s.id] ? S.busy.sent[s.id].text : null;
+  const promptFlag = sentText !== null && sentText !== s.text
+    ? `<span class="flag edited" title="Rendering with:\n${esc(sentText)}">✎ Prompt changed · not in this render</span>`
+    : s.status !== "queued" && !s.bypassed && promptOnlyChanged(s)
+      ? `<span class="flag edited" title="This take was rendered with:\n${esc(s.rendered.text)}\n\nChange the text back to that, or Re-render.">✎ Prompt changed since this take</span>` : "";
+  const promptBtn = sentText === null && s.status !== "queued" && !s.bypassed && promptOnlyChanged(s)
+    ? `<button class="ghost sm bridge" data-action="context-redo" title="Render ${title} again in place with the new prompt (the Shots around it keep their takes)">Re-render</button>` : "";
   const standaloneTag = !cut && s.standalone && s.status !== "queued" && !s.bypassed
     ? '<span class="flag standalone" title="Rendered on its own, from the references. The Shot before it bridges into it.">standalone</span>' : "";
   // rendering now or waiting in the queue: ▶ (yellow) queues another take after it
@@ -3216,7 +3320,7 @@ function shotRowHTML(s) {
           <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span>
         </button>
         <div class="shot-tools">
-          ${joinChip}${ctxBtn}
+          ${promptFlag}${promptBtn}${joinChip}${ctxBtn}
           ${canReroll ? `<button class="icon lg reroll" data-action="reroll-shot" title="Reroll ${title} (new seed)" aria-label="Reroll ${title}">⟳</button>` : ""}
           <button class="icon lg${s.bypassed ? " on" : ""}" data-action="bypass-shot" aria-pressed="${s.bypassed}" title="${s.bypassed ? "Turn shot back on" : "Bypass shot"}">${POWER}</button>
           <button class="icon lg x" data-action="remove-shot" title="Remove" aria-label="Remove ${title}">${CROSS}</button>
@@ -3376,7 +3480,7 @@ function renderShots() {
     const takes = !s.bypassed && s.status !== "queued" ? takeNav(s) : "";
     const ro = inRender(s) ? ' readonly title="Part of the render in progress; edit it when it finishes"' : "";
     const body = open ? `<div class="shot-body">
-        <textarea class="field fit" data-shot-field="text" rows="3" aria-label="${title} text"${ro}>${esc(s.text)}</textarea>
+        <textarea class="field fit" data-shot-field="text" rows="3" aria-label="${title} text">${esc(s.text)}</textarea>
         <div class="shot-opts">
           <label class="lbl-row">Seconds <input type="number" step="0.1" min="0.1" data-shot-field="seconds" value="${esc(s.seconds)}" style="width:72px"${ro}></label>
           <label class="lbl-row">Seed <input class="mono" data-shot-field="shot_seed" value="${s.shot_seed < 0 ? "" : esc(s.shot_seed)}" placeholder="auto${isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used) ? ` · ${s.seed_used}` : ""}" style="width:120px"${ro}></label>
@@ -3623,7 +3727,6 @@ function throughTarget() {
 }
 
 const ROUTES = [["lip_sync", "Lip sync to song", "song → Song Track → Long Shot", "per segment"],
-  ["voice_ref", "Voice reference", "song → MelBand vocals → ref_audio", "timbre"],
   ["final_override", "Song in final video", "replaces generated audio in Video Combine", "output"]];
 
 function switchHTML(on, attrs, sm) {
@@ -3816,7 +3919,7 @@ function renderSettings() {
       <button class="fold vsr-fold" data-action="fold" data-fold="vsr" aria-expanded="${!vsrFold}"
         title="${vsrFold ? "Show the upscale settings" : "Show only the switch"}"><span class="fold-ch" aria-hidden="true">▾</span>RTX Super Resolution${vsrFold && vsr.on && vsrOk ? ` <span class="muted small">· ${vsr.scale}× ${esc(vsr.quality)}</span>` : ""}</button>
       <div class="vsr-text"><div>Upscale previews</div>
-        <div class="muted small">${!vsrOk ? "Install ComfyUI-NVIDIA-RTX-VSR-Pro (RTX GPU) to use it."
+        <div class="muted small">${!vsrOk ? installBtn("rtx", "(needs an RTX GPU)")
           : vsr.on ? "Every render is upscaled (slower as the chain grows). Never re-renders Shots."
             : "Off: previews stay fast. Upscale final video (when every Shot is approved) always upscales with this scale and quality."}</div>
         ${vsrOk && size ? `<div class="muted small">${vsrRamNote(size, vsr.scale)}</div>` : ""}</div>
@@ -3839,10 +3942,6 @@ function renderSettings() {
         <button data-action="ref-size" data-v="max" aria-pressed="${s.ref_image_size === "max"}">Max · best identity</button>
       </div></div>
     <div class="out-files">
-      <label class="check-row"><input type="checkbox" data-outfile="save_png"${s.save_png ? " checked" : ""}>
-        <span>Save PNG <span class="muted small">· the first frame (with the workflow) next to each video</span></span></label>
-      <label class="check-row"><input type="checkbox" data-outfile="save_noaudio"${s.save_noaudio ? " checked" : ""}>
-        <span>Save audio-less MP4 <span class="muted small">· a copy without sound, besides the video with sound</span></span></label>
       <div class="muted small">Videos are saved in output/longshot/${esc(P().slug)}/videos.</div>
     </div>
     <div class="seg-store">
@@ -3886,6 +3985,7 @@ function renderAdvanced() {
         <label class="strength" style="flex:1 1 180px">Strength
           <input type="range" min="0" max="2" step="0.05" data-turbo="strength" value="${esc(t.strength)}"${t.on ? "" : " disabled"}><output>${Number(t.strength).toFixed(2)}</output></label>
       </div>
+      ${hasPack("turbo") ? "" : `<div class="pack-note muted small">Using ComfyUI's stock LoRA loader. ${installBtn("turbo")}</div>`}
     </div>
     <div class="loras">${loras}</div>
     <div class="adv-sub">Sampling</div>
@@ -4102,6 +4202,37 @@ document.addEventListener("click", async (e) => {
     case "ref-step": stepRef(castOf(el), +el.dataset.dir); break;
     case "flip-shots": store("h3studio.flipShots", store("h3studio.flipShots") === "1" ? "0" : "1"); renderShots(); break;
     case "add-voice": pickVoices(null); break;
+    case "install-pack": installPack(el.dataset.pack); break;
+    case "add-refmod": pickRefmod(); break;
+    case "use-refmod": {
+      $("modal").hidden = true;
+      if (setupGuard()) return;
+      p.refmods.push({ id: uid("m"), name: el.dataset.name, kind: ["image", "video", "audio"].includes(el.dataset.kind) ? el.dataset.kind : "image",
+        label: "<" + el.dataset.name.replace(/[^A-Za-z0-9 _-]/g, "").slice(0, 20) + ">", desc: "", strength: 1, bypassed: false });
+      applyRefChange((await askRefChange()) || "keep", "RefMods");
+      commit();
+      break;
+    }
+    case "bypass-refmod": {
+      if (setupGuard()) return;
+      const m = refmodOf(el);
+      if (!m) return;
+      const mode = await askRefChange();
+      m.bypassed = !m.bypassed;
+      applyRefChange(mode, "RefMods");
+      commit();
+      break;
+    }
+    case "remove-refmod": {
+      if (setupGuard()) return;
+      const m = refmodOf(el);
+      if (!m || !confirm(`Remove ${m.label || m.name}?`)) return;
+      const mode = await askRefChange();
+      p.refmods = p.refmods.filter((x) => x.id !== m.id);
+      if (!m.bypassed) applyRefChange(mode, "RefMods");
+      commit();
+      break;
+    }
     case "voice-replace": { const v = voiceOf(el); if (v) pickVoices(v.id); break; }
     case "bypass-voice": {
       if (setupGuard()) return;
@@ -4317,6 +4448,16 @@ document.addEventListener("change", async (e) => {
   const changed = before === undefined || before !== el.value;
   committed.set(el, el.value);
   if (el.dataset.relink) { relinkFromSelect(el); return; }
+  if (el.dataset.refmodField) {
+    const m = refmodOf(el), k = el.dataset.refmodField;
+    if (!m) return;
+    if (setupGuard()) { render(); return; }
+    const val = k === "strength" ? Math.max(0, Math.min(1, Number(el.value) || 0)) : el.value;
+    if (val === m[k]) return;
+    m[k] = val;
+    if (!m.bypassed) applyRefChange((await askRefChange()) || "keep", "RefMods");
+    return commit();
+  }
   if (el.dataset.voiceField) {
     const v = voiceOf(el), k = el.dataset.voiceField;
     if (!v) return;
@@ -4499,6 +4640,13 @@ function shotInput(el) {
   }
   liveEdit(s);
   scheduleSave();
+}
+
+/** Only the prompt differs from what the take was rendered with (seconds and seed match). */
+function promptOnlyChanged(s) {
+  const r = s && s.rendered;
+  return !!r && s.text !== r.text && Number(s.seconds) === Number(r.seconds) && Number(s.shot_seed) === Number(r.seed) &&
+    !Object.keys(S.bad).some((k) => k.startsWith(s.id + ":"));
 }
 
 function matchesRendered(s) {

@@ -733,3 +733,21 @@ textarea.fit { resize: none; overflow: hidden; line-height: 1.5; }
 #shots-panel.flipped .anchor-slot.bottom { bottom: auto; top: -4px; transform: translateY(-50%); }
 #shots-panel.flipped.has-anchors .shot-list { padding-bottom: 26px; }
 #shots-panel.flipped.has-anchors.anchor-end .shot-list { padding-top: 48px; }
+
+/* Optional packs: install buttons (0.8.6) */
+.install-btn { background: transparent; border: 1px dashed var(--amber); color: var(--amber); border-radius: 6px;
+  padding: 3px 10px; font-size: 12px; cursor: pointer; }
+.install-btn:hover { background: var(--amber-bg); }
+.pack-note { margin-top: 8px; }
+.copy-line { background: var(--field); border: 1px solid var(--field-line); border-radius: 6px; padding: 8px 10px; user-select: all; white-space: pre-wrap; }
+/* RefMod cards: no preview, a tile by kind */
+.refmod-card .refmod-thumb { width: 64px; height: 64px; display: flex; align-items: center; justify-content: center;
+  font-size: 26px; background: #2B2240; border-radius: 6px; cursor: default; }
+.refmod-card .refmod-label { flex: 1; min-width: 0; font-weight: 600; font-size: 13px; }
+.refmod-card .refmod-desc { width: 100%; font-size: 12px; color: var(--sub); margin: 2px 0; }
+.refmod-card .refmod-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.addtile.refmod-add { color: #C9B6FF; }
+.addtile.refmod-add.install { cursor: default; text-align: center; padding: 10px; }
+.addtile.refmod-add.install:hover { background: transparent; border-color: var(--line-2); color: #C9B6FF; }
+.cast-break { grid-column: 1 / -1; height: 0; margin: -4px 0; }
+.refmod-card input[type=number] { background: var(--field); border: 1px solid var(--field-line); border-radius: 6px; color: var(--text); padding: 3px 6px; font-size: 12px; }

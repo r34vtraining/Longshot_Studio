@@ -5,15 +5,10 @@ ComfyUI at `/longshot`. Build a film from short Shots, review and approve each o
 Studio stitches them into one continuous take or a cut sequence. Approved work is never
 thrown away.
 
-<img width="1701" height="1390" alt="image" src="https://github.com/user-attachments/assets/2c2f4718-efc1-4be3-8682-c9d13481effa" />
-
-## What's new in 0.8.5
-1. Whole-film decodes (Update preview, Upscale final, ProRes master) run one continuous run at a time, split only at Cut and Context joins. Still one video file; RAM now limits the longest unbroken run, not the film.
-2. Before decoding, the Studio checks each run fits in RAM and names the Shots if one doesn't.
-3. Up to 256 Shots per project (was 64).
-4. ⇅ in the Shots header flips the list: newest Shot on top (remembered per browser).
+<img width="2166" height="1493" alt="H3 Long Shot Studio" src="https://github.com/user-attachments/assets/543bc5fd-05bf-45dd-9557-f36327e8c935" />
 
 ## Features
+
 **Generate**
 - Reference-to-video like the ComfyUI MiniMax H3 workflow: picture references for
   characters, outfits and places, plus audio references for character voices.
@@ -37,7 +32,36 @@ thrown away.
 - Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
 
+## What's new in 0.8.7
+
+Needs H3 Long Shot **1.6.11 or later**.
+
+1. No more Video Helper Suite: videos are saved and clips loaded by H3 Long Shot's own nodes, sound by ComfyUI's Load Audio. Only the Prompt Compiler and Long Shot are required now.
+2. Saved videos still carry the workflow (drop one on ComfyUI to reopen it). No PNG or silent copy is written next to them any more.
+
+## What's new in 0.8.6
+
+1. RefMod cards: a row in Cast & Scenes for saved RefMods (characters, styles, motions), each with its own label and subject line.
+2. Fewer dependencies: KJNodes and MelBandRoFormer are no longer needed; the default scheduler is ComfyUI's own `beta`.
+3. Turbo, RTX upscaling and RefMods are optional, with a **Click to install** button where each is used.
+4. A Shot's prompt can be edited while it renders; the card flags that the take was made with the old text.
+
+## What's new in 0.8.5
+
+Needs H3 Long Shot **1.6.10 or later**.
+
+1. Whole-film decodes (Update preview, Upscale final, ProRes master) run one continuous run at a time, split only at Cut and Context joins. Still one video file; RAM now limits the longest unbroken run, not the film.
+2. Before decoding, the Studio checks each run fits in RAM and names the Shots if one doesn't.
+3. Up to 256 Shots per project (was 64).
+4. ⇅ in the Shots header flips the list: newest Shot on top (remembered per browser).
+
 ## What's new in 0.8.4
+
+1. Open output folder opens Approved_Clips, with the focused Shot's clip selected (before any export: the latest video or the clips folder).
+2. Rest the mouse on the Retention field to see the markers it takes (fully_preserved, weak_reference, fully_copy…).
+3. While the queue has work, the ComfyUI machine stays awake, and the Studio tab keeps its screen on.
+
+## What's new in 0.8.3
 
 Needs H3 Long Shot **1.6.9 or later**.
 
@@ -50,20 +74,24 @@ Needs H3 Long Shot **1.6.9 or later**.
 ## Requirements
 
 - ComfyUI with native MiniMax H3 support, and the MiniMax H3 model files.
-- These node packs (the Studio names any that are missing):
+- Two node packs (the Studio names any that are missing):
 
 | Pack | Needed for |
 |---|---|
 | [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) | prompts (always) |
-| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.6.9+** | rendering (always) |
-| [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) | reference resizing (always) |
-| [ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) | video and audio (always) |
-| [ComfyUI-MiniMax-H3-Turbo](https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo) | Turbo LoRA (optional) |
-| [ComfyUI-MelBandRoFormer](https://github.com/kijai/ComfyUI-MelBandRoFormer) | the song's voice as a reference (optional) |
-| [ComfyUI-NVIDIA-RTX-VSR-Pro](https://github.com/whmc76/ComfyUI-NVIDIA-RTX-VSR-Pro) | RTX upscaling, RTX GPU (optional) |
+| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.6.11+** | rendering, and saving / loading video (always) |
 
-The default scheduler, `beta57`, comes from [RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF);
-without it, pick another under **Advanced**.
+ffmpeg is needed (on PATH, or `pip install imageio-ffmpeg` with ComfyUI's Python).
+
+Optional, each with a **Click to install** button in the Studio where it's used:
+
+| Pack | Adds |
+|---|---|
+| [ComfyUI-MiniMax-H3-Turbo](https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo) | full Turbo support (without it, the Turbo LoRA loads through ComfyUI's stock loader) |
+| [ComfyUI-NVIDIA-RTX-VSR-Pro](https://github.com/whmc76/ComfyUI-NVIDIA-RTX-VSR-Pro) | RTX upscaling (RTX GPU) |
+| [ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod) | RefMods |
+
+For SageAttention, start ComfyUI with `--use-sage-attention`.
 
 ## Install
 
@@ -72,8 +100,6 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/r34vtraining/Longshot_Studio
 git clone https://github.com/r34vtraining/H3_Prompt_Compiler
 git clone https://github.com/r34vtraining/H3_Longshot
-git clone https://github.com/kijai/ComfyUI-KJNodes
-git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
 ```
 
 Skip any you already have, and install each pack's `requirements.txt` with ComfyUI's Python.

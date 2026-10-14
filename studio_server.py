@@ -17,6 +17,7 @@
     DELETE /longshot/takes/<slug>/<name>    delete one take (loopback only)
     POST /longshot/clear-segments  {project} (loopback only)
     POST /longshot/open-folder     {"which": "output"|"input", "select", "project", "subfolder"} (loopback only)
+    POST /longshot/install-pack    {pack}: clone an optional pack (loopback only)
     POST /longshot/keep-awake      {on}: keep the machine awake while the queue has work
     POST /longshot/restart         restart ComfyUI (relaunches itself, like ComfyUI-Manager)
     POST /longshot/cleanup-outputs {prompt_id, png, noaudio}: delete a finished render's
@@ -292,8 +293,8 @@ def longshot_version():
 
 
 def current_env():
-    return gb.Env(classes=set(_node_classes()), video_formats=video_formats(),
-                  shot_inputs=_timeline_shot_inputs())
+    return gb.Env(classes=set(_node_classes()), video_formats=None,
+                  shot_inputs=_timeline_shot_inputs(), nvenc=nvenc_available())
 
 
 _READY = set()
@@ -577,6 +578,7 @@ def options_payload():
         "output_subfolder": gb.OUTPUT_SUBFOLDER,
         "longshot_version": ".".join(str(x) for x in longshot_version()),
         "max_shots": gb.MAX_SHOTS,
+        "optional_packs": {k: {"folder": f, "url": u} for k, (f, u) in OPTIONAL_PACKS.items()},
     }
 
 
@@ -773,6 +775,39 @@ def bring_to_front(folder, before, platform=None, wait=4.0):
 # the OS request, so it's released the moment neither is true, or about
 # KEEP_AWAKE_TTL seconds after the last heartbeat.
 # ---------------------------------------------------------------------------
+
+OPTIONAL_PACKS = {      # 0.8.6: optional features, installed from the Studio (fixed repos only)
+    "turbo": ("ComfyUI-MiniMax-H3-Turbo", "https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo"),
+    "rtx": ("ComfyUI-NVIDIA-RTX-VSR-Pro", "https://github.com/whmc76/ComfyUI-NVIDIA-RTX-VSR-Pro"),
+    "refmod": ("ComfyUI-MiniMaxH3Mod", "https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod"),
+}
+
+
+def install_pack(key, custom_nodes, run=None, git=None, python=None):
+    """git clone one optional pack into custom_nodes (and pip its requirements with
+    ComfyUI's own Python). Returns {folder, cloned, pip}. ComfyUI restarts to load it."""
+    if key not in OPTIONAL_PACKS:
+        raise ValueError("Not an optional pack.")
+    folder, url = OPTIONAL_PACKS[key]
+    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, timeout=900))
+    dest = os.path.join(custom_nodes, folder)
+    cloned = False
+    if not os.path.isdir(dest):
+        git = git or shutil.which("git")
+        if not git:
+            raise ValueError("git isn't installed on this machine. Run: git clone " + url)
+        res = run([git, "clone", "--depth", "1", url, dest])
+        if getattr(res, "returncode", 1) != 0:
+            err = getattr(res, "stderr", b"") or b""
+            raise RuntimeError("git clone failed: " + (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))[-400:])
+        cloned = True
+    pip = False
+    req = os.path.join(dest, "requirements.txt")
+    if os.path.isfile(req):
+        res = run([python or sys.executable, "-m", "pip", "install", "-r", req])
+        pip = getattr(res, "returncode", 1) == 0
+    return {"folder": dest, "cloned": cloned, "pip": pip, "url": url}
+
 
 KEEP_AWAKE_TTL = 120.0
 
@@ -1551,6 +1586,28 @@ def register(routes=None):
         if n is None:
             return error("The H3 Long Shot pack isn't loaded.", 404)
         return web.json_response({"cleared": n})
+
+    @routes.post("/longshot/install-pack")
+    async def install_pack_route(request):
+        """{pack}: clone an optional pack (Turbo, RTX VSR, RefMod). Local only."""
+        if not is_local_request(request.remote, request.headers):
+            return error("Packs can only be installed from the machine running ComfyUI.", 403)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        import folder_paths
+        roots = folder_paths.get_folder_paths("custom_nodes")
+        if not roots:
+            return error("ComfyUI's custom_nodes folder wasn't found.", 500)
+        try:
+            out = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: install_pack(str(body.get("pack") or ""), roots[0]))
+        except ValueError as err:
+            return error(err)
+        except Exception as err:
+            return error(str(err), 500)
+        return web.json_response(out)
 
     @routes.post("/longshot/keep-awake")
     async def keep_awake(request):

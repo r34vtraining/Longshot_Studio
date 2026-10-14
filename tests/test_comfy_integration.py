@@ -56,7 +56,7 @@ def need(*classes):
 
 ALL_PACKS = need(*sorted(FULL_SET))
 CORE_PACKS = need("MiniMaxH3TimelineShot", "MiniMaxH3RefPromptBuilder", "MiniMaxH3LongShot",
-                  "ImageResizeKJv2", "VHS_VideoCombine", "VHS_LoadAudioUpload")
+                  "ImageScaleToMaxDimension", "MiniMaxH3SaveVideo", "LoadAudio")
 
 
 # ---------------------------------------------------------------------------
@@ -205,9 +205,8 @@ def test_live_env_reports_the_installed_nodes(install):
     env = srv.current_env()
     for c in FULL_SET:
         assert env.has(c), c
-    # this machine's ffmpeg has no NVENC, so the live env drops it
-    if not srv.nvenc_available():
-        assert gb.NVENC not in env.video_formats and gb.H264 in env.video_formats
+    # the encoder choice follows whether this machine's ffmpeg can use NVENC (0.8.7)
+    assert env.nvenc == srv.nvenc_available()
 
 
 @ALL_PACKS
@@ -361,20 +360,20 @@ def loop(install, monkeypatch, tmp_path):
     state = {"ex": new_executor()}
     RAN.clear()
 
-    def run(p, upto, dry_run=False, restart=False, final=False, standalone=False):
+    def run(p, upto, dry_run=False, restart=False, final=False, standalone=False, clips_for=None, built=None):
         """restart=True: ComfyUI restarted — Long Shot's memory and ComfyUI's
         caches are gone; only files on disk remain."""
         if restart:
             ls.clear_segment_cache()
             state["ex"] = new_executor()
         ex = state["ex"]
-        built = gb.build_prompt(p, upto=upto, dry_run=dry_run, env=srv.current_env(), final=final,
-                                standalone=standalone)
+        built = built or gb.build_prompt(p, upto=upto, dry_run=dry_run, env=srv.current_env(), final=final,
+                                         standalone=standalone, clips_for=clips_for)
         server.events.clear()
         calls = len(sampler.calls)
         # every output node, as ComfyUI's /prompt does (the ProRes master is a second one)
-        ex.execute(built.prompt, f"p{len(server.events)}-{upto}", {"client_id": "studio"},
-                   [k for k, v in built.prompt.items() if v["class_type"] == "VHS_VideoCombine"])
+        ex.execute(built.prompt, f"p{len(server.events)}-{upto}-{len(built.prompt)}", {"client_id": "studio"},
+                   [k for k, v in built.prompt.items() if v["class_type"] in ("MiniMaxH3SaveVideo", "VHS_VideoCombine")])
         assert ex.success, [(m[1].get("exception_message"), "".join(m[1].get("traceback", []))) for m in ex.status_messages if m[0] == "execution_error"]
         outputs = ex.history_result["outputs"]
         progress = [(d["segment"], d["status"]) for e, d in server.events
@@ -415,7 +414,7 @@ def test_core_loop_start_continue_reroll_edit(loop):
     assert os.path.isfile(os.path.join(folder_paths.get_output_directory(), "longshot",
                                        "sample-project", "videos", video["filename"]))
     # nvenc when this machine's ffmpeg can actually use it, software h264 otherwise
-    assert video["format"] == (gb.NVENC if srv.nvenc_available() else gb.H264)
+    assert video["format"] == "video/mp4"
     assert out["longshot"]["plan_json"][0]["seed"] == 1722
 
     # Continue: Shot 1 comes from memory, only Shot 2 renders
@@ -623,7 +622,7 @@ def test_round_3_routes_stats_rename_export_import(install, tmp_path):
 
 
 @CORE_PACKS
-@need("VHS_LoadVideo", "MiniMaxH3Clip")
+@need("MiniMaxH3LoadVideo", "MiniMaxH3Clip")
 def test_clip_shot_through_the_real_executor(loop):
     p = small()
     for i in range(2, 6):
@@ -1003,12 +1002,7 @@ def _probe(path):
 @pytest.mark.skipif(not shutil.which("ffprobe"), reason="needs ffprobe")
 def test_final_writes_a_10_bit_prores_master_with_sound_and_metadata(loop, monkeypatch):
     monkeypatch.setitem(comfy_nodes.NODE_CLASS_MAPPINGS, "RTXVideoSuperResolution", _vsr_stand_in())
-    srv.register_video_formats()
-    srv.register_video_formats()                    # twice is harmless
-    assert folder_paths.get_folder_paths("VHS_video_formats").count(
-        os.path.join(PKG_DIR, "video_formats")) == 1
     env = srv.current_env()
-    assert gb.PRORES in env.video_formats
     p = small()
     p["settings"]["rtx_vsr"] = {"on": False, "scale": 2.0, "quality": "ULTRA"}
     p["settings"]["prores_master"] = True
@@ -1029,7 +1023,7 @@ def test_final_writes_a_10_bit_prores_master_with_sound_and_metadata(loop, monke
     v = next(s for s in info["streams"] if s["codec_type"] == "video")
     a = next(s for s in info["streams"] if s["codec_type"] == "audio")
     assert v["codec_name"] == "prores" and v["profile"] == "HQ" and v["pix_fmt"] == "yuv422p10le"
-    assert a["codec_name"] == "pcm_s16le"
+    assert a["codec_name"] == "pcm_s24le"
     tags = {k.lower(): val for k, val in info["format"].get("tags", {}).items()}
     assert "prompt" in tags and "MiniMaxH3LongShot" in tags["prompt"], "workflow metadata in the master"
     # the mp4 keeps its metadata too
@@ -1038,18 +1032,11 @@ def test_final_writes_a_10_bit_prores_master_with_sound_and_metadata(loop, monke
                                mp4["filename"]))
     assert "prompt" in {k.lower() for k in info["format"].get("tags", {})}
 
-    # Save PNG / audio-less video both off: only the two videos with sound stay
+    # 0.8.7: Save Video writes only the videos with sound: no PNG, no silent copy
     vdir = os.path.join(folder_paths.get_output_directory(), *mp4["subfolder"].split("/"))
-    before = set(os.listdir(vdir))
-    removed = pj.remove_render_side_files(folder_paths.get_output_directory(),
-                                          srv.video_entries(out), png=True, noaudio=True)
-    assert len(removed) == 4                     # 2 PNGs + 2 silent videos
-    left = set(os.listdir(vdir))
-    assert left == before - {r.rsplit("/", 1)[-1] for r in removed}
-    assert mp4["filename"] in left and master["filename"] in left
-    assert mp4["workflow"] not in left and master["workflow"] not in left
-    assert mp4["filename"].replace("-audio", "") not in left
-    assert master["filename"].replace("-audio", "") not in left
+    assert pj.remove_render_side_files(folder_paths.get_output_directory(), srv.video_entries(out),
+                                       png=True, noaudio=True) == []
+    assert mp4["filename"] in os.listdir(vdir) and master["filename"] in os.listdir(vdir)
 
 
 @CORE_PACKS
@@ -1058,18 +1045,13 @@ def test_cleanup_route_uses_comfyuis_history_of_that_render(loop, monkeypatch):
     out, _, _ = loop(p, "s1")
     video = out["combine"]["gifs"][0]
     vdir = os.path.join(folder_paths.get_output_directory(), *video["subfolder"].split("/"))
-    png, silent = video["workflow"], video["filename"].replace("-audio", "")
-    assert os.path.isfile(os.path.join(vdir, png)) and os.path.isfile(os.path.join(vdir, silent))
     monkeypatch.setattr(srv, "history_outputs", lambda pid: out if pid == "p1" else None)
     assert _client_call("POST", "/longshot/cleanup-outputs", json={"prompt_id": "nope", "png": True})[0] == 404
     assert _client_call("POST", "/longshot/cleanup-outputs", json={"png": True})[0] == 400
-    status, res = _client_call("POST", "/longshot/cleanup-outputs",
-                               json={"prompt_id": "p1", "png": True, "noaudio": False})
-    assert status == 200 and res["removed"] == [f"{video['subfolder']}/{png}"]
-    assert os.path.isfile(os.path.join(vdir, silent))
+    # Save Video leaves no side files: nothing to remove, the video stays
     status, res = _client_call("POST", "/longshot/cleanup-outputs",
                                json={"prompt_id": "p1", "png": True, "noaudio": True})
-    assert res["removed"] == [f"{video['subfolder']}/{silent}"]
+    assert status == 200 and res["removed"] == []
     assert os.path.isfile(os.path.join(vdir, video["filename"]))
 
 
@@ -1141,3 +1123,46 @@ def test_round_4b_standalone_shot_then_bridge_the_gap(loop, monkeypatch):
     rows = out["longshot"]["plan_json"]
     assert sampled == 1 and rows[0]["pins"] == {"start": None, "end": None}
     assert rows[0]["take"] != standalone_take
+
+
+@CORE_PACKS
+def test_round_5_render_decodes_only_the_new_shot_into_its_own_clip(loop, monkeypatch):
+    if "MiniMaxH3Take" not in comfy_nodes.NODE_CLASS_MAPPINGS:
+        pytest.skip("needs H3 Long Shot 1.6")
+    p = small()
+    for i in range(3, 6):
+        p["shots"][i]["bypassed"] = True
+    out, _, sampled = loop(p, "s1")
+    studio_step(p, out["longshot"]["plan_json"], {"s1"})
+    built = gb.build_prompt(p, upto="s2", env=srv.current_env(), clips_for=["s2", "s1", "nope"])
+    ok, err, outs, node_errors = validate(built.prompt)
+    assert ok, (err, node_errors)
+    assert "combine" not in built.prompt and "decode" not in built.prompt      # no stitched decode
+    assert sorted(built.nodes["clips"]) == ["s1", "s2"]                        # only Shots in the chain
+    p2 = dict(p)
+    out, progress, sampled = loop(p, "s2", built=gb.build_prompt(p, upto="s2", env=srv.current_env(),
+                                                                 clips_for=["s2"]))
+    assert sampled == 1
+    rows = out["longshot"]["plan_json"]
+    clip = out[next(iter(gb.build_prompt(p, upto="s2", env=srv.current_env(), clips_for=["s2"]).nodes["clips"].values()))]["gifs"][0]
+    assert clip["subfolder"] == "longshot/sample-project/clips" and clip["filename"].startswith("s2_")
+    folder = os.path.join(folder_paths.get_output_directory(), "longshot", "sample-project", "clips")
+    key = rows[1]["take"][:-len(".safetensors")]
+    idx = pj.adopt_clips(folder_paths.get_output_directory(), "sample-project",
+                         [{"key": key, "file": clip}], probe=lambda path: srv.probe_video(path).get("duration"))
+    assert key in idx and os.path.isfile(os.path.join(folder, key + ".mp4"))
+    # its own window, decoded alone: longer than its visible part in the film by the shared overlap
+    assert abs(idx[key]["dur"] - rows[1]["window_frames"] / 24) < 0.1
+    import re as _re
+    assert not [f for f in os.listdir(folder) if _re.match(r"s2_\d{5}", f)]    # moved, leftovers gone
+
+    # clips for takes from the take history: just the take, decoded on its own
+    take1 = rows[0]["take"]
+    tb = gb.build_take_clips(p, [{"key": take1[:-12], "take": take1}], env=srv.current_env())
+    ok, err, outs, node_errors = validate(tb.prompt)
+    assert ok, (err, node_errors)
+    ls = _long_shot_module()
+    calls = []
+    out2, _, sampled = loop(p, "s1", built=tb)
+    assert sampled == 0
+    assert out2[tb.nodes["clips"][take1[:-12]]]["gifs"][0]["filename"].startswith(take1[:-12])

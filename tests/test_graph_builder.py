@@ -48,7 +48,8 @@ def check_wiring(prompt):
         assert src in prompt, f"{nid}.{name} -> missing node {src}"
         assert idx >= 0
         used.add(src)
-    dangling = set(prompt) - used - {"combine", "combine_prores"}
+    dangling = set(prompt) - used - {"combine", "combine_prores", "save_audio", "upscale_chunk"} \
+        - {n for n in prompt if prompt[n]["class_type"] in ("MiniMaxH3UpscaleChunk", "MiniMaxH3SaveAudio")}
     assert not dangling, f"nodes that feed nothing: {dangling}"
 
 
@@ -112,10 +113,9 @@ def test_sample_builds_the_reference_workflow():
     # 7 references, in order, each resized exactly as the reference workflow does
     for k in range(7):
         r = p[ls[f"ref_images.ref_image_{k}"][0]]
-        assert r["class_type"] == "ImageResizeKJv2"
+        assert r["class_type"] == "ImageScaleToMaxDimension"          # core (0.8.6, was KJNodes)
         assert {x: r["inputs"][x] for x in r["inputs"] if x != "image"} == dict(
-            width=1500, height=1500, upscale_method="nearest-exact", keep_proportion="resize",
-            pad_color="0, 0, 0", crop_position="center", divisible_by=2, device="cpu")
+            upscale_method="lanczos", largest_size=1500)
     assert p[p[ls["ref_images.ref_image_0"][0]]["inputs"]["image"][0]]["inputs"]["image"] \
         == "hero portrait (1).png"
     assert "ref_images.ref_image_7" not in ls
@@ -144,10 +144,9 @@ def test_sample_builds_the_reference_workflow():
 
     c = p["combine"]["inputs"]
     assert c["filename_prefix"] == "longshot/sample-project/videos/Sample project"
-    assert c["format"] == "video/nvenc_h264-mp4" and c["frame_rate"] == 24
+    assert p["combine"]["class_type"] == "MiniMaxH3SaveVideo"          # 0.8.7: Long Shot's, not VHS
+    assert c["codec"] == "h264_nvenc" and c["frame_rate"] == 24
     assert c["audio"] == ["decode_audio", 0] and c["images"] == ["decode", 0]
-    assert (c["pix_fmt"], c["bitrate"], c["megabit"], c["save_metadata"], c["pingpong"],
-            c["save_output"], c["loop_count"]) == ("yuv420p", 8, True, True, False, True, 0)
     # no CLIPVisionEncode, no ResolutionSelector, no rgthree switch, no Seed Everywhere
     classes = {n["class_type"] for n in p.values()}
     assert not classes & {"CLIPVisionEncode", "ResolutionSelector", "Any Switch (rgthree)",
@@ -347,7 +346,7 @@ def test_sage_is_skipped_when_kjnodes_lacks_it():
     b = build(sample(), env=env)
     assert "sage" not in b.prompt
     assert model_chain(b.prompt)[:2] == ["UNETLoader", "MiniMaxH3SigmaShift"]
-    assert any("SageAttention" in w for w in b.warnings)
+    assert not any("SageAttention" in w for w in b.warnings)     # ComfyUI's launch flag does it
     check_wiring(b.prompt)
 
 
@@ -372,7 +371,7 @@ def test_model_settings_flow_through():
     assert b["noise"]["inputs"]["noise_seed"] == 99
     ls = b["longshot"]["inputs"]
     assert (ls["seed_mode"], ls["overlap_frames"], ls["ref_image_size"]) == ("same", 39, "max")
-    assert b["resize1"]["inputs"]["width"] == 1024 == b["resize1"]["inputs"]["height"]
+    assert b["resize1"]["inputs"]["largest_size"] == 1024
     assert (b["shift"]["inputs"]["shift_video"], b["shift"]["inputs"]["shift_audio"]) == (8.5, 2)
 
 
@@ -405,7 +404,7 @@ def test_shot_seed_range(seed, ok):
 # Audio routes: every combination
 # ---------------------------------------------------------------------------
 
-AUDIO_CLASSES = {"VHS_LoadAudioUpload", "MiniMaxH3SongTrack", "MelBandRoFormerModelLoader",
+AUDIO_CLASSES = {"LoadAudio", "TrimAudioDuration", "MiniMaxH3SongTrack", "MelBandRoFormerModelLoader",
                  "MelBandRoFormerSampler"}
 
 
@@ -421,8 +420,8 @@ def test_audio_route_combinations(lip, voice, final):
     if not (lip or voice or final):
         assert not classes & AUDIO_CLASSES, "all routes off: no audio nodes at all"
     else:
-        loader = g["audio"]["inputs"]
-        assert loader == {"audio": "song.mp3", "start_time": 15.0, "duration": 15.1}
+        assert g["audio_file"]["inputs"] == {"audio": "song.mp3"}
+        assert g["audio"]["inputs"] == {"audio": ["audio_file", 0], "start_index": 15.0, "duration": 15.1}
     assert ("song" in ls) == lip
     if lip:
         assert g[ls["song"][0]]["class_type"] == "MiniMaxH3SongTrack"
@@ -471,19 +470,20 @@ def test_short_song_warns():
 # ---------------------------------------------------------------------------
 
 def test_missing_node_classes_are_named_with_their_pack():
-    env = gb.Env(classes=set(gb.required_classes(sample())) - {"VHS_VideoCombine",
+    env = gb.Env(classes=set(gb.required_classes(sample())) - {"MiniMaxH3SaveVideo",
                                                               "MiniMaxH3LongShot"})
     with pytest.raises(gb.BuildError) as err:
         build(sample(), env=env)
     msg = str(err.value)
-    assert "VHS_VideoCombine — from ComfyUI-VideoHelperSuite" in msg
+    assert "MiniMaxH3SaveVideo — from H3 Long Shot 1.6.11+" in msg
     assert "MiniMaxH3LongShot — from H3 Long Shot" in msg
 
 
 def test_turbo_node_only_required_when_turbo_is_on():
     p = sample()
     env = gb.Env(classes=set(gb.required_classes(p)) - {"MiniMaxH3TurboLoRA"})
-    with pytest.raises(gb.BuildError, match="MiniMaxH3TurboLoRA"):
+    # no Turbo pack and no stock loader either: it names the stock loader (0.8.6 fallback)
+    with pytest.raises(gb.BuildError, match="LoraLoaderModelOnly"):
         build(p, env=env)
     p["settings"]["turbo"]["on"] = False
     build(p, env=env)
@@ -491,7 +491,7 @@ def test_turbo_node_only_required_when_turbo_is_on():
 
 def test_melband_only_required_for_voice_reference():
     p = sample()
-    env = gb.Env(classes=set(gb.required_classes(p)) | {"VHS_LoadAudioUpload",
+    env = gb.Env(classes=set(gb.required_classes(p)) | {"LoadAudio", "TrimAudioDuration",
                                                          "MiniMaxH3SongTrack"})
     p["audio"].update(lip_sync=True, final_override=True)
     build(p, env=env)
@@ -500,23 +500,11 @@ def test_melband_only_required_for_voice_reference():
         build(p, env=env)
 
 
-@pytest.mark.parametrize("formats,want", [
-    (None, gb.NVENC), (["video/nvenc_h264-mp4", "video/h264-mp4"], gb.NVENC),
-    (["video/h264-mp4", "video/webm"], gb.H264)])
-def test_nvenc_falls_back_to_h264(formats, want):
-    b = build(sample(), env=gb.Env(video_formats=formats))
-    c = b.prompt["combine"]["inputs"]
-    assert c["format"] == want == b.video_format
-    if want == gb.H264:
-        assert c["crf"] == 19 and "bitrate" not in c
-    else:
-        assert (c["bitrate"], c["megabit"]) == (8, True) and "crf" not in c
-    assert any("NVENC" in w for w in b.warnings) == (want == gb.H264)
-
-
-def test_no_mp4_format_is_an_error():
-    with pytest.raises(gb.BuildError):
-        build(sample(), env=gb.Env(video_formats=["video/webm"]))
+@pytest.mark.parametrize("nvenc,want", [(None, "h264_nvenc"), (True, "h264_nvenc"), (False, "libx264")])
+def test_nvenc_falls_back_to_h264(nvenc, want):
+    b = build(sample(), env=gb.Env(nvenc=nvenc))
+    assert b.prompt["combine"]["inputs"]["codec"] == want
+    assert any("NVENC" in w for w in b.warnings) == (want == "libx264")
 
 
 # ---------------------------------------------------------------------------
@@ -640,7 +628,7 @@ def test_references_and_audio_in_a_project_subfolder():
     g = build(p).prompt
     assert g["img1"]["inputs"]["image"] == "longshot/sample-project/portrait.png"
     assert g["img2"]["inputs"]["image"] == "outfit.png"
-    assert g["audio"]["inputs"]["audio"] == "longshot/sample-project/song (1).mp3"
+    assert g["audio_file"]["inputs"]["audio"] == "longshot/sample-project/song (1).mp3"
 
 
 @pytest.mark.parametrize("sub,name", [("../secret", "a.png"), ("/etc", "a.png"),
@@ -751,7 +739,7 @@ def test_a_clip_shot_builds_load_video_clip_and_clip_shot():
     shot = g["shot3"]["inputs"]
     assert g["shot3"]["class_type"] == "MiniMaxH3ClipShot" and shot["shots"] == ["shot2", 0]
     assert g["shot4"]["inputs"]["shots"] == ["shot3", 0]
-    assert {"VHS_LoadVideo", "MiniMaxH3Clip", "MiniMaxH3ClipShot"} <= set(gb.required_classes(with_clip()))
+    assert {"MiniMaxH3LoadVideo", "MiniMaxH3Clip", "MiniMaxH3ClipShot"} <= set(gb.required_classes(with_clip()))
     check_wiring(g)
 
 
@@ -780,11 +768,11 @@ def test_original_clip_pixels_only_on_the_final_video():
 def test_clips_load_scaled_to_cover_the_film():
     wide = build(with_clip(width=3840, height=1080))          # wider than 16:9: fit the height
     load = wide.prompt["clipload3"]["inputs"]
-    assert (load["custom_width"], load["custom_height"]) == (0, wide.height + 8)
+    assert load["height"] == wide.height + 8 and load["width"] == round((wide.height + 8) * 3840 / 1080)
     tall = build(with_clip(width=1080, height=1920)).prompt["clipload3"]["inputs"]
-    assert tall["custom_height"] == 0 and tall["custom_width"] > 0
+    assert tall["width"] > 0 and tall["height"] == round(tall["width"] * 1920 / 1080)
     unknown = build(with_clip()).prompt["clipload3"]["inputs"]
-    assert (unknown["custom_width"], unknown["custom_height"]) == (0, 0)
+    assert (unknown["width"], unknown["height"]) == (0, 0)          # Load Video reads the clip's own size
 
 
 # ---------------------------------------------------------------------------
@@ -800,10 +788,10 @@ def test_prores_master_only_on_the_final_and_only_when_asked():
     final = b.prompt
     check_wiring(final)
     m, c = final["combine_prores"]["inputs"], final["combine"]["inputs"]
-    assert m["format"] == gb.PRORES == "video/h3-prores-422hq-10bit.json"
+    assert m["codec"] == "prores_hq" and final["combine_prores"]["class_type"] == "MiniMaxH3SaveVideo"
     assert m["images"] == c["images"] == ["vsr", 0]          # the same upscaled frames
     assert m["audio"] == c["audio"]                          # and the same sound
-    assert m["save_metadata"] is True and m["save_output"] is True and m["frame_rate"] == 24
+    assert m["frame_rate"] == 24
     assert m["filename_prefix"] == "longshot/sample-project/videos/Sample project_final_master"
     assert b.nodes["prores"] == "combine_prores"
     assert final["longshot"] == build(p).prompt["longshot"], "the master reuses every segment"
@@ -816,26 +804,6 @@ def test_prores_master_carries_the_song_when_it_replaces_the_audio():
     final = build(p, final=True).prompt
     assert final["combine_prores"]["inputs"]["audio"] == ["audio", 0]
 
-
-def test_prores_master_falls_back_to_vhs_prores_with_a_warning():
-    p = sample()
-    p["settings"]["prores_master"] = True
-    env = gb.Env(video_formats=[gb.H264, gb.VHS_PRORES])
-    b = build(p, final=True, env=env)
-    m = b.prompt["combine_prores"]["inputs"]
-    assert m["format"] == gb.VHS_PRORES and m["profile"] == "hq"
-    assert any("8-bit" in w for w in b.warnings)
-    with pytest.raises(gb.BuildError, match="no ProRes format"):
-        build(p, final=True, env=gb.Env(video_formats=[gb.H264]))
-    # the Studio's own format is used when VHS lists it
-    b = build(p, final=True, env=gb.Env(video_formats=[gb.H264, gb.VHS_PRORES, gb.PRORES]))
-    assert b.prompt["combine_prores"]["inputs"]["format"] == gb.PRORES
-    assert not any("ProRes" in w for w in b.warnings)
-
-
-# ---------------------------------------------------------------------------
-# Round 4b: a Shot rendered on its own
-# ---------------------------------------------------------------------------
 
 def test_standalone_render_sends_a_one_shot_timeline():
     p = sample()
@@ -865,3 +833,236 @@ def test_standalone_needs_a_generated_shot():
     p["shots"][2].update(kind="clip", clip={"file": "x.mp4", "frames": 22})
     with pytest.raises(gb.BuildError, match="clip"):
         build(p, upto="s3", standalone=True)
+
+
+def test_more_than_16_shots_build():
+    p = sample()
+    shot = next(s for s in p["shots"] if s.get("kind") != "clip")
+    p["shots"] = [dict(copy.deepcopy(shot), id=f"s{i}", text=f"Beat {i}.", seconds=2)
+                  for i in range(1, 31)]
+    b = build(p)
+    check_wiring(b.prompt)
+    assert len(b.chain) == 30
+    p["shots"] = [dict(copy.deepcopy(shot), id=f"s{i}", seconds=1) for i in range(1, 201)]
+    assert len(build(p).chain) == 200                                  # 256 since Long Shot 1.6.10
+    p["shots"] = [dict(copy.deepcopy(shot), id=f"s{i}", seconds=1) for i in range(1, 258)]
+    with pytest.raises(gb.BuildError, match="at most 256"):
+        build(p)
+
+
+def test_a_chunk_upscales_a_range_straight_to_a_file():
+    p = sample()
+    p["settings"]["prores_master"] = True
+    b = build(p, final=True, chunk={"index": 2, "start": 480, "length": 240, "audio": True})
+    pr = b.prompt
+    check_wiring(pr)
+    up = pr["upscale_chunk"]
+    assert up["class_type"] == "MiniMaxH3UpscaleChunk"
+    assert up["inputs"]["images"] == ["decode", 0]
+    assert up["inputs"]["start"] == 480 and up["inputs"]["length"] == 240
+    assert up["inputs"]["filename_prefix"].endswith("/videos/_chunks/" + gb.safe_name(p.get("name")) + "_final_c002")
+    assert up["inputs"]["master_prefix"] == up["inputs"]["filename_prefix"] + "_master"
+    assert up["inputs"]["codec"] in ("h264_nvenc", "libx264") and up["inputs"]["scale"] == 2
+    # no RTX node and no Video Combine in the graph: nothing big is cached
+    assert not of_class(pr, "RTXVideoSuperResolution") and not of_class(pr, "MiniMaxH3SaveVideo")
+    sa = pr["save_audio"]
+    # the sound of the run this chunk opens (0.8.5: one WAV per decode run)
+    assert sa["class_type"] == "MiniMaxH3SaveAudio" and sa["inputs"]["filename_prefix"].endswith(
+        "/_chunks/" + gb.safe_name(p.get("name")) + "_audio_c002")
+    first = build(sample(), final=True, chunk={"index": 0, "start": 0, "length": 240, "audio": True}).prompt
+    assert first["save_audio"]["inputs"]["filename_prefix"].endswith("_audio")
+    assert b.nodes["chunk"] == "upscale_chunk" and b.nodes["audio_file"] == "save_audio"
+    assert b.nodes["prores"] == "combine_prores"
+    assert b.filename_prefix.endswith("/videos/" + gb.safe_name(p.get("name")) + "_final")   # the joined name
+    # the rest of the graph is the plain final's, so the decode is reused between chunks
+    plain = build(sample(), final=True).prompt
+    for nid in ("longshot", "decode"):
+        assert pr[nid] == plain[nid]
+    later = build(sample(), final=True, chunk={"index": 3, "start": 720, "length": 240}).prompt
+    check_wiring(later)
+    assert "save_audio" not in later and "decode_audio" not in later
+    # a preview that doesn't upscale: a piece of a film decoded run by run, encoded at scale 1
+    q = sample()
+    q["settings"].setdefault("rtx_vsr", {})["on"] = False
+    piece = build(q, chunk={"index": 1, "start": 22, "length": 10_000_000, "audio": True})
+    check_wiring(piece.prompt)
+    assert piece.prompt["upscale_chunk"]["inputs"]["scale"] == 1.0
+    assert piece.prompt["upscale_chunk"]["inputs"]["start"] == 22
+    assert not of_class(piece.prompt, "RTXVideoSuperResolution")
+
+
+def test_bad_chunks_are_build_errors():
+    for bad in ({"start": -1, "length": 10}, {"start": 0, "length": 0}, {"start": "x"}):
+        with pytest.raises(gb.BuildError):
+            build(sample(), final=True, chunk=bad)
+    with pytest.raises(gb.BuildError):
+        build(sample(), dry_run=True, chunk={"start": 0, "length": 10})
+
+
+def test_export_approved_clips_upscaled():
+    p = sample()
+    p["settings"]["prores_master"] = True
+    b = gb.build_clip_export(p, [{"take": "s1__1722__fc96d2a8.safetensors"}, {"take": "s3__9__aa5f3e3d.safetensors"}])
+    pr = b.prompt
+    check_wiring(pr)
+    assert b.nodes["export"] == {"1": {"video": "up1", "audio": "wav1"}, "2": {"video": "up2", "audio": "wav2"}}
+    up = pr["up2"]["inputs"]
+    assert pr["take2"]["inputs"]["take"] == "s3__9__aa5f3e3d.safetensors"
+    assert up["images"] == ["dec2", 0] and up["start"] == 0 and up["length"] >= 10_000_000
+    assert up["filename_prefix"].endswith("/Approved_Clips/_work/c002")
+    assert up["master_prefix"] == up["filename_prefix"] + "_master"
+    assert pr["wav2"]["inputs"]["audio"] == ["aud2", 0]
+    assert not of_class(pr, "MiniMaxH3SaveVideo") and not of_class(pr, "RTXVideoSuperResolution")
+    with pytest.raises(gb.BuildError):
+        gb.build_clip_export(sample(), [{"take": "../evil"}])
+    with pytest.raises(gb.BuildError):
+        gb.build_clip_export(sample(), [])
+
+
+def test_frame_anchors_reach_the_shots_beside_them():
+    p = sample()
+    gen = [s for s in p["shots"] if s.get("kind") != "clip" and not s.get("bypassed")]
+    for s in p["shots"]:
+        s.pop("lock", None); s.pop("take", None)
+    a, b = gen[0], gen[1]
+    b["anchor_in"] = {"file": "join.png", "subfolder": ""}          # end of a, start of b
+    p["anchor_end"] = {"file": "last.png", "subfolder": ""}
+    pr = build(p).prompt
+    check_wiring(pr)
+    shots = {v["inputs"]["shot_id"]: v["inputs"] for v in pr.values() if v["class_type"] == "MiniMaxH3TimelineShot"}
+    k = len(gb.active_cast(p))
+    sa, sb = shots[a["id"]], shots[b["id"]]
+    assert pr[sa["end_image"][0]]["inputs"]["image"] == "join.png" and "start_image" not in sa
+    assert pr[sb["start_image"][0]]["inputs"]["image"] == "join.png"
+    assert sa["text"].endswith(f"The shot ends on <Picture {k + 1}>.")
+    assert sb["text"].startswith(f"The shot begins from <Picture {k + 1}>.")
+    last = [s for s in gen][-1]
+    sl = shots[last["id"]]
+    assert pr[sl["end_image"][0]]["inputs"]["image"] == "last.png"
+    # a locked (rendered) Shot loads its take: no anchors sent for it
+    a["lock"] = "s1__1722__fc96d2a8.safetensors"
+    pr2 = build(p).prompt
+    s2 = {v["inputs"]["shot_id"]: v["inputs"] for v in pr2.values() if v["class_type"] == "MiniMaxH3TimelineShot"}
+    assert "end_image" not in s2[a["id"]] and "The shot ends on" not in s2[a["id"]]["text"]
+
+
+def test_context_shot_is_a_cut_with_the_frame_before_as_a_picture():
+    p = sample()
+    gen = [s for s in p["shots"] if s.get("kind") != "clip" and not s.get("bypassed")]
+    for s in p["shots"]:
+        s.pop("lock", None); s.pop("take", None)
+    b = gen[1]
+    b["join"] = "context"
+    b["anchor_in"] = {"file": "join.png", "subfolder": ""}
+    b["context_image"] = {"file": "s1__5__aa_last.png", "subfolder": "longshot/x/context"}
+    pr = build(p).prompt
+    check_wiring(pr)
+    shots = {v["inputs"]["shot_id"]: v["inputs"] for v in pr.values() if v["class_type"] == "MiniMaxH3TimelineShot"}
+    sb = shots[b["id"]]
+    k = len(gb.active_cast(p))
+    assert sb["join"] == "cut"
+    assert pr[sb["context_image"][0]]["inputs"]["image"] == "longshot/x/context/s1__5__aa_last.png"
+    assert sb["text"].startswith(f"<Picture {k + 2}> is a reference for the characters, objects and "
+                                 "surroundings only."), "after the start anchor"
+    assert "continuity" not in sb["text"] and "last frame" not in sb["text"]
+    assert f"does not begin from <Picture {k + 2}>" in sb["text"]
+    assert f"The shot begins from <Picture {k + 1}>." in sb["text"]
+    # its own retention line: weak_reference (Long Shot 1.6.9)
+    assert sb["retention"].startswith(f"<Picture {k + 2}> (reference for [Shot 1]): weak_reference - ")
+    others = [v for sid, v in shots.items() if sid != b["id"]]
+    assert all("retention" not in v for v in others)
+    # an older Long Shot without the input: no retention line, the wording still applies
+    old_env = gb.Env(shot_inputs={"start_image", "end_image", "context_image"})
+    sb_old = {v["inputs"]["shot_id"]: v["inputs"] for v in build(p, env=old_env).prompt.values()
+              if v["class_type"] == "MiniMaxH3TimelineShot"}[b["id"]]
+    assert "retention" not in sb_old and "does not begin from" in sb_old["text"]
+    # a Continuous Shot never takes it, even if one is sent
+    b["join"] = "bridge"
+    sb2 = {v["inputs"]["shot_id"]: v["inputs"] for v in build(p).prompt.values()
+           if v["class_type"] == "MiniMaxH3TimelineShot"}[b["id"]]
+    assert "context_image" not in sb2 and sb2["join"] == "bridge"
+
+
+def _voices(p, n=2):
+    cast = gb.active_cast(p)
+    p["voices"] = [{"id": f"v{i + 1}", "label": f"<voice {i + 1}>", "file": f"voice{i + 1}.wav",
+                    "subfolder": "longshot/x", "start": 1.5 * i, "length": 4, "bypassed": False}
+                   for i in range(n)]
+    cast[0]["voice"] = "v1"
+    if len(cast) > 1:
+        cast[1]["voice"] = "v2"
+    return cast
+
+
+def test_voice_references_are_audio_after_the_songs_vocals():
+    p = sample()
+    p["audio"].update(lip_sync=False, voice_ref=False, final_override=False)
+    cast = _voices(p)
+    b = build(p)
+    pr = b.prompt
+    check_wiring(pr)
+    ls = pr["longshot"]["inputs"]
+    loaders = {k: pr[ls[k][0]]["inputs"] for k in ls if k.startswith("ref_audios.")}
+    assert sorted(loaders) == ["ref_audios.ref_audio_0", "ref_audios.ref_audio_1"]
+    assert pr[loaders["ref_audios.ref_audio_0"]["audio"][0]]["inputs"]["audio"] == "longshot/x/voice1.wav"
+    assert loaders["ref_audios.ref_audio_1"]["start_index"] == 1.5 and loaders["ref_audios.ref_audio_1"]["duration"] == 4
+    subj = [v["inputs"] for v in pr.values() if v["class_type"] == "MiniMaxH3Subject"]
+    assert subj[0]["role_2"] == "voice timbre" and subj[0]["reference_2"] == "<Audio 1>"
+    assert subj[1]["reference_2"] == "<Audio 2>"
+    assert all(x["role_2"] == "-" for x in subj[2:])
+    ret = pr["builder"]["inputs"]["retention_analysis"]
+    assert f"<Audio 1> (voice timbre of {cast[0]['label']}): reference - " in ret
+    assert ret.startswith(p["style"]["retention"].strip())
+    assert {"LoadAudio", "TrimAudioDuration"} <= set(gb.required_classes(p))
+    # the song's vocals come first when Voice reference is on
+    p["audio"].update(voice_ref=True, file="song.mp3")
+    pr = build(p).prompt
+    subj = [v["inputs"] for v in pr.values() if v["class_type"] == "MiniMaxH3Subject"]
+    assert subj[0]["reference_2"] == "<Audio 2>" and subj[1]["reference_2"] == "<Audio 3>"
+    trim = pr[pr["longshot"]["inputs"]["ref_audios.ref_audio_2"][0]]["inputs"]
+    assert pr[trim["audio"][0]]["inputs"]["audio"] == "longshot/x/voice2.wav"
+
+
+def test_bypassed_voice_drops_its_link_and_the_limit_is_three():
+    p = sample()
+    p["audio"].update(lip_sync=False, voice_ref=False, final_override=False)
+    _voices(p)
+    p["voices"][0]["bypassed"] = True
+    pr = build(p).prompt
+    subj = [v["inputs"] for v in pr.values() if v["class_type"] == "MiniMaxH3Subject"]
+    assert subj[0]["role_2"] == "-" and subj[1]["reference_2"] == "<Audio 1>"
+    p["voices"][0]["bypassed"] = False
+    p["audio"].update(voice_ref=True, file="song.mp3")
+    p["voices"].append({"id": "v3", "label": "x", "file": "v3.wav", "subfolder": ""})
+    with pytest.raises(gb.BuildError, match="at most 3 reference audios"):
+        build(p)
+
+
+def test_turbo_falls_back_to_the_stock_lora_loader_without_its_pack():
+    env = gb.Env(classes=(set(gb.required_classes(sample())) - {"MiniMaxH3TurboLoRA"}) | {"LoraLoaderModelOnly"})
+    b = build(sample(), env=env)
+    check_wiring(b.prompt)
+    t = b.prompt["turbo"]
+    assert t["class_type"] == "LoraLoaderModelOnly" and t["inputs"]["strength_model"] == 1.0
+    assert any("stock loader" in w for w in b.warnings)
+
+
+def test_refmod_cards_load_through_load_h3_refmods_and_are_subjects():
+    p = sample()
+    p["audio"].update(lip_sync=False, voice_ref=False, final_override=False)
+    n = len(gb.active_cast(p))
+    p["refmods"] = [{"id": "m1", "name": "luma_v2", "kind": "image", "label": "<Luma>", "desc": "the plush", "strength": 0.8},
+                    {"id": "m2", "name": "narrator", "kind": "audio", "label": "<Narr>", "desc": "", "strength": 1},
+                    {"id": "m3", "name": "off", "kind": "image", "label": "<Off>", "bypassed": True}]
+    b = build(p)
+    pr = b.prompt
+    check_wiring(pr)
+    ld = pr["refmods"]["inputs"]
+    assert pr["refmods"]["class_type"] == "MiniMaxH3RefModsLoader"
+    assert (ld["mod_1"], ld["strength_1"], ld["mod_2"], ld["mod_3"]) == ("luma_v2", 0.8, "narrator", "(none)")
+    assert pr["longshot"]["inputs"]["refmods"] == ["refmods", 0]
+    assert gb.refmod_labels(p) == [f"<Picture {n + 1}>", "<Audio 1>"]
+    subs = [v["inputs"] for v in pr.values() if v["class_type"] == "MiniMaxH3Subject"]
+    assert {"label": "<Luma>", "reference": f"<Picture {n + 1}>", "role": "appearance"}.items() <= subs[-2].items()
+    assert subs[-1]["role"] == "voice timbre" and subs[-1]["reference"] == "<Audio 1>"
+    assert "MiniMaxH3RefModsLoader" in gb.required_classes(p)
