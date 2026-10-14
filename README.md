@@ -5,7 +5,7 @@ ComfyUI at `/longshot`. Build a film from short Shots, review and approve each o
 Studio stitches them into one continuous take or a cut sequence. Approved work is never
 thrown away.
 
-<img width="2166" height="1493" alt="H3 Long Shot Studio" src="https://github.com/user-attachments/assets/543bc5fd-05bf-45dd-9557-f36327e8c935" />
+<img width="2239" height="1331" alt="image" src="https://github.com/user-attachments/assets/1ae2f7b5-cfe0-4e43-838a-c86b78ac4f80" />
 
 ## Features
 
@@ -46,38 +46,25 @@ Needs H3 Long Shot **1.6.11 or later**.
 
 1. No more Video Helper Suite: videos are saved and clips loaded by H3 Long Shot's own nodes, sound by ComfyUI's Load Audio. Only the Prompt Compiler and Long Shot are required now.
 2. Saved videos still carry the workflow (drop one on ComfyUI to reopen it). No PNG or silent copy is written next to them any more.
+3. RefMod cards: a row in Cast & Scenes for saved RefMods (characters, styles, motions), each with its own label and subject line.
+4. Fewer dependencies: KJNodes and MelBandRoFormer are no longer needed; the default scheduler is ComfyUI's own `beta`.
+5. Turbo, RTX upscaling and RefMods are optional, with a **Click to install** button where each is used.
+6. A Shot's prompt can be edited while it renders; the card flags that the take was made with the old text.
 
-## What's new in 0.8.6
-
-1. RefMod cards: a row in Cast & Scenes for saved RefMods (characters, styles, motions), each with its own label and subject line.
-2. Fewer dependencies: KJNodes and MelBandRoFormer are no longer needed; the default scheduler is ComfyUI's own `beta`.
-3. Turbo, RTX upscaling and RefMods are optional, with a **Click to install** button where each is used.
-4. A Shot's prompt can be edited while it renders; the card flags that the take was made with the old text.
-
-## What's new in 0.8.5
-
-Needs H3 Long Shot **1.6.10 or later**.
+## Features from previous versions
 
 1. Whole-film decodes (Update preview, Upscale final, ProRes master) run one continuous run at a time, split only at Cut and Context joins. Still one video file; RAM now limits the longest unbroken run, not the film.
 2. Before decoding, the Studio checks each run fits in RAM and names the Shots if one doesn't.
 3. Up to 256 Shots per project (was 64).
 4. ⇅ in the Shots header flips the list: newest Shot on top (remembered per browser).
-
-## What's new in 0.8.4
-
-1. Open output folder opens Approved_Clips, with the focused Shot's clip selected (before any export: the latest video or the clips folder).
-2. Rest the mouse on the Retention field to see the markers it takes (fully_preserved, weak_reference, fully_copy…).
-3. While the queue has work, the ComfyUI machine stays awake, and the Studio tab keeps its screen on.
-
-## What's new in 0.8.3
-
-Needs H3 Long Shot **1.6.9 or later**.
-
-1. Context Shots open on a new angle: the frame before is a reference only, never a starting frame.
-2. The join chip offers what exists next to the Shot, with Continuous as the default, so Render all chains Shots (and frame anchors) from the start.
-3. ▶ on one Shot pins it to the approved Shots next to it; with none approved it renders on its own.
-4. Render all shows which Shot is sampling, which are up next, and which are done.
-5. Audio references in Cast & Scenes. Link one to a picture in its editor: "gets its voice timbre from <Audio N>".
+5. Open output folder opens Approved_Clips, with the focused Shot's clip selected (before any export: the latest video or the clips folder).
+6. Rest the mouse on the Retention field to see the markers it takes (fully_preserved, weak_reference, fully_copy…).
+7. While the queue has work, the ComfyUI machine stays awake, and the Studio tab keeps its screen on.
+8. Context Shots open on a new angle: the frame before is a reference only, never a starting frame.
+9. The join chip offers what exists next to the Shot, with Continuous as the default, so Render all chains Shots (and frame anchors) from the start.
+10. ▶ on one Shot pins it to the approved Shots next to it; with none approved it renders on its own.
+11. Render all shows which Shot is sampling, which are up next, and which are done.
+12. Audio references in Cast & Scenes. Link one to a picture in its editor: "gets its voice timbre from <Audio N>".
 
 ## Requirements
 
