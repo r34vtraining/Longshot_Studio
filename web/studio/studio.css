@@ -751,3 +751,38 @@ textarea.fit { resize: none; overflow: hidden; line-height: 1.5; }
 .addtile.refmod-add.install:hover { background: transparent; border-color: var(--line-2); color: #C9B6FF; }
 .cast-break { grid-column: 1 / -1; height: 0; margin: -4px 0; }
 .refmod-card input[type=number] { background: var(--field); border: 1px solid var(--field-line); border-radius: 6px; color: var(--text); padding: 3px 6px; font-size: 12px; }
+
+/* 0.8.8: timeline zoom and scroll. Everything inside .tl-canvas is placed in % of the
+   film, so the scrub bar, loop band, blocks and playhead stay in step at any zoom. */
+.tl-view { position: relative; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; cursor: default;
+  overscroll-behavior-x: contain; }
+.tl-view::-webkit-scrollbar { display: none; }
+.tl-view.panning, .tl-view.panning * { cursor: grabbing !important; }
+.tl-canvas { position: relative; min-width: 100%; padding-top: 18px; padding-bottom: 2px; }
+.tl-canvas .loop-band { top: 20px; height: 18px; }
+.tl-ruler { position: absolute; left: 0; right: 0; top: 0; height: 17px; border-bottom: 1px solid var(--line-2);
+  cursor: pointer; user-select: none; }
+.tl-rt { position: absolute; bottom: 0; width: 1px; height: 4px; background: var(--line-3); pointer-events: none; }
+.tl-rt.major { height: 8px; background: var(--line-4); }
+.tl-rl { position: absolute; top: 0; padding-left: 3px; font-family: var(--mono); font-size: 10px; line-height: 10px;
+  color: var(--muted); white-space: nowrap; pointer-events: none; }
+.tl-rl.sub { color: var(--dim); }
+.tl-head { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--amber);
+  pointer-events: none; z-index: 6; opacity: .9; }
+.tl-head::before { content: ""; position: absolute; top: 0; left: -4px; border: 5px solid transparent;
+  border-top-color: var(--amber); border-bottom: 0; }
+.tl-head[hidden] { display: none; }
+.tl-block.narrow:hover, .tl-block.narrow:focus-within { width: 76px !important; margin-left: var(--pop, 0px); z-index: 5; }
+.tl-block.narrow:hover .tl-pick, .tl-block.narrow:focus-within .tl-pick { box-shadow: 0 4px 14px rgba(0, 0, 0, .6); }
+.tl-sbar { position: relative; height: 6px; margin-top: 6px; border-radius: 3px; background: var(--line-2); cursor: pointer;
+  touch-action: none; }
+.tl-sbar.full { opacity: .45; }
+.tl-sthumb { position: absolute; top: 0; bottom: 0; min-width: 8px; border-radius: 3px; background: var(--line-4); cursor: grab; }
+.tl-sthumb:hover { background: var(--sub); }
+.tl-smark { position: absolute; top: -1px; bottom: -1px; width: 2px; margin-left: -1px; background: var(--amber); pointer-events: none; }
+.tl-num { margin-left: var(--in0, 0px); }
+.tl-takes { left: calc(1px + var(--in0, 0px)); right: calc(1px + var(--in1, 0px)); }
+.tl-block.narrow .tl-num { margin-left: 0; }
+.tl-block.narrow .tl-takes { left: 1px; right: 1px; }
+/* the scrub thumb's centre sits exactly on the playhead (the native thumb is 16px) */
+.tl-canvas #scrub { width: calc(100% + 16px); margin-left: -8px; display: block; }

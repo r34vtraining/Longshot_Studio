@@ -2322,6 +2322,255 @@ function viewURL(f) {
 
 let TL = { exact: false, entries: [], total: 0, sig: "" };
 const PL = { t: 0, playing: false, src: null, k: -1, gapT: 0, gapWall: 0 };
+
+// ---------------------------------------------------------------------------
+// Timeline zoom and scroll. #tl-canvas is the whole film, `z` times the width of
+// #tl-view (z = 1: the whole film fits). Blocks, the scrub bar, the loop band and
+// the playhead are placed in % of the canvas, so they stay in step at any zoom.
+// ---------------------------------------------------------------------------
+
+const TL_MIN_BLOCK = 76;              // px: a thumbnail with ◀ n/m ▶ (narrower blocks pop out on hover)
+const TL_MAX_PX = FPS * 18;           // closest zoom: 18 px per frame
+const TLV = {
+  z: Math.max(1, Number(store("h3studio.tlZoom")) || 1),
+  hold: 0,                            // until then the user steers: don't follow the playhead
+  lastT: -1, focus: null, raf: 0, w: 0,
+};
+const tlView = $("tl-view"), tlCanvas = $("tl-canvas");
+
+const tlFitPx = () => (TL.total > 0 ? (tlView.clientWidth || 1) / TL.total : 1);
+const tlMaxZ = () => Math.max(1, TL_MAX_PX / tlFitPx());
+/** Pixels per second of film at the current zoom. */
+const tlPx = () => (TL.total > 0 ? tlCanvas.offsetWidth / TL.total : 1);
+const tlUser = () => { TLV.hold = performance.now() + 2500; };
+
+/** Zoom to z (1 = whole film), keeping the moment under view-x `ax` where it is. */
+function tlSetZoom(z, ax) {
+  if (!TL.total) return;
+  const w = tlView.clientWidth;
+  if (ax === undefined) ax = w / 2;
+  const t = (tlView.scrollLeft + ax) / tlPx();
+  TLV.z = Math.min(tlMaxZ(), Math.max(1, z));
+  store("h3studio.tlZoom", String(TLV.z));
+  tlCanvas.style.width = Math.round(w * TLV.z) + "px";
+  tlView.scrollLeft = t * tlPx() - ax;
+  layoutTL();
+}
+
+const RULER_FRAMES = [1, 2, 3, 6, 12, 24, 48, 120, 240, 360, 720, 1440, 2880, 7200, 14400];
+
+function rulerLabel(f) {
+  if (f % FPS) return (f % FPS) + "f";
+  const s = f / FPS, m = Math.floor(s / 60);
+  return m + ":" + String(s - m * 60).padStart(2, "0");
+}
+
+/** The ruler, drawn only for the visible part (plus a margin). */
+function drawRuler(px, L, R) {
+  const pf = px / FPS;                               // px per frame
+  const major = RULER_FRAMES.find((f) => f * pf >= 64) || RULER_FRAMES[RULER_FRAMES.length - 1];
+  const minor = RULER_FRAMES.find((f) => f * pf >= 7 && major % f === 0) || major;
+  const end = Math.round(TL.total * FPS);
+  const a = Math.max(0, Math.floor((L - 80) / pf / minor) * minor);
+  const b = Math.min(end, Math.ceil((R + 80) / pf));
+  let h = "";
+  for (let f = a; f <= b; f += minor) {
+    const x = (f * pf).toFixed(1);
+    if (f % major === 0) {
+      h += `<div class="tl-rt major" style="left:${x}px"></div>` +
+        `<div class="tl-rl${f % FPS ? " sub" : ""}" style="left:${x}px">${rulerLabel(f)}</div>`;
+    } else h += `<div class="tl-rt" style="left:${x}px"></div>`;
+  }
+  $("tl-ruler").innerHTML = h;
+}
+
+/** Playhead line, and its mark on the scroll bar. */
+function placeHead(t) {
+  const total = TL.total, head = $("tl-head");
+  head.hidden = !total;
+  if (!total) return;
+  const p = Math.max(0, Math.min(100, (t / total) * 100)) + "%";
+  head.style.left = p;
+  $("tl-smark").style.left = p;
+}
+
+function drawSbar() {
+  const w = tlView.clientWidth, cw = tlCanvas.offsetWidth || w;
+  const th = $("tl-sthumb");
+  th.style.left = (tlView.scrollLeft / cw) * 100 + "%";
+  th.style.width = Math.min(100, (w / cw) * 100) + "%";
+  $("tl-sbar").classList.toggle("full", cw <= w + 1);
+}
+
+/** Size the canvas for the zoom, then the parts that depend on what is visible. */
+function layoutTL() {
+  const w = tlView.clientWidth;
+  if (!w) return;
+  if (TL.total > 0) TLV.z = Math.min(TLV.z, tlMaxZ());
+  const cw = TL.total > 0 ? Math.round(w * TLV.z) : w;
+  if (tlCanvas.style.width !== cw + "px") tlCanvas.style.width = cw + "px";
+  TLV.w = w;
+  const px = tlPx(), L = tlView.scrollLeft, R = L + w;
+  // narrow blocks pop out to full size on hover, centred on their spot, inside the view
+  const byId = new Map(TL.entries.map((e) => [e.id, e]));
+  for (const b of $("tl-strip").children) {
+    const e = byId.get(b.dataset.tl);
+    if (!e) continue;
+    const bw = e.dur * px, narrow = bw < TL_MIN_BLOCK;
+    b.classList.toggle("narrow", narrow);
+    if (narrow) {
+      const x0 = e.start * px;
+      let nl = x0 + bw / 2 - TL_MIN_BLOCK / 2;
+      nl = Math.max(L, Math.min(R - TL_MIN_BLOCK, nl));
+      nl = Math.max(0, Math.min(cw - TL_MIN_BLOCK, nl));
+      b.style.setProperty("--pop", (nl - x0).toFixed(1) + "px");
+    }
+    // a block wider than the view keeps its label and ◀ take ▶ in the visible part
+    let in0 = 0, in1 = 0;
+    if (!narrow) {
+      const x0 = e.start * px, x1 = x0 + bw;
+      in0 = Math.max(0, Math.min(L - x0, bw - TL_MIN_BLOCK));
+      in1 = Math.max(0, Math.min(x1 - R, bw - TL_MIN_BLOCK - in0));
+    }
+    b.style.setProperty("--in0", in0.toFixed(1) + "px");
+    b.style.setProperty("--in1", in1.toFixed(1) + "px");
+  }
+  if (TL.total > 0) drawRuler(px, L, R); else $("tl-ruler").innerHTML = "";
+  drawSbar();
+}
+
+const tlLayoutSoon = () => {
+  if (TLV.raf) return;
+  TLV.raf = requestAnimationFrame(() => { TLV.raf = 0; layoutTL(); });
+};
+
+/** Scroll so time range a..b (seconds) is in view; centred when it has to move. */
+function tlRevealRange(a, b) {
+  if (!TL.total || TLV.z <= 1.0001) return;
+  const px = tlPx(), w = tlView.clientWidth, L = tlView.scrollLeft, pad = Math.min(40, w / 10);
+  const x0 = a * px, x1 = Math.max(b * px, x0 + TL_MIN_BLOCK);
+  if (x0 >= L + pad && x1 <= L + w - pad) return;
+  tlView.scrollLeft = x1 - x0 < w - 2 * pad ? (x0 + x1) / 2 - w / 2 : x0 - pad;
+  tlLayoutSoon();
+}
+
+/** Bring a Shot's block into view. */
+function tlReveal(id) {
+  const e = TL.entries.find((x) => x.id === id);
+  if (e) tlRevealRange(e.start, e.start + e.dur);
+}
+
+/** The view follows the playhead when it moves out of sight (not while the user steers). */
+function tlFollow(t) {
+  if (t === TLV.lastT) return;
+  TLV.lastT = t;
+  if (!TL.total || TLV.z <= 1.0001 || performance.now() < TLV.hold) return;
+  const px = tlPx(), w = tlView.clientWidth, L = tlView.scrollLeft, x = t * px;
+  if (x >= L && x <= L + w - 6) return;
+  tlView.scrollLeft = PL.playing ? x - w * 0.08 : x - w / 2;
+  tlLayoutSoon();
+}
+
+tlView.addEventListener("scroll", tlLayoutSoon, { passive: true });
+if (window.ResizeObserver) {
+  new ResizeObserver(() => {
+    const w = tlView.clientWidth;
+    if (!w || w === TLV.w) return;
+    const t = TL.total ? tlView.scrollLeft / tlPx() : 0;
+    layoutTL();
+    if (TL.total) tlView.scrollLeft = t * tlPx();
+  }).observe(tlView);
+}
+
+// Wheel zooms around the cursor; Shift + wheel (or a sideways swipe) scrolls.
+tlView.addEventListener("wheel", (e) => {
+  if (!TL.total) return;
+  e.preventDefault();
+  tlUser();
+  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? tlView.clientWidth : 1;
+  const dx = e.deltaX * unit, dy = e.deltaY * unit;
+  if (e.shiftKey || Math.abs(dx) > Math.abs(dy)) {
+    tlView.scrollLeft += Math.abs(dx) > Math.abs(dy) ? dx : dy;
+    return;
+  }
+  const r = tlView.getBoundingClientRect();
+  tlSetZoom(TLV.z * Math.exp(-Math.max(-300, Math.min(300, dy)) * 0.0025), e.clientX - r.left);
+}, { passive: false });
+
+// Drag anywhere on the timeline (but the scrub bar and the take arrows) to scroll.
+// A click without dragging still works: a block picks its Shot, the ruler seeks.
+(function tlDrag() {
+  let d = null, swallow = 0;
+  tlView.addEventListener("click", (c) => {
+    if (performance.now() < swallow) { c.stopPropagation(); c.preventDefault(); }
+  }, true);
+  tlView.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 && e.button !== 1) return;
+    if (e.target.closest("#scrub, .tl-arrow")) return;
+    d = { x: e.clientX, s: tlView.scrollLeft, id: e.pointerId, moved: false, ruler: !!e.target.closest("#tl-ruler") };
+    if (e.button === 1) e.preventDefault();
+  });
+  tlView.addEventListener("pointermove", (e) => {
+    if (!d || e.pointerId !== d.id) return;
+    const dx = e.clientX - d.x;
+    if (!d.moved && Math.abs(dx) < 5) return;
+    if (!d.moved) {
+      d.moved = true;
+      tlView.classList.add("panning");
+      try { tlView.setPointerCapture(e.pointerId); } catch (err) { /* gone */ }
+    }
+    tlUser();
+    tlView.scrollLeft = d.s - dx;
+  });
+  const end = (e) => {
+    if (!d || e.pointerId !== d.id) return;
+    const was = d;
+    d = null;
+    tlView.classList.remove("panning");
+    if (was.moved) {
+      swallow = performance.now() + 80;             // the click that follows a drag isn't a pick
+    } else if (was.ruler && e.type === "pointerup" && TL.entries.some((x) => x.src)) {
+      const r = tlView.getBoundingClientRect();
+      if (PL.playing) pausePlayer();
+      tlSeek((tlView.scrollLeft + e.clientX - r.left) / tlPx());
+    }
+  };
+  tlView.addEventListener("pointerup", end);
+  tlView.addEventListener("pointercancel", end);
+})();
+
+// Double-click the ruler: the whole film.
+$("tl-ruler").addEventListener("dblclick", (e) => {
+  e.preventDefault();
+  tlUser();
+  tlSetZoom(1);
+  tlView.scrollLeft = 0;
+});
+
+// The scroll bar: drag the thumb, or press the track to centre the view there.
+(function tlSbarDrag() {
+  const bar = $("tl-sbar"), thumb = $("tl-sthumb");
+  let d = null;
+  bar.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    const r = bar.getBoundingClientRect(), cw = tlCanvas.offsetWidth, w = tlView.clientWidth;
+    if (cw <= w + 1) return;
+    e.preventDefault();
+    tlUser();
+    if (e.target !== thumb) tlView.scrollLeft = ((e.clientX - r.left) / r.width) * cw - w / 2;
+    d = { x: e.clientX, s: tlView.scrollLeft, k: cw / r.width, id: e.pointerId };
+    try { bar.setPointerCapture(e.pointerId); } catch (err) { /* gone */ }
+  });
+  bar.addEventListener("pointermove", (e) => {
+    if (!d || e.pointerId !== d.id) return;
+    tlUser();
+    tlView.scrollLeft = d.s + (e.clientX - d.x) * d.k;
+  });
+  const end = (e) => { if (d && e.pointerId === d.id) d = null; };
+  bar.addEventListener("pointerup", end);
+  bar.addEventListener("pointercancel", end);
+})();
+
 const shotById = (id) => P().shots.find((x) => x.id === id);
 
 /** A take's (or a Clip Shot's trimmed piece's) clip name on disk. */
@@ -2680,6 +2929,8 @@ function rowNum(lo, i) {
 function updateTime() {
   const t = PL.playing ? tlTime() : PL.t, total = TL.total;
   $("scrub").value = String(t);
+  placeHead(t);
+  tlFollow(t);
   const e = TL.entries[entryAt(t)];
   $("tc-overlay").textContent = (e ? "S" + numOf(e.id) + " · " : "") + fmt(t);
   $("tc-label").textContent = fmt(t) + " / " + fmt(total);
@@ -2694,6 +2945,7 @@ function focusShot(id) {
   renderShots();
   renderDecision();
   renderViewer();
+  tlReveal(id);
 }
 
 /** (Re)load the timeline: at time `at`, or at the start of Shot focusId. */
@@ -3621,6 +3873,8 @@ function renderViewer() {
   }
   $("download").toggleAttribute("disabled", !hasFile);
   $("download").hidden = S.local || !hasFile;
+  layoutTL();
+  if (S.focus !== TLV.focus) { TLV.focus = S.focus; if (S.focus) tlReveal(S.focus); }
   updateTime();
 }
 
@@ -4323,7 +4577,11 @@ document.addEventListener("click", async (e) => {
     }
     case "play": togglePlay(); break;
     case "step": stepFrame(+el.dataset.dir); break;
-    case "jump": { const L = loopRange(); if (L) { if (PL.playing) pausePlayer(); tlSeek(TL.entries[L.i].start + 0.04); } break; }
+    case "jump": {
+      const L = loopRange();
+      if (L) { if (PL.playing) pausePlayer(); TLV.hold = 0; tlSeek(TL.entries[L.i].start + 0.04); tlReveal(L.shot.id); }
+      break;
+    }
     case "loop": {
       const L = loopRange();
       S.loop = !S.loop && !!L;
@@ -4332,7 +4590,7 @@ document.addEventListener("click", async (e) => {
       break;
     }
     case "tl-pick": { const b = el.closest("[data-tl]"); if (b) focusShot(b.dataset.tl); break; }
-    case "tl-take": { const b = el.closest("[data-tl]"); const sh = b && shotById(b.dataset.tl); if (sh) { S.focus = sh.id; stepTake(sh, +el.dataset.dir); } break; }
+    case "tl-take": { const b = el.closest("[data-tl]"); const sh = b && shotById(b.dataset.tl); if (sh) { S.focus = sh.id; stepTake(sh, +el.dataset.dir); tlReveal(sh.id); } break; }
     case "update-preview": updatePreview(); break;
     case "make-clips": makeMissingClips(missingClips().length ? missingClips() : takesWithoutClips()); break;
     case "clear-all": clearAll(); break;

@@ -5,8 +5,7 @@ ComfyUI at `/longshot`. Build a film from short Shots, review and approve each o
 Studio stitches them into one continuous take or a cut sequence. Approved work is never
 thrown away.
 
-<img width="2232" height="1386" alt="image" src="https://github.com/user-attachments/assets/faa39e5f-7389-4537-b0d9-f64c5e595a38" />
-
+<img width="2166" height="1493" alt="H3 Long Shot Studio" src="https://github.com/user-attachments/assets/543bc5fd-05bf-45dd-9557-f36327e8c935" />
 
 ## Features
 
@@ -22,7 +21,7 @@ thrown away.
 - Optional song-driven lip sync.
 
 **Edit**
-- A timeline with one block per Shot: switch takes instantly, loop the seam, approve or
+- A zoomable timeline with one block per Shot: switch takes instantly, loop the seam, approve or
   reroll any Shot **in place** while its neighbours keep their takes.
 - Insert, bypass or remove Shots anywhere, including before Shot 1.
 - Drop in real video clips as Shots, bridged into the generated footage or hard-cut.
@@ -33,13 +32,27 @@ thrown away.
 - Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
 
+## What's new in 0.8.8
+
+1. Zoom the timeline with the mouse wheel, around the cursor, from the whole film down to single frames.
+2. Shift + wheel, dragging the timeline, or the thin scroll bar under it scrolls sideways.
+3. A time ruler above the Shots (frame ticks when zoomed in). Click it to seek; double-click it to see the whole film.
+4. Narrow Shot blocks pop out to full size on hover, so the ◀ take ▶ arrows can always be clicked.
+5. The view follows the playhead, and scrolls to a Shot when you pick it (card, Jump to Shot, take arrows). The zoom is remembered per browser.
+
 ## What's new in 0.8.7
 
 Needs H3 Long Shot **1.6.11 or later**.
 
+1. No more Video Helper Suite: videos are saved and clips loaded by H3 Long Shot's own nodes, sound by ComfyUI's Load Audio. Only the Prompt Compiler and Long Shot are required now.
+2. Saved videos still carry the workflow (drop one on ComfyUI to reopen it). No PNG or silent copy is written next to them any more.
+
+## What's new in 0.8.6
+
 1. RefMod cards: a row in Cast & Scenes for saved RefMods (characters, styles, motions), each with its own label and subject line.
 2. Fewer dependencies: KJNodes and MelBandRoFormer are no longer needed; the default scheduler is ComfyUI's own `beta`.
 3. Turbo, RTX upscaling and RefMods are optional, with a **Click to install** button where each is used.
+4. A Shot's prompt can be edited while it renders; the card flags that the take was made with the old text.
 
 ## What's new in 0.8.5
 

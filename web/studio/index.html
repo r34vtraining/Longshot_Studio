@@ -126,10 +126,17 @@
       </div>
       <div class="vcontrols" id="vcontrols">
       <div class="scrub" id="scrub-wrap">
-        <div id="loop-band" class="loop-band" hidden></div>
-        <div id="ticks"></div>
-        <input type="range" id="scrub" aria-label="Scrub" min="0" max="0" step="0.01" value="0">
-        <div id="tl-strip" class="tl-strip" aria-label="Timeline: one block per Shot"></div>
+        <div id="tl-view" class="tl-view" title="Wheel: zoom · Shift + wheel or drag: scroll · double-click the ruler: whole film">
+          <div id="tl-canvas" class="tl-canvas">
+            <div id="tl-ruler" class="tl-ruler" aria-hidden="true"></div>
+            <div id="loop-band" class="loop-band" hidden></div>
+            <div id="ticks"></div>
+            <input type="range" id="scrub" aria-label="Scrub" min="0" max="0" step="0.01" value="0">
+            <div id="tl-strip" class="tl-strip" aria-label="Timeline: one block per Shot"></div>
+            <div id="tl-head" class="tl-head" aria-hidden="true"></div>
+          </div>
+        </div>
+        <div id="tl-sbar" class="tl-sbar" aria-hidden="true"><div id="tl-sthumb" class="tl-sthumb"></div><div id="tl-smark" class="tl-smark"></div></div>
         <div id="tl-approx" class="tl-approx" hidden>
           <span id="tl-approx-main"><span title="Takes that were never rendered side by side are shown from the renders that made them, so the joins between them can jump slightly.">Approximate joins</span>
           · <button class="linkbtn" data-action="update-preview" id="tl-update" title="Decode every rendered Shot together for the exact video. Nothing is sampled.">Update preview</button></span>
