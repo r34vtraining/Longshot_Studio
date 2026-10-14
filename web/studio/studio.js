@@ -36,7 +36,7 @@ function store(key, value) {           // browser storage: conveniences only
 function applyFolds() {
   let f = {};
   try { f = JSON.parse(store("h3studio.folds") || "{}") || {}; } catch (e) { f = {}; }
-  for (const k of ["plan", "queue"]) {
+  for (const k of ["plan", "queue", "cast"]) {
     const panel = document.getElementById(k + "-panel"), btn = panel && panel.querySelector("[data-fold]");
     if (!panel) continue;
     panel.classList.toggle("folded", !!f[k]);
@@ -117,6 +117,8 @@ function normalize(p) {
     subfolder: v.subfolder || "", type: "input", original_name: v.original_name || v.file || "",
     sha256: v.sha256 || null, size_bytes: v.size_bytes ?? null, start: Math.max(0, Number(v.start) || 0),
     length: Math.max(0, Number(v.length) || 0), bypassed: !!v.bypassed }));
+  p.ref_sets = p.ref_sets && typeof p.ref_sets === "object" ? p.ref_sets : {};      // 0.8.13: restore references
+  p.take_refs = p.take_refs && typeof p.take_refs === "object" ? p.take_refs : {};
   p.style = Object.assign({ summary: "", retention: "", style_line: "", soundscape: "", music: "N/A",
     task_types: ["reference generation"] }, p.style || {});
   p.shots = (p.shots || []).map((s) => ({ id: s.id || uid("s"), text: s.text || "",
@@ -1657,6 +1659,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
   if (S.busy) return;
   if (Object.keys(S.uploading).length) { toast("Wait for the image upload to finish."); return; }
   S.error = null;
+  if (comfyTooOld()) { S.error = comfyTooOldText(); render(); return; }
   const missing = kind === "clips" || kind === "export" ? [] : missingRefs();
   if (missing.length) {
     S.error = `${missing.length} reference${missing.length > 1 ? "s are" : " is"} missing — relink or bypass ${missing.length > 1 ? "them" : "it"}.`;
@@ -1725,7 +1728,9 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
   if (fresh.length) toast(fresh.join(" "));
   let res;
   try {
-    res = await api("/prompt", { method: "POST", body: { prompt: built.prompt, client_id: CLIENT_ID } });
+    await pushLive();
+    res = await api("/prompt", { method: "POST", body: { prompt: built.prompt, client_id: CLIENT_ID,
+      extra_data: { preview_method: queuePreviewMethod() } } });
   } catch (e) {
     undoSeeds();
     S.error = describeQueueError(e);
@@ -1740,6 +1745,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
     promptId: res.prompt_id, kind, target, label, note, baseNote: note, built, onDone, sent, batch, standalone, extra,
     jobId, slug: P().slug, project: P().name,
     of: built.chain.length, segs: {}, segT0: {}, step: 0, phase: "queued", started: Date.now(),
+    refs: refSnapshot(),                             // the references these takes are made with
   };
   if (kind === "render" || kind === "reroll") S.open = target;
   render();
@@ -1790,6 +1796,12 @@ async function finish(promptId, entry) {
     }
   }
   S.busy = null;
+  clearLive();
+  if (b.kind === "render" || b.kind === "reroll") {
+    const sh = b.target && P() && P().shots.find((x) => x.id === b.target);
+    VIEW.done = sh ? titleOf(sh) : (b.label || "Render");
+  }
+  renderMini();
   let res = {};
   try {
     // the run's own project, whichever is open now
@@ -1857,6 +1869,7 @@ async function finishIn(b, promptId, entry) {
     if (entry && !failed && b.kind !== "final") {
       await fetchAllTakes();
       const lo = last();
+      recordTakeRefs(b, lo);
       if (b.built.nodes.clips && lo) {
         // each new take's own clip: named after its take
         const items = Object.entries(b.built.nodes.clips).map(([sid, node]) => {
@@ -2218,6 +2231,7 @@ function connect() {
   try { ws = new WebSocket(url); } catch (e) { return retry(); }
   ws.onopen = () => {
     S.conn = "ok";
+    pushLive();
     if (S.restarting) afterRestart();
     renderHeader(); renderDecision();
     if (P()) renderShots();                     // ▶ on Shot cards follows the connection
@@ -2228,7 +2242,7 @@ function connect() {
   ws.onclose = () => { S.conn = S.restarting ? "restarting" : "down"; renderHeader(); renderDecision(); renderQueue(); if (P()) renderShots(); retry(); };
   ws.onerror = () => {};
   ws.onmessage = (ev) => {
-    if (typeof ev.data !== "string") return;          // binary previews
+    if (typeof ev.data !== "string") { onPreviewBytes(ev.data); return; }   // step previews
     let msg;
     try { msg = JSON.parse(ev.data); } catch (e) { return; }
     onMessage(msg.type, msg.data || {});
@@ -2247,7 +2261,12 @@ function onMessage(type, d) {
       if (d.node === b.built.nodes.combine || d.node === "decode") b.phase = "saving";
       break;
     case "progress":
-      if (d.node === b.built.nodes.longshot || d.node === undefined) b.step = d.max ? d.value / d.max : 0;
+      if (d.node === b.built.nodes.longshot || d.node === undefined) {
+        b.step = d.max ? d.value / d.max : 0;
+        b.stepV = d.value;
+        b.stepMax = d.max;
+        syncLive();
+      }
       break;
     case "mmh3.longshot": onSegment(b, d); if (b.slug === (P() && P().slug)) refreshRunRows(b); break;
     case "execution_success": case "execution_error": case "execution_interrupted":
@@ -2256,6 +2275,7 @@ function onMessage(type, d) {
   }
   renderDecision();
   renderQueue();
+  renderMini();
 }
 
 function onSegment(b, d) {
@@ -2263,6 +2283,7 @@ function onSegment(b, d) {
   b.segs[d.segment] = d.status;
   if (d.status === "reused") (b.sources = b.sources || {})[d.segment] = d.source || "memory";
   if (d.status === "rendering") { b.segT0[d.segment] = Date.now(); b.step = 0; b.current = d; }
+  if (d.status === "done" && d.id) (b.doneIds = b.doneIds || new Set()).add(d.id);   // new takes this run
   if (d.status === "done" && b.segT0[d.segment] && d.seconds && b.slug === P().slug) {
     const rate = (Date.now() - b.segT0[d.segment]) / 1000 / d.seconds;   // wall s per video s
     const st = P().stats;
@@ -2279,6 +2300,275 @@ function onSegment(b, d) {
       : `Shots ${reused[0]}–${reused[reused.length - 1]} reused from ${from} · `) : "";
     b.note = `${r}Shot ${cur} of ${b.of} rendering`;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Live preview (0.8.10): while a Shot renders, ComfyUI's step previews show on
+// the review screen. The Studio asks for them per render (extra_data
+// preview_method): the sharp taeh3 decoder when it's installed, else ComfyUI's
+// rough colour preview. Off: "none", so the render spends nothing on them.
+// ---------------------------------------------------------------------------
+
+const LIVE = { on: store("h3studio.livePreview") === "1", url: null, prompt: null };
+
+// The preview panel can hide down to one status line (0.8.13). Live preview pauses
+// while it's hidden, and comes back when it's shown only if it was switched on.
+const VIEW = { hidden: store("h3studio.viewerHidden") === "1", done: null };
+
+function livePreviewMethod() {
+  if (!LIVE.on || VIEW.hidden) return "none";
+  return S.opts && S.opts.preview_decoder ? "taesd" : "latent2rgb";
+}
+
+/** Long Shot 1.6.13+ reads the switch at every step: ComfyUI's own previews stay
+ *  off for the Studio's renders and Long Shot makes them while the switch is on. */
+const liveSwitch = () => !!(S.opts && S.opts.live_switch);
+
+/** What a render asks ComfyUI for (extra_data.preview_method). */
+const queuePreviewMethod = () => (liveSwitch() ? "none" : livePreviewMethod());
+
+/** Tell Long Shot this tab's switch (now, so a running render follows from its next step). */
+async function pushLive() {
+  if (!liveSwitch() || S.conn !== "ok") return;
+  try {
+    await api("/longshot/live-preview", { method: "POST", body: { client_id: CLIENT_ID, method: livePreviewMethod() } });
+  } catch (e) { /* older Long Shot or ComfyUI restarting: the next render sends it again */ }
+}
+
+/** H3 Long Shot is at least version a.b.c. */
+function longshotAtLeast(...want) {
+  const v = String((S.opts || {}).longshot_version || "0").split(".").map(Number);
+  for (let i = 0; i < want.length; i++) { if ((v[i] || 0) !== want[i]) return (v[i] || 0) > want[i]; }
+  return true;
+}
+
+/** Previews made behind the render (no wait for the GPU): rough from Long Shot 1.6.14,
+ *  sharp from 1.6.15. Older versions measured 30-40% slower with the model partly in VRAM. */
+function liveCostNote() {
+  const sharp = !!(S.opts && S.opts.preview_decoder);
+  return (sharp ? longshotAtLeast(1, 6, 15) : longshotAtLeast(1, 6, 14))
+    ? "It runs behind the render, so it costs no measurable speed (a little extra VRAM)."
+    : "With this H3 Long Shot it can slow renders by 30–40% when the model doesn't fully fit in VRAM; update H3 Long Shot to 1.6.15.";
+}
+
+function renderLiveToggle() {
+  const sharp = !!(S.opts && S.opts.preview_decoder);
+  $("live-preview").checked = LIVE.on;
+  $("live-wrap").classList.toggle("on", LIVE.on);
+  $("live-wrap").title = "Show the picture forming on this screen while a Shot renders. " + liveCostNote() + " " +
+    (liveSwitch() ? "Takes effect at the next step, also mid-render. " : "Takes effect from the next render (update H3 Long Shot to 1.6.13 to switch mid-render). ") +
+    (sharp ? "Quality: sharp (taeh3 decoder installed)." : "Quality: rough colours. Settings → Live preview quality installs the sharper decoder.");
+}
+
+/** A step preview from ComfyUI's socket: [event u32][image type u32][jpeg|png] (event 1),
+ *  or [event 4][meta length u32][meta json][image] (newer clients). */
+async function onPreviewBytes(blob) {
+  const b = S.busy;
+  if (!LIVE.on || !b || !b.promptId || !blob || blob.size < 9) return;
+  const head = new DataView(await blob.slice(0, 8).arrayBuffer());
+  const ev = head.getUint32(0);
+  let img;
+  if (ev === 1) img = blob.slice(8, blob.size, head.getUint32(4) === 2 ? "image/png" : "image/jpeg");
+  else if (ev === 4) {
+    const n = head.getUint32(4);
+    let meta = {};
+    try { meta = JSON.parse(await blob.slice(8, 8 + n).text()); } catch (e) { /* no meta */ }
+    if (meta.prompt_id && meta.prompt_id !== b.promptId) return;
+    img = blob.slice(8 + n, blob.size, meta.image_type || "image/jpeg");
+  } else return;
+  if (S.busy !== b) return;                         // finished meanwhile
+  if (LIVE.url) URL.revokeObjectURL(LIVE.url);
+  LIVE.url = URL.createObjectURL(img);
+  LIVE.prompt = b.promptId;
+  $("live-img").src = LIVE.url;
+  syncLive();
+}
+
+/** Show the preview while this project's render runs and the player isn't playing. */
+function syncLive() {
+  const b = S.busy;
+  const show = LIVE.on && !!LIVE.url && !!b && b.promptId === LIVE.prompt && !PL.playing &&
+    (!b.slug || !P() || b.slug === P().slug);
+  $("live-img").hidden = !show;
+  $("live-label").hidden = !show;
+  if (show) {
+    const seg = b.current && b.current.segment;
+    $("live-label").textContent = "Live" + (seg ? ` · Shot ${seg}${b.of ? " of " + b.of : ""}` : "") +
+      (b.stepMax ? ` · step ${b.stepV}/${b.stepMax}` : "");
+  }
+}
+
+function clearLive() {
+  if (LIVE.url) URL.revokeObjectURL(LIVE.url);
+  LIVE.url = LIVE.prompt = null;
+  $("live-img").removeAttribute("src");
+  syncLive();
+}
+
+function setLive(on) {
+  LIVE.on = !!on;
+  store("h3studio.livePreview", LIVE.on ? "1" : "0");
+  pushLive();
+  if (LIVE.on) {
+    toast(`Live preview on: the picture forms on the review screen from the next ${liveSwitch() ? "step" : "render"}. ` +
+      liveCostNote());
+  } else clearLive();
+  renderLiveToggle();
+}
+
+/** Settings: download the sharper preview decoder (taeh3) into models/vae_approx. */
+async function installPreview() {
+  const page = "https://github.com/madebyollin/taehv";
+  if (!S.local) {
+    showModal("Better live preview", "", `<p>On the machine running ComfyUI, download <code>safetensors/taeh3.safetensors</code> from
+      <a href="${page}" target="_blank" rel="noopener">${page}</a> into <code>ComfyUI/models/vae_approx</code>.</p>`);
+    return;
+  }
+  const ok = await confirmBox({ title: "Install the better-quality preview?",
+    body: "Downloads madebyollin's taeh3 decoder (22 MB, MIT licence) into ComfyUI's models/vae_approx folder. " +
+      "Live previews then show close-to-final frames. No restart needed.", yes: "Download", no: "Cancel" });
+  if (!ok) return;
+  toast("Downloading the preview decoder…");
+  try { await api("/longshot/install-preview", { method: "POST" }); }
+  catch (e) {
+    showModal("Better live preview", "", `<p>${esc(e.message)}</p>`);
+    return;
+  }
+  try { S.opts = await api("/longshot/options"); } catch (e) { /* keep */ }
+  toast("Sharper live preview installed.");
+  renderLiveToggle();
+  renderSettings();
+}
+
+// ---------------------------------------------------------------------------
+// Restore references (0.8.13): each take made from now on remembers the references
+// it was rendered with (the live pictures, voices and RefMods). Shared sets are
+// stored once in p.ref_sets; p.take_refs maps a take to its set.
+// ---------------------------------------------------------------------------
+
+const REF_KINDS = [["cast", "picture", "pictures"], ["voices", "voice", "voices"], ["refmods", "RefMod", "RefMods"]];
+
+function refSnapshot(p = P()) {
+  const live = (xs) => JSON.parse(JSON.stringify((xs || []).filter((x) => !x.bypassed)));
+  return { cast: live(p.cast), voices: live(p.voices), refmods: live(p.refmods) };
+}
+
+function refSetKey(set) {
+  const txt = JSON.stringify(set);
+  let h = 2166136261;
+  for (let i = 0; i < txt.length; i++) { h ^= txt.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return "r" + (h >>> 0).toString(36) + txt.length.toString(36);
+}
+
+/** After a render: the takes it made (not the reused ones) remember its references. */
+function recordTakeRefs(b, lo) {
+  if (!b || !b.refs || !b.doneIds || !lo || !lo.plan || !lo.chain) return;
+  const p = P();
+  const key = refSetKey(b.refs);
+  let n = 0;
+  lo.chain.forEach((sid, i) => {
+    const r = lo.plan[i];
+    if (!r || !r.take || !b.doneIds.has(sid)) return;
+    const k = takeStem(r.take);
+    if (p.take_refs[k]) return;
+    p.take_refs[k] = key;
+    n++;
+  });
+  if (n) p.ref_sets[key] = b.refs;
+}
+
+function refSetFor(s) {
+  const p = P(), k = s && s.take ? p.take_refs[takeStem(s.take)] : null;
+  return k ? p.ref_sets[k] || null : null;
+}
+
+const restoreName = (kind, x) => kind === "refmods" ? (x.label || x.name || "RefMod")
+  : (x.label && x.label !== "<new>" ? x.label : (x.original_name || x.image || x.file || "untitled"));
+
+/** Put back the references a Shot's take was made with: removed ones are added again
+ *  (where they were), bypassed ones turned on. Nothing else changes. */
+async function restoreRefs(s) {
+  if (!s || setupGuard()) return;
+  const set = refSetFor(s);
+  if (!set) { toast(`${titleOf(s)}'s take was made before 0.8.13, so the references it used weren't recorded.`); return; }
+  const p = P(), changes = [];
+  for (const [kind, one] of REF_KINDS) {
+    for (const item of set[kind] || []) {
+      const ex = (p[kind] || []).find((x) => x.id === item.id);
+      if (ex && ex.bypassed) changes.push({ how: "on", kind, one, ex, name: restoreName(kind, ex) });
+      else if (!ex) changes.push({ how: "add", kind, one, item, name: restoreName(kind, item) });
+    }
+  }
+  if (!changes.length) { toast(`All of ${titleOf(s)}'s references are already in Cast & Scenes.`); return; }
+  const redo = active().filter((x) => x.kind !== "clip" && x.status === "review");
+  const nApproved = approvedShots().length;
+  const body = `<p>Puts back what ${esc(titleOf(s))}'s take was made with:</p><ul class="restore-refs-list">` +
+    changes.map((c) => `<li>${esc(c.one)} <b>${esc(c.name)}</b> · ${c.how === "on" ? "turned back on" : "added again"}</li>`).join("") +
+    `</ul><p class="muted small" style="margin-top:10px">The labels after them renumber (<code>&lt;Picture N&gt;</code>), so every Shot's prompt changes. ` +
+    (nApproved ? `${nApproved} approved Shot${nApproved > 1 ? "s keep their takes" : " keeps its take"}. ` : "") +
+    (redo.length ? `${redo.map(titleOf).join(", ")} will render again.` : "No Shot under review renders again.") + "</p>";
+  const ok = await confirmBox({ title: "Restore references?", body, html: true, yes: "Restore", no: "Cancel" });
+  if (!ok) return;
+  for (const c of changes) {
+    if (c.how === "on") { c.ex.bypassed = false; continue; }
+    const list = p[c.kind], order = set[c.kind].map((x) => x.id);
+    // after the nearest reference that came before it in the take's set
+    let at = 0;
+    for (let i = order.indexOf(c.item.id) - 1; i >= 0; i--) {
+      const j = list.findIndex((x) => x.id === order[i]);
+      if (j >= 0) { at = j + 1; break; }
+    }
+    list.splice(at, 0, Object.assign(JSON.parse(JSON.stringify(c.item)), { bypassed: false }));
+  }
+  normalize(p);
+  applyRefChange(await askRefChange(), "References restored");
+  commit();
+  toast(`Restored ${changes.length} reference${changes.length > 1 ? "s" : ""} from ${titleOf(s)}'s take.`);
+}
+
+function setViewerHidden(on) {
+  VIEW.hidden = !!on;
+  store("h3studio.viewerHidden", VIEW.hidden ? "1" : "0");
+  if (VIEW.hidden) {
+    if (S.theater) setTheater(false);
+    if (PL.playing) pausePlayer();
+  }
+  applyViewerHidden();
+  pushLive();                                      // hidden: no previews; shown: the switch as it was
+  if (!VIEW.hidden) { layoutStage(); renderViewer(); }
+}
+
+function applyViewerHidden() {
+  $("viewer-panel").classList.toggle("mini", VIEW.hidden);
+  $("viewer-mini").hidden = !VIEW.hidden;
+  if (VIEW.hidden) renderMini();
+}
+
+/** The status line of the hidden preview: rendering / no Shot queued / Shot completed. */
+function renderMini() {
+  if (!VIEW.hidden) return;
+  const b = S.busy, dot = $("vm-dot"), bar = $("vm-bar");
+  let text, pct = null, cls = "";
+  if (b) {
+    const here = !b.slug || !P() || b.slug === P().slug;
+    const seg = b.current && b.current.segment;
+    const sh = b.current && b.current.id ? shotById(b.current.id) : null;
+    const what = sh ? titleOf(sh) : seg ? `Shot ${seg}` : (b.label || "Render");
+    text = b.phase === "queued" ? `${b.label || "Render"} · waiting for ComfyUI`
+      : b.phase === "saving" ? `${what} · saving`
+        : `Rendering ${what}${b.of > 1 && seg ? ` (${seg} of ${b.of})` : ""}` +
+          (b.stepMax ? ` · step ${b.stepV}/${b.stepMax}` : "");
+    if (!here) text += ` · in ${b.project || b.slug}`;
+    pct = progressOf(b);
+    cls = "run";
+  } else if (VIEW.done) {
+    text = `${VIEW.done} completed`;
+    cls = "done";
+  } else text = "No Shot queued";
+  $("vm-text").textContent = text;
+  dot.className = "vm-dot" + (cls ? " " + cls : "");
+  bar.hidden = pct === null;
+  if (pct !== null) $("vm-fill").style.width = Math.max(0, Math.min(100, pct)) + "%";
 }
 
 function progressOf(b) {
@@ -2926,6 +3216,7 @@ function play() {
   else { PL.gapT = PL.t; PL.gapWall = performance.now(); }
   cancelAnimationFrame(rafId);
   rafId = requestAnimationFrame(tick);
+  syncLive();                                      // playing: the player, not the preview
 }
 
 function pausePlayer() {
@@ -2935,6 +3226,7 @@ function pausePlayer() {
   setPlayIcon(false);
   $("play").setAttribute("aria-label", "Play");
   updateTime();
+  syncLive();
 }
 
 function togglePlay() {
@@ -3149,6 +3441,14 @@ function render() {
 
 function renderSaveState() { $("save-state").textContent = S.saveState; }
 
+/** ComfyUI older than 0.35.0: no native H3 guides at any frame, so every render would fail. */
+function comfyTooOld() { return !!(S.opts && S.opts.comfy && S.opts.comfy.ok === false); }
+function comfyTooOldText() {
+  const c = S.opts.comfy;
+  return `This ComfyUI${c.version ? " (" + c.version + ")" : ""} is too old for MiniMax H3 Long Shot: ` +
+    `update ComfyUI to ${c.min} or later, then restart it. (ComfyUI Desktop updates with the app.)`;
+}
+
 function renderHeader() {
   const dot = $("conn-dot");
   const st = S.restarting ? "restarting" : S.conn;
@@ -3170,7 +3470,10 @@ function renderHeader() {
   renderSaveState();
   const missing = S.opts ? CORE_NODES.filter((c) => S.opts.nodes && S.opts.nodes[c] === false) : [];
   const banner = $("banner");
-  if (missing.length) {
+  if (comfyTooOld()) {
+    banner.hidden = false;
+    banner.textContent = comfyTooOldText();
+  } else if (missing.length) {
     banner.hidden = false;
     banner.textContent = "ComfyUI is missing nodes the Studio needs: " +
       missing.map((c) => `${c} (${(S.opts.packs || {})[c] || "core"})`).join(", ") +
@@ -3246,7 +3549,19 @@ function refChoices() {
   return ((S.opts || {}).images || []).map((name) => ({ sub: "", name }));
 }
 
+/** One line for the folded Cast & Scenes panel: "4 pictures · 2 voices · 1 RefMod". */
+function castSummary(p = P()) {
+  const part = (list, one, many) => {
+    const on = (list || []).filter((x) => !x.bypassed).length, off = (list || []).length - on;
+    if (!on && !off) return "";
+    return `${on} ${on === 1 ? one : many}` + (off ? ` (+${off} off)` : "");
+  };
+  return [part(p.cast, "picture", "pictures"), part(p.voices, "voice", "voices"), part(p.refmods, "RefMod", "RefMods")]
+    .filter(Boolean).join(" · ") || "no references yet";
+}
+
 function renderCast() {
+  $("cast-summary").textContent = castSummary();
   let n = 0;
   const choices = refChoices();
   const cards = P().cast.map((c) => {
@@ -3801,6 +4116,9 @@ function renderShots() {
           <span class="push"></span>
           ${!s.bypassed && s.status !== "queued" ? `<button class="ghost sm" data-action="clear-render"${inRender(s) ? " disabled" : ""}
             title="Back to not rendered: keeps the prompt, length and seed. The take stays in Take history.">Clear render</button>` : ""}
+          ${s.kind !== "clip" && s.take ? `<button class="ghost sm" data-action="restore-refs"
+            title="${refSetFor(s) ? "Put back the references this take was made with: removed ones are added again, bypassed ones turned on. Others stay as they are."
+              : "This take was made before 0.8.13, so the references it used weren't recorded."}">Restore references</button>` : ""}
           <button class="ghost sm" data-action="insert-before" title="Insert a new Shot before this one">⊕ Shot before</button>
           <button class="ghost sm" data-action="insert-after" title="Insert a new Shot after this one">⊕ Shot after</button>
           <button class="ghost sm" data-action="insert-clip-after" title="Insert a video clip after this Shot">⊕ Clip after</button>
@@ -3930,6 +4248,8 @@ function renderViewer() {
   $("download").toggleAttribute("disabled", !hasFile);
   $("download").hidden = S.local || !hasFile;
   layoutTL();
+  renderLiveToggle();
+  syncLive();
   if (S.focus !== TLV.focus) { TLV.focus = S.focus; if (S.focus) tlReveal(S.focus); }
   updateTime();
 }
@@ -4241,6 +4561,9 @@ function renderSettings() {
     </div>
     <label class="check-row prores-row${vsrOk ? "" : " off"}"><input type="checkbox" data-outfile="prores_master"${s.prores_master ? " checked" : ""}${vsrOk ? "" : " disabled"}>
       <span>Final video: also save a ProRes master <span class="muted small">· 10-bit ProRes 422 HQ .mov with sound, next to the upscaled MP4 (large files)</span></span></label>
+    <div class="live-q-row"><span>Live preview quality <span class="muted small">· ${o.preview_decoder
+      ? "sharp (taeh3 decoder installed)" : "rough colours"}</span></span>${o.preview_decoder ? ""
+      : `<button class="install-btn" data-action="install-preview">Install better-quality preview</button><span class="muted small">downloads the taeh3 decoder (22 MB) into models/vae_approx</span>`}</div>
     ${P().shots.some((x) => x.kind === "clip" && !x.bypassed) ? `<div class="vsr-row${s.clip_pixels ? "" : " off"}">
       ${switchHTML(!!s.clip_pixels, 'data-action="clip-pixels" aria-label="Original clip pixels in the final video"', true)}
       <div class="vsr-text"><div>Final video: original clip pixels</div>
@@ -4513,6 +4836,10 @@ document.addEventListener("click", async (e) => {
     case "flip-shots": store("h3studio.flipShots", store("h3studio.flipShots") === "1" ? "0" : "1"); renderShots(); break;
     case "add-voice": pickVoices(null); break;
     case "install-pack": installPack(el.dataset.pack); break;
+    case "install-preview": installPreview(); break;
+    case "viewer-hide": setViewerHidden(true); break;
+    case "viewer-show": setViewerHidden(false); break;
+    case "restore-refs": restoreRefs(shotOf(el)); break;
     case "add-refmod": pickRefmod(); break;
     case "use-refmod": {
       $("modal").hidden = true;
@@ -4784,6 +5111,7 @@ document.addEventListener("change", async (e) => {
     return commit();
   }
   if (el.id === "tl-export-up") { p.settings.export_upscale = el.checked; return commit(); }
+  if (el.id === "live-preview") { setLive(el.checked); return; }
   if (el.dataset.anchorFile !== undefined) {
     const k = el.closest("[data-anchor]");
     if (!k || setupGuard()) { render(); return; }
@@ -5606,11 +5934,12 @@ function showModal(title, text, html) {
 // ---------------------------------------------------------------------------
 
 let confirmResolve = null;
-function confirmBox({ title, body, yes = "Continue", no = "Cancel", check = null, alt = null }) {
+function confirmBox({ title, body, yes = "Continue", no = "Cancel", check = null, alt = null, html = false }) {
   return new Promise((resolve) => {
     if (confirmResolve) confirmDone(false);           // only one question at a time
     $("confirm-title").textContent = title;
-    $("confirm-body").textContent = body;
+    if (html) $("confirm-body").innerHTML = body;     // built from escaped text only
+    else $("confirm-body").textContent = body;
     $("confirm-alt").hidden = !alt;                   // a second answer: resolves "alt"
     $("confirm-alt").textContent = alt || "";
     const row = $("confirm-check-row");
@@ -6709,6 +7038,7 @@ async function afterRestart() {
   S.restarting = null;
   S.checkedFor = null;                       // check saved segments again
   try { S.opts = await api("/longshot/options"); } catch (e) { /* keep old lists */ }
+  pushLive();                                // a restarted ComfyUI forgot the switch
   if (P()) { await Promise.all([loadInputs(), checkInputs(), loadSegStats()]); }
   render();
   toast(S.autoRestart ? "ComfyUI restarted after running out of memory. The queue goes on." : "ComfyUI restarted.");
@@ -6750,6 +7080,7 @@ async function start() {
   } catch (e) { S.local = false; }
   document.body.classList.toggle("is-local", S.local);
   try { S.opts = await api("/longshot/options"); } catch (e) { toast("Couldn't read ComfyUI's model lists: " + e.message); }
+  pushLive();
   if (/Mac|iPhone|iPad/.test(navigator.platform || "")) $("save-key").textContent = "⌘S";
   await refreshProjects();
   const want = store("h3studio.project");
@@ -6767,3 +7098,5 @@ async function start() {
 
 init();
 applyFolds();
+applyViewerHidden();
+$("viewer-mini").addEventListener("click", (e) => { if (!e.target.closest("button")) setViewerHidden(false); });

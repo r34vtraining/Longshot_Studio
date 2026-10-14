@@ -5,7 +5,7 @@ ComfyUI at `/longshot`. Build a film from short Shots, review and approve each o
 Studio stitches them into one continuous take or a cut sequence. Approved work is never
 thrown away.
 
-<img width="2239" height="1331" alt="image" src="https://github.com/user-attachments/assets/1ae2f7b5-cfe0-4e43-838a-c86b78ac4f80" />
+<img width="2166" height="1493" alt="H3 Long Shot Studio" src="https://github.com/user-attachments/assets/543bc5fd-05bf-45dd-9557-f36327e8c935" />
 
 ## Features
 
@@ -32,15 +32,46 @@ thrown away.
 - Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
 
+## What's new in 0.8.13
+
+1. **Cast & Scenes folds** to one line with a summary ("4 pictures · 2 voices · 1 RefMod"), remembered per browser.
+2. **Hide the preview**: **▴ Hide preview** (under the timeline, right) folds the video, timeline and controls to one status line: *Rendering Shot 3 · step 12/30* (with a progress bar), *No Shot queued* or *Shot 3 completed*. Click it to show the preview again. Live preview pauses while it's hidden and comes back only if you had it on. Approve / Reroll stay as they are.
+3. **Restore references** on a Shot card: puts back the references its take was made with. Removed ones are added again where they were, bypassed ones turned on; the others stay. The Studio lists what comes back and which Shots render again (labels renumber) before it changes anything. Works for takes made from 0.8.13 on.
+
+## What's new in 0.8.12
+
+Best with H3 Long Shot **1.6.15 or later**.
+
+1. **Live preview costs no measurable speed** with H3 Long Shot 1.6.15: both the rough and the sharp (taeh3) preview run behind the render. Measured with the model partly in VRAM: 31.4 s/step off, 31.4 s/step with the rough preview (the sharp one now runs the same way). Older Long Shot versions wait for the GPU at every step, about 30–40% slower in that case; the switch's tooltip says which applies.
+
+## What's new in 0.8.11
+
+Live preview switches mid-render with H3 Long Shot **1.6.13 or later**.
+
+1. The Live preview switch takes effect at the next sampling step, also while a Shot renders: on shows the picture right away, off stops the extra decoding (and its VRAM) right away. With an older Long Shot it applies from the next render.
+
+## What's new in 0.8.10
+
+Works with H3 Long Shot 1.6.11; **1.6.12** makes live previews show new footage instead of the overlap.
+
+1. **Live preview**: a switch next to Update preview shows the picture forming on the review screen while a Shot renders.
+2. **Settings → Live preview quality**: one click installs the sharper preview decoder (taeh3, 22 MB); without it the preview is rough colours.
+3. An older ComfyUI (before 0.35.0) is named on the page, and renders stop with "update ComfyUI" instead of failing.
+4. Install notes for Windows portable, Desktop (port 8000) and git installs.
+
 ## What's new in 0.8.9
 
-1. Zoom the timeline with the alt+mouse wheel, around the cursor, from the whole film down to single frames.
-2. Mouse scroll or dragging the timeline, or the thin scroll bar under it scrolls sideways.
-3. Ctrl+mouse wheel changes the height of the timeline.
-4. A time ruler above the Shots (frame ticks when zoomed in). Click it to seek; double-click it to see the whole film.
-5. Narrow Shot blocks pop out to full size on hover, so the ◀ take ▶ arrows can always be clicked.
-6. The view follows the playhead, and scrolls to a Shot when you pick it (card, Jump to Shot, take arrows). The zoom is remembered per browser.
-7. double click a shot takes you to the prompt box for that shot. 
+1. Timeline mouse controls, editor style: scroll moves along the film, **Alt + scroll** zooms around the cursor, **Ctrl + scroll** makes the timeline taller or shorter to see more of each thumbnail (both remembered per browser).
+2. Double-click a Shot on the timeline to jump to its prompt (a clip: its card).
+3. Sharper timeline thumbnails for clips made from now on.
+
+## What's new in 0.8.8
+
+1. Zoom the timeline around the cursor, from the whole film down to single frames.
+2. Dragging the timeline, or the thin scroll bar under it, scrolls sideways.
+3. A time ruler above the Shots (frame ticks when zoomed in). Click it to seek; double-click it to see the whole film.
+4. Narrow Shot blocks pop out to full size on hover, so the ◀ take ▶ arrows can always be clicked.
+5. The view follows the playhead, and scrolls to a Shot when you pick it (card, Jump to Shot, take arrows). The zoom is remembered per browser.
 
 ## What's new in 0.8.7
 
@@ -48,25 +79,38 @@ Needs H3 Long Shot **1.6.11 or later**.
 
 1. No more Video Helper Suite: videos are saved and clips loaded by H3 Long Shot's own nodes, sound by ComfyUI's Load Audio. Only the Prompt Compiler and Long Shot are required now.
 2. Saved videos still carry the workflow (drop one on ComfyUI to reopen it). No PNG or silent copy is written next to them any more.
-3. RefMod cards: a row in Cast & Scenes for saved RefMods (characters, styles, motions), each with its own label and subject line.
-4. Fewer dependencies: KJNodes and MelBandRoFormer are no longer needed; the default scheduler is ComfyUI's own `beta`.
-5. Turbo, RTX upscaling and RefMods are optional, with a **Click to install** button where each is used.
-6. A Shot's prompt can be edited while it renders; the card flags that the take was made with the old text.
 
-## Features from previous versions
+## What's new in 0.8.6
+
+1. RefMod cards: a row in Cast & Scenes for saved RefMods (characters, styles, motions), each with its own label and subject line.
+2. Fewer dependencies: KJNodes and MelBandRoFormer are no longer needed; the default scheduler is ComfyUI's own `beta`.
+3. Turbo, RTX upscaling and RefMods are optional, with a **Click to install** button where each is used.
+4. A Shot's prompt can be edited while it renders; the card flags that the take was made with the old text.
+
+## What's new in 0.8.5
+
+Needs H3 Long Shot **1.6.10 or later**.
 
 1. Whole-film decodes (Update preview, Upscale final, ProRes master) run one continuous run at a time, split only at Cut and Context joins. Still one video file; RAM now limits the longest unbroken run, not the film.
 2. Before decoding, the Studio checks each run fits in RAM and names the Shots if one doesn't.
 3. Up to 256 Shots per project (was 64).
 4. ⇅ in the Shots header flips the list: newest Shot on top (remembered per browser).
-5. Open output folder opens Approved_Clips, with the focused Shot's clip selected (before any export: the latest video or the clips folder).
-6. Rest the mouse on the Retention field to see the markers it takes (fully_preserved, weak_reference, fully_copy…).
-7. While the queue has work, the ComfyUI machine stays awake, and the Studio tab keeps its screen on.
-8. Context Shots open on a new angle: the frame before is a reference only, never a starting frame.
-9. The join chip offers what exists next to the Shot, with Continuous as the default, so Render all chains Shots (and frame anchors) from the start.
-10. ▶ on one Shot pins it to the approved Shots next to it; with none approved it renders on its own.
-11. Render all shows which Shot is sampling, which are up next, and which are done.
-12. Audio references in Cast & Scenes. Link one to a picture in its editor: "gets its voice timbre from <Audio N>".
+
+## What's new in 0.8.4
+
+1. Open output folder opens Approved_Clips, with the focused Shot's clip selected (before any export: the latest video or the clips folder).
+2. Rest the mouse on the Retention field to see the markers it takes (fully_preserved, weak_reference, fully_copy…).
+3. While the queue has work, the ComfyUI machine stays awake, and the Studio tab keeps its screen on.
+
+## What's new in 0.8.3
+
+Needs H3 Long Shot **1.6.9 or later**.
+
+1. Context Shots open on a new angle: the frame before is a reference only, never a starting frame.
+2. The join chip offers what exists next to the Shot, with Continuous as the default, so Render all chains Shots (and frame anchors) from the start.
+3. ▶ on one Shot pins it to the approved Shots next to it; with none approved it renders on its own.
+4. Render all shows which Shot is sampling, which are up next, and which are done.
+5. Audio references in Cast & Scenes. Link one to a picture in its editor: "gets its voice timbre from <Audio N>".
 
 ## Requirements
 
@@ -92,6 +136,9 @@ For SageAttention, start ComfyUI with `--use-sage-attention`.
 
 ## Install
 
+Needs **ComfyUI 0.35.0 or later** (native MiniMax H3). On an older ComfyUI the page opens but
+says to update, and nothing renders.
+
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/r34vtraining/Longshot_Studio
@@ -99,9 +146,19 @@ git clone https://github.com/r34vtraining/H3_Prompt_Compiler
 git clone https://github.com/r34vtraining/H3_Longshot
 ```
 
-Skip any you already have, and install each pack's `requirements.txt` with ComfyUI's Python.
-Restart ComfyUI and open **http://127.0.0.1:8188/longshot** (portable) or **https://127.0.0.1:8000/longshot** (Desktop).  
- 
+Skip any you already have. Then install H3 Long Shot's `requirements.txt` with ComfyUI's own Python:
+
+| ComfyUI | Command (from the folder that holds `ComfyUI`) |
+|---|---|
+| Windows portable | `python_embeded\python.exe -m pip install -r ComfyUI\custom_nodes\H3_Longshot\requirements.txt` |
+| Desktop | in its `.venv`: `.venv\Scripts\python.exe -m pip install -r custom_nodes\H3_Longshot\requirements.txt` |
+| git / venv | `python -m pip install -r custom_nodes/H3_Longshot/requirements.txt` (venv active) |
+
+Restart ComfyUI and open `/longshot` on ComfyUI's address:
+
+- portable or git install: **http://127.0.0.1:8188/longshot**
+- ComfyUI Desktop: **http://127.0.0.1:8000/longshot** (its port is in Settings → Server Config)
+
 **Updating:** `git pull` in the Studio's and H3 Long Shot's folders, restart ComfyUI, then
 hard-refresh the page (Ctrl+Shift+R).
 

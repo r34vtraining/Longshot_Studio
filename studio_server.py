@@ -18,6 +18,8 @@
     POST /longshot/clear-segments  {project} (loopback only)
     POST /longshot/open-folder     {"which": "output"|"input", "select", "project", "subfolder"} (loopback only)
     POST /longshot/install-pack    {pack}: clone an optional pack (loopback only)
+    POST /longshot/install-preview the taeh3 live-preview decoder (loopback only)
+    POST /longshot/live-preview    {client_id, method}: the tab's live-preview switch
     POST /longshot/keep-awake      {on}: keep the machine awake while the queue has work
     POST /longshot/restart         restart ComfyUI (relaunches itself, like ComfyUI-Manager)
     POST /longshot/cleanup-outputs {prompt_id, png, noaudio}: delete a finished render's
@@ -290,6 +292,30 @@ def longshot_version():
         return tuple(int(x) for x in str(v).split("."))
     except Exception:
         return (0,)
+
+
+def _longshot_nodes():
+    """H3 Long Shot's nodes module (same process), or None."""
+    try:
+        import sys as _sys
+        import nodes as comfy_nodes
+        cls = comfy_nodes.NODE_CLASS_MAPPINGS.get("MiniMaxH3LongShot")
+        return _sys.modules.get(cls.__module__) if cls else None
+    except Exception:
+        return None
+
+
+def live_switch_supported():
+    """Long Shot 1.6.13+: the live-preview switch is read at every step."""
+    return hasattr(_longshot_nodes(), "set_live_preview")
+
+
+def set_live_preview(client_id, method):
+    """The Studio tab's live-preview switch, passed to Long Shot."""
+    mod = _longshot_nodes()
+    if not hasattr(mod, "set_live_preview"):
+        raise LookupError("Update H3 Long Shot to 1.6.13 or later for a live-preview switch that works mid-render.")
+    return mod.set_live_preview(client_id, method)
 
 
 def current_env():
@@ -579,6 +605,9 @@ def options_payload():
         "longshot_version": ".".join(str(x) for x in longshot_version()),
         "max_shots": gb.MAX_SHOTS,
         "optional_packs": {k: {"folder": f, "url": u} for k, (f, u) in OPTIONAL_PACKS.items()},
+        "comfy": comfy_status(),
+        "preview_decoder": preview_decoder_installed(names("vae_approx")),
+        "live_switch": live_switch_supported(),
     }
 
 
@@ -807,6 +836,84 @@ def install_pack(key, custom_nodes, run=None, git=None, python=None):
         res = run([python or sys.executable, "-m", "pip", "install", "-r", req])
         pip = getattr(res, "returncode", 1) == 0
     return {"folder": dest, "cloned": cloned, "pip": pip, "url": url}
+
+
+# ---------------------------------------------------------------------------
+# Live preview (0.8.10): ComfyUI previews H3 latents itself, roughly (latent2rgb)
+# or sharply with madebyollin's taeh3 decoder in models/vae_approx. The Studio
+# can download that one file, pinned to a commit and checked by its hash.
+# ---------------------------------------------------------------------------
+
+PREVIEW_DECODER = {
+    "file": "taeh3.safetensors",
+    "url": "https://raw.githubusercontent.com/madebyollin/taehv/"
+           "011dfc2112197741c540e0bdd5b7b67bcc930771/safetensors/taeh3.safetensors",
+    "page": "https://github.com/madebyollin/taehv",
+    "sha256": "4fd022bfcab08772fe0536b17ea1a3bbb5625be11e397868d1c5d891863d4c13",
+    "size": 22709752,
+}
+MIN_COMFY = "0.35.0"
+
+
+def preview_decoder_installed(names):
+    """ComfyUI uses the first vae_approx file whose name starts with taeh3."""
+    return any(os.path.basename(str(n)).startswith("taeh3") for n in names or [])
+
+
+def _download(url, dest, timeout=60):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "H3-Long-Shot-Studio"})
+    with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f, 1 << 20)
+
+
+def install_preview_decoder(folder, fetch=None, spec=None):
+    """Download the taeh3 decoder into `folder` (models/vae_approx). Kept only if
+    its size and SHA-256 match. Returns {path, downloaded}."""
+    import hashlib
+    spec = spec or PREVIEW_DECODER
+    os.makedirs(folder, exist_ok=True)
+    dest = os.path.join(folder, spec["file"])
+
+    def sha(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        return h.hexdigest()
+
+    if os.path.isfile(dest) and sha(dest) == spec["sha256"]:
+        return {"path": dest, "downloaded": False}
+    tmp = dest + ".part"
+    try:
+        (fetch or _download)(spec["url"], tmp)
+        if os.path.getsize(tmp) != spec["size"] or sha(tmp) != spec["sha256"]:
+            raise RuntimeError("The downloaded file didn't match the expected one. Download "
+                               f"{spec['file']} from {spec['page']} into {folder} by hand.")
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return {"path": dest, "downloaded": True}
+
+
+def comfy_status():
+    """ComfyUI's version, and whether it has what Long Shot needs (native H3 with
+    guides at any frame: ComfyUI 0.35.0, Sept 2026). Checked by ability, so
+    nightly and Desktop builds count by what they can do."""
+    version = None
+    try:
+        import comfyui_version
+        version = str(comfyui_version.__version__)
+    except Exception:
+        pass
+    try:
+        import inspect
+        from comfy.ldm.minimax.model import PackedLayout
+        ok = "frame_count" not in inspect.signature(PackedLayout.__init__).parameters
+    except Exception:
+        ok = False
+    return {"version": version, "ok": ok, "min": MIN_COMFY}
 
 
 KEEP_AWAKE_TTL = 120.0
@@ -1608,6 +1715,41 @@ def register(routes=None):
         except Exception as err:
             return error(str(err), 500)
         return web.json_response(out)
+
+    @routes.post("/longshot/install-preview")
+    async def install_preview_route(request):
+        """Download the taeh3 live-preview decoder into models/vae_approx. Local only."""
+        if not is_local_request(request.remote, request.headers):
+            return error("The preview decoder can only be installed from the machine running ComfyUI.", 403)
+        import folder_paths
+        roots = folder_paths.get_folder_paths("vae_approx")
+        if not roots:
+            return error("ComfyUI's models/vae_approx folder wasn't found.", 500)
+        try:
+            out = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: install_preview_decoder(roots[0]))
+        except Exception as err:
+            return error(f"Couldn't download the preview decoder: {err}", 500)
+        return web.json_response(out)
+
+    @routes.post("/longshot/live-preview")
+    async def live_preview_route(request):
+        """{client_id, method}: this tab's live-preview switch ("taesd" | "latent2rgb" |
+        "none"). It only changes that tab's own previews, so any device may set it."""
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        cid = str(body.get("client_id") or "")
+        if not cid:
+            return error("Send {client_id, method}.")
+        try:
+            method = set_live_preview(cid, body.get("method"))
+        except LookupError as err:
+            return error(str(err), 409)
+        except ValueError as err:
+            return error(err)
+        return web.json_response({"client_id": cid, "method": method})
 
     @routes.post("/longshot/keep-awake")
     async def keep_awake(request):

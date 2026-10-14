@@ -67,8 +67,9 @@
     <div class="panel" id="cast-panel">
       <div class="panel-head">
         <div class="head-left">
-          <h2>Cast &amp; Scenes</h2>
-          <span class="muted small">labels renumber when you bypass or remove one</span>
+          <h2><button class="fold" data-action="fold" data-fold="cast" aria-expanded="true" title="Show only one line"><span class="fold-ch" aria-hidden="true">▾</span>Cast &amp; Scenes</button></h2>
+          <span class="muted small cast-hint">labels renumber when you bypass or remove one</span>
+          <span class="muted small cast-sum" id="cast-summary"></span>
         </div>
         <div class="head-right">
           <button class="ghost sm folder-btn local-only" data-action="open-folder" data-which="input" title="Open ComfyUI's input folder, where references and audio live">
@@ -115,7 +116,13 @@
 
     <div id="stage" class="stage">
     <div class="stage-bar-bg" aria-hidden="true"></div>
-    <div class="panel viewer">
+    <div class="panel viewer" id="viewer-panel">
+      <div class="viewer-mini" id="viewer-mini" hidden>
+        <span class="vm-dot" id="vm-dot" aria-hidden="true"></span>
+        <span class="vm-text" id="vm-text" aria-live="polite">No Shot queued</span>
+        <span class="vm-bar" id="vm-bar" hidden><span id="vm-fill"></span></span>
+        <button class="ghost sm" data-action="viewer-show" title="Show the video, timeline and controls again">Show preview</button>
+      </div>
       <div class="screen" id="screen">
         <video id="video" playsinline preload="auto"></video>
         <div class="placeholder" id="placeholder">
@@ -123,6 +130,8 @@
           <div class="ph-shot" id="ph-shot">Nothing rendered yet</div>
         </div>
         <div class="tc" id="tc-overlay">00:00.00</div>
+        <img id="live-img" class="live-img" alt="Live preview of the Shot being rendered" hidden>
+        <div class="live-label" id="live-label" hidden></div>
       </div>
       <div class="vcontrols" id="vcontrols">
       <div class="scrub" id="scrub-wrap">
@@ -137,10 +146,14 @@
           </div>
         </div>
         <div id="tl-sbar" class="tl-sbar" aria-hidden="true"><div id="tl-sthumb" class="tl-sthumb"></div><div id="tl-smark" class="tl-smark"></div></div>
+        <div class="tl-row">
+        <label class="live-toggle" id="live-wrap" title="Show the picture forming on this screen while a Shot renders."><input type="checkbox" id="live-preview"> Live preview</label>
         <div id="tl-approx" class="tl-approx" hidden>
           <span id="tl-approx-main"><span title="Takes that were never rendered side by side are shown from the renders that made them, so the joins between them can jump slightly.">Approximate joins</span>
           · <button class="linkbtn" data-action="update-preview" id="tl-update" title="Decode every rendered Shot together for the exact video. Nothing is sampled.">Update preview</button></span>
           <button class="linkbtn" data-action="make-clips" id="tl-make" hidden title="Takes in Take history that have no clip yet: decode each on its own (nothing is sampled)."></button>
+        </div>
+        <button class="hide-preview" data-action="viewer-hide" id="hide-btn" title="Fold the video, timeline and controls to one status line (Live preview pauses while it's hidden)">▴ Hide preview</button>
         </div>
         <div id="tl-export" class="tl-approx tl-export" hidden>
           <button class="linkbtn" data-action="export-approved" id="tl-export-btn" title="Copy each approved Shot's own clip (whole, with sound) into output/longshot/&lt;project&gt;/Approved_Clips, numbered as on the timeline. Nothing is decoded.">Export approved clips</button>
