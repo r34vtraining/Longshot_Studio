@@ -100,8 +100,8 @@ git clone https://github.com/r34vtraining/H3_Longshot
 ```
 
 Skip any you already have, and install each pack's `requirements.txt` with ComfyUI's Python.
-Restart ComfyUI and open **http://127.0.0.1:8188/longshot**.
-
+Restart ComfyUI and open **http://127.0.0.1:8188/longshot** (portable) or 127.0.0.1:8000/longshot** (Desktop).  
+ 
 **Updating:** `git pull` in the Studio's and H3 Long Shot's folders, restart ComfyUI, then
 hard-refresh the page (Ctrl+Shift+R).
 
