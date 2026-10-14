@@ -32,13 +32,15 @@ thrown away.
 - Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
 
-## What's new in 0.8.8
+## What's new in 0.8.9
 
-1. Zoom the timeline with the mouse wheel, around the cursor, from the whole film down to single frames.
-2. Shift + wheel, dragging the timeline, or the thin scroll bar under it scrolls sideways.
-3. A time ruler above the Shots (frame ticks when zoomed in). Click it to seek; double-click it to see the whole film.
-4. Narrow Shot blocks pop out to full size on hover, so the ◀ take ▶ arrows can always be clicked.
-5. The view follows the playhead, and scrolls to a Shot when you pick it (card, Jump to Shot, take arrows). The zoom is remembered per browser.
+1. Zoom the timeline with the alt+mouse wheel, around the cursor, from the whole film down to single frames.
+2. Mouse scroll or dragging the timeline, or the thin scroll bar under it scrolls sideways.
+3. Ctrl+mouse wheel changes the height of the timeline.
+4. A time ruler above the Shots (frame ticks when zoomed in). Click it to seek; double-click it to see the whole film.
+5. Narrow Shot blocks pop out to full size on hover, so the ◀ take ▶ arrows can always be clicked.
+6. The view follows the playhead, and scrolls to a Shot when you pick it (card, Jump to Shot, take arrows). The zoom is remembered per browser.
+7. double click a shot takes you to the prompt box for that shot. 
 
 ## What's new in 0.8.7
 
