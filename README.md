@@ -34,21 +34,10 @@ thrown away.
 
 ## What's new in 0.8.13
 
+Needs Long Shot **1.6.15 or later**.
 1. **Cast & Scenes folds** to one line with a summary ("4 pictures · 2 voices · 1 RefMod"), remembered per browser.
 2. **Hide the preview**: **▴ Hide preview** (under the timeline, right) folds the video, timeline and controls to one status line: *Rendering Shot 3 · step 12/30* (with a progress bar), *No Shot queued* or *Shot 3 completed*. Click it to show the preview again. Live preview pauses while it's hidden and comes back only if you had it on. Approve / Reroll stay as they are.
 3. **Restore references** on a Shot card: puts back the references its take was made with. Removed ones are added again where they were, bypassed ones turned on; the others stay. The Studio lists what comes back and which Shots render again (labels renumber) before it changes anything. Works for takes made from 0.8.13 on.
-
-## What's new in 0.8.12
-
-Best with H3 Long Shot **1.6.15 or later**.
-
-1. **Live preview costs no measurable speed** with H3 Long Shot 1.6.15: both the rough and the sharp (taeh3) preview run behind the render. Measured with the model partly in VRAM: 31.4 s/step off, 31.4 s/step with the rough preview (the sharp one now runs the same way). Older Long Shot versions wait for the GPU at every step, about 30–40% slower in that case; the switch's tooltip says which applies.
-
-## What's new in 0.8.11
-
-Live preview switches mid-render with H3 Long Shot **1.6.13 or later**.
-
-1. The Live preview switch takes effect at the next sampling step, also while a Shot renders: on shows the picture right away, off stops the extra decoding (and its VRAM) right away. With an older Long Shot it applies from the next render.
 
 ## Previous updates
 
