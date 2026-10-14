@@ -2334,7 +2334,7 @@ const TL_MAX_PX = FPS * 18;           // closest zoom: 18 px per frame
 const TLV = {
   z: Math.max(1, Number(store("h3studio.tlZoom")) || 1),
   hold: 0,                            // until then the user steers: don't follow the playhead
-  lastT: -1, focus: null, raf: 0, w: 0,
+  lastT: -1, focus: null, raf: 0, w: 0, h: 64, altWheel: false,
 };
 const tlView = $("tl-view"), tlCanvas = $("tl-canvas");
 
@@ -2482,20 +2482,76 @@ if (window.ResizeObserver) {
   }).observe(tlView);
 }
 
-// Wheel zooms around the cursor; Shift + wheel (or a sideways swipe) scrolls.
+// Timeline height (Ctrl + wheel): taller blocks show more of each thumbnail.
+const TL_H_MIN = 64, TL_H_MAX = 240;
+function tlSetHeight(h) {
+  TLV.h = Math.round(Math.min(TL_H_MAX, Math.max(TL_H_MIN, h)));
+  $("tl-strip").style.height = TLV.h + "px";
+  store("h3studio.tlHeight", String(TLV.h));
+}
+tlSetHeight(Number(store("h3studio.tlHeight")) || TL_H_MIN);
+
+// Wheel over the timeline: plain = move along the film, Alt = zoom around the
+// cursor, Ctrl = timeline height.
 tlView.addEventListener("wheel", (e) => {
+  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? tlView.clientWidth : 1;
+  const dx = e.deltaX * unit, dy = e.deltaY * unit;
+  const d = Math.abs(dx) > Math.abs(dy) ? dx : dy;
+  if (e.ctrlKey || e.metaKey) {
+    e.preventDefault();                           // not the browser's page zoom
+    tlSetHeight(TLV.h * Math.exp(-Math.max(-300, Math.min(300, d)) * 0.002));
+    layoutTL();
+    return;
+  }
   if (!TL.total) return;
   e.preventDefault();
   tlUser();
-  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? tlView.clientWidth : 1;
-  const dx = e.deltaX * unit, dy = e.deltaY * unit;
-  if (e.shiftKey || Math.abs(dx) > Math.abs(dy)) {
-    tlView.scrollLeft += Math.abs(dx) > Math.abs(dy) ? dx : dy;
+  if (e.altKey) {
+    TLV.altWheel = true;
+    const r = tlView.getBoundingClientRect();
+    tlSetZoom(TLV.z * Math.exp(-Math.max(-300, Math.min(300, d)) * 0.0025), e.clientX - r.left);
     return;
   }
-  const r = tlView.getBoundingClientRect();
-  tlSetZoom(TLV.z * Math.exp(-Math.max(-300, Math.min(300, dy)) * 0.0025), e.clientX - r.left);
+  tlView.scrollLeft += d;
 }, { passive: false });
+
+// Alt + wheel: releasing Alt mustn't then focus the browser's menu (Windows).
+window.addEventListener("keydown", (e) => { if (e.key === "Alt" && !e.repeat) TLV.altWheel = false; }, true);
+window.addEventListener("keyup", (e) => {
+  if (e.key === "Alt" && TLV.altWheel) { e.preventDefault(); TLV.altWheel = false; }
+}, true);
+
+// Double-click a Shot's block: its card, with the cursor in the prompt (a clip: its card).
+// The first click re-renders the strip, so the browser's dblclick never fires: two
+// clicks on the same Shot within the double-click time count instead.
+const tlDbl = { id: null, at: 0 };
+$("tl-strip").addEventListener("click", (e) => {
+  if (e.target.closest(".tl-arrow")) { tlDbl.id = null; return; }
+  const b = e.target.closest("[data-tl]");
+  if (!b) return;
+  const now = performance.now(), id = b.dataset.tl;
+  if (tlDbl.id === id && now - tlDbl.at < 450) {
+    tlDbl.id = null;
+    e.stopPropagation();                          // not a second pick
+    tlOpenPrompt(id);
+    return;
+  }
+  tlDbl.id = id;
+  tlDbl.at = now;
+});
+
+function tlOpenPrompt(id) {
+  const sh = shotById(id);
+  if (!sh) return;
+  if (S.focus !== sh.id || S.open !== sh.id) focusShot(sh.id);
+  setTimeout(() => {
+    const card = document.querySelector(`.shot[data-shot="${CSS.escape(sh.id)}"]`);
+    if (!card) return;
+    card.scrollIntoView({ block: "center", behavior: "smooth" });
+    const box = sh.kind !== "clip" && card.querySelector('textarea[data-shot-field="text"]');
+    if (box) { box.focus({ preventScroll: true }); box.setSelectionRange(box.value.length, box.value.length); }
+  }, 0);
+}
 
 // Drag anywhere on the timeline (but the scrub bar and the take arrows) to scroll.
 // A click without dragging still works: a block picks its Shot, the ruler seeks.

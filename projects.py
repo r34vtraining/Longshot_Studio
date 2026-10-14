@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.8.8"
+STUDIO_VERSION = "0.8.9"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -482,7 +482,7 @@ def clip_commands(ffmpeg, src, folder, key, start, dur):
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", tmp]
     thumb = ["ffmpeg" if not ffmpeg else ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
              "-ss", f"{start + min(0.5, dur / 2):.4f}", "-i", src, "-frames:v", "1",
-             "-vf", "scale=192:-2", "-q:v", "5", os.path.join(folder, key + ".jpg")]
+             "-vf", "scale=384:-2", "-q:v", "5", os.path.join(folder, key + ".jpg")]
     return clip, thumb, tmp
 
 

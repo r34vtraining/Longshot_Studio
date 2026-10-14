@@ -1569,7 +1569,7 @@ def register(routes=None):
                 return False
             try:
                 return subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", "0.5",
-                                       "-i", src, "-frames:v", "1", "-vf", "scale=192:-2", "-q:v", "5", dest],
+                                       "-i", src, "-frames:v", "1", "-vf", "scale=384:-2", "-q:v", "5", dest],
                                       capture_output=True, timeout=60,
                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
             except (OSError, subprocess.SubprocessError):

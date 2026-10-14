@@ -786,3 +786,4 @@ textarea.fit { resize: none; overflow: hidden; line-height: 1.5; }
 .tl-block.narrow .tl-takes { left: 1px; right: 1px; }
 /* the scrub thumb's centre sits exactly on the playhead (the native thumb is 16px) */
 .tl-canvas #scrub { width: calc(100% + 16px); margin-left: -8px; display: block; }
+.tl-canvas { overflow-x: clip; }
