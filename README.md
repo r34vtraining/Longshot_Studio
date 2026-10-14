@@ -37,15 +37,9 @@ thrown away.
 
 Needs H3 Long Shot **1.6.11 or later**.
 
-1. No more Video Helper Suite: videos are saved and clips loaded by H3 Long Shot's own nodes, sound by ComfyUI's Load Audio. Only the Prompt Compiler and Long Shot are required now.
-2. Saved videos still carry the workflow (drop one on ComfyUI to reopen it). No PNG or silent copy is written next to them any more.
-
-## What's new in 0.8.6
-
 1. RefMod cards: a row in Cast & Scenes for saved RefMods (characters, styles, motions), each with its own label and subject line.
 2. Fewer dependencies: KJNodes and MelBandRoFormer are no longer needed; the default scheduler is ComfyUI's own `beta`.
 3. Turbo, RTX upscaling and RefMods are optional, with a **Click to install** button where each is used.
-4. A Shot's prompt can be edited while it renders; the card flags that the take was made with the old text.
 
 ## What's new in 0.8.5
 
