@@ -6,7 +6,7 @@ Studio stitches them into one continuous take or a cut sequence. Approved work i
 thrown away.
 
 <img width="1785" height="1390" alt="image" src="https://github.com/user-attachments/assets/1724d016-5553-4872-a1c9-daf0a4e0b2a6" />
-
+LIVE PREVIEW is added
 
 ## Features
 
