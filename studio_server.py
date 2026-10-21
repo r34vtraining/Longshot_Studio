@@ -20,6 +20,7 @@
     POST /longshot/install-pack    {pack}: clone an optional pack (loopback only)
     POST /longshot/install-preview the taeh3 live-preview decoder (loopback only)
     POST /longshot/live-preview    {client_id, method}: the tab's live-preview switch
+    POST /longshot/layout          {overlap, pieces}: every Shot's place on the film (frames)
     POST /longshot/keep-awake      {on}: keep the machine awake while the queue has work
     POST /longshot/restart         restart ComfyUI (relaunches itself, like ComfyUI-Manager)
     POST /longshot/cleanup-outputs {prompt_id, png, noaudio}: delete a finished render's
@@ -45,6 +46,8 @@ import subprocess
 import sys
 import tempfile
 
+from . import audio_sync
+from . import film
 from . import graph_builder as gb
 from . import projects as pj
 
@@ -305,6 +308,39 @@ def _longshot_nodes():
         return None
 
 
+def _longshot_planner():
+    """H3 Long Shot's planner module (same process), or None."""
+    mod = _longshot_nodes()
+    if mod is None:
+        return None
+    try:
+        import importlib
+        return importlib.import_module(mod.__name__.rsplit(".", 1)[0] + ".planner")
+    except Exception:
+        return None
+
+
+def film_layout(pieces, overlap, planner=None):
+    """Where every Shot sits on the whole film (0.9.0; runs split at Cut / Context in
+    0.9.2), from H3 Long Shot's own planner. pieces: [{id, seconds, window, cut}] in
+    film order (window: a take's or clip's frame count, or None; cut: a Cut or Context
+    join before it). Returns {fps, total, pieces: [{id, ws, vs, we, run}]} in frames."""
+    planner = planner or _longshot_planner()
+    if planner is None:
+        raise LookupError("H3 Long Shot isn't loaded.")
+    return film.film_layout(pieces, overlap, planner)
+
+
+def chunk_codec_args(codec):
+    """H3 Long Shot's own encoder settings for chunks (so black made here joins them),
+    or None."""
+    mod = _longshot_nodes()
+    table = getattr(mod, "_CHUNK_CODECS", None)
+    if not table or codec not in table:
+        return None
+    return list(table[codec]) + list(getattr(mod, "_BT709", []))
+
+
 def live_switch_supported():
     """Long Shot 1.6.13+: the live-preview switch is read at every step."""
     return hasattr(_longshot_nodes(), "set_live_preview")
@@ -320,7 +356,8 @@ def set_live_preview(client_id, method):
 
 def current_env():
     return gb.Env(classes=set(_node_classes()), video_formats=None,
-                  shot_inputs=_timeline_shot_inputs(), nvenc=nvenc_available())
+                  shot_inputs=_timeline_shot_inputs(), nvenc=nvenc_available(),
+                  planner=_longshot_planner(), longshot=(longshot_version() if longshot_version() != (0,) else None))
 
 
 _READY = set()
@@ -1137,7 +1174,9 @@ def register(routes=None):
                 None, add_context_frames, project, bool(body.get("dry_run")), body.get("upto"),
                 bool(body.get("standalone")))
         try:
-            if isinstance(body.get("take_clips"), list):
+            if isinstance(body.get("take_audio"), dict):
+                built = gb.build_take_audio(project, body["take_audio"].get("take"), env=current_env())
+            elif isinstance(body.get("take_clips"), list):
                 built = gb.build_take_clips(project, body["take_clips"][:64], env=current_env())
             elif isinstance(body.get("export_clips"), list):
                 built = gb.build_clip_export(project, body["export_clips"][:64], env=current_env())
@@ -1571,7 +1610,11 @@ def register(routes=None):
                 None, lambda: pj.join_chunks(folder_paths.get_output_directory(), slug, body.get("prefix"),
                                              body["chunks"], body.get("audio"),
                                              body.get("masters") if isinstance(body.get("masters"), list) else None,
-                                             ffmpeg=ffmpeg))
+                                             ffmpeg=ffmpeg, gaps=body.get("gaps") if isinstance(body.get("gaps"), list) else None,
+                                             song=body.get("song") if isinstance(body.get("song"), dict) else None,
+                                             input_dir=folder_paths.get_input_directory(),
+                                             codec_args=chunk_codec_args(body.get("codec")),
+                                             master_args=chunk_codec_args("prores_hq")))
         except ValueError as err:
             return error(err)
         except Exception as err:
@@ -1590,8 +1633,10 @@ def register(routes=None):
         out_dir, mode = folder_paths.get_output_directory(), body.get("mode")
         try:
             if mode == "copy":
+                song = body.get("song") if isinstance(body.get("song"), dict) else None
                 names = await asyncio.get_running_loop().run_in_executor(
-                    None, pj.copy_approved, out_dir, slug, body.get("items"))
+                    None, lambda: pj.copy_approved(out_dir, slug, body.get("items"), ffmpeg=_ffmpeg_path(),
+                                                   input_dir=folder_paths.get_input_directory(), song=song))
             elif mode == "mux":
                 ffmpeg = _ffmpeg_path()
                 if not ffmpeg:
@@ -1602,7 +1647,9 @@ def register(routes=None):
             elif mode == "keep":
                 res = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: pj.keep_upscaled(out_dir, slug, body.get("items"), str(body.get("sig") or ""),
-                                                   prores=bool(body.get("prores"))))
+                                                   prores=bool(body.get("prores")), ffmpeg=_ffmpeg_path(),
+                                                   input_dir=folder_paths.get_input_directory(),
+                                                   song=body.get("song") if isinstance(body.get("song"), dict) else None))
                 return web.json_response({**res, "subfolder": pj.approved_subfolder(slug)})
             elif mode == "clear":
                 names = []
@@ -1731,6 +1778,119 @@ def register(routes=None):
         except Exception as err:
             return error(f"Couldn't download the preview decoder: {err}", 500)
         return web.json_response(out)
+
+    @routes.post("/longshot/phrases")
+    async def phrases_route(request):
+        """{file, subfolder, min_gap, sensitivity}: suggested phrase starts in the song (0.11.0)."""
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        import folder_paths
+        try:
+            path = pj.resolve_input(folder_paths.get_input_directory(), body.get("file"), body.get("subfolder", ""))
+        except (ValueError, TypeError) as err:
+            return error(err)
+        if not os.path.isfile(path):
+            return error("The song file is missing.", 404)
+        ff = _ffmpeg_path()
+        if not ff:
+            return error("ffmpeg isn't available.", 500)
+        try:
+            gap = float(body.get("min_gap", 0.5))
+            sens = float(body.get("sensitivity", 0.5))
+            found = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: audio_sync.detect_phrases(path, ff, min_gap=gap, sensitivity=sens))
+        except Exception as err:
+            return error(f"Couldn't read the song: {err}", 500)
+        return web.json_response({"phrases": found})
+
+    _preview_locks = {}
+
+    @routes.get("/longshot/song-preview")
+    async def song_preview(request):
+        """?file=&subfolder=: the song for playback in the Studio (0.12.6): a WAV as is,
+        anything else (mp3, m4a…) as a WAV copy made once in ComfyUI's temp folder, so
+        jumping to a point in it is exact."""
+        import folder_paths
+        try:
+            path = pj.resolve_input(folder_paths.get_input_directory(), request.query.get("file"),
+                                    request.query.get("subfolder", ""))
+        except (ValueError, TypeError) as err:
+            return error(err)
+        if not os.path.isfile(path):
+            return error("The song file is missing.", 404)
+        if not audio_sync.needs_preview(path):
+            return web.FileResponse(path, headers={"Cache-Control": "no-cache"})
+        ff = _ffmpeg_path()
+        if not ff:                                   # no ffmpeg: the file itself
+            return web.FileResponse(path, headers={"Cache-Control": "no-cache"})
+        folder = os.path.join(folder_paths.get_temp_directory(), "longshot_song_preview")
+        key = audio_sync.preview_name(path)
+        lock = _preview_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            try:
+                out = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: audio_sync.make_preview(path, ff, folder))
+            except Exception as err:
+                return error(f"Couldn't prepare the song for playback: {err}", 500)
+        return web.FileResponse(out, headers={"Content-Type": "audio/wav", "Cache-Control": "no-cache"})
+
+    @routes.post("/longshot/align")
+    async def align_route(request):
+        """{audio: {filename, subfolder}, song: {file, subfolder}, at, seconds}: how far a take's
+        own audio (in output/) is from the song where it sits (0.11.0). {offset, confidence}:
+        offset > 0, the take sings early by that many seconds."""
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        import folder_paths
+        try:
+            a = body.get("audio") or {}
+            tpath = pj.resolve_input(folder_paths.get_output_directory(), a.get("filename"), a.get("subfolder", ""))
+            song = body.get("song") or {}
+            spath = pj.resolve_input(folder_paths.get_input_directory(), song.get("file"), song.get("subfolder", ""))
+            at, secs = float(body.get("at", 0)), float(body.get("seconds", 0))
+        except (ValueError, TypeError, AttributeError) as err:
+            return error(err)
+        if not os.path.isfile(tpath) or not os.path.isfile(spath):
+            return error("The take's audio or the song is missing.", 404)
+        ff = _ffmpeg_path()
+        if not ff:
+            return error("ffmpeg isn't available.", 500)
+
+        def measure():
+            take = audio_sync.read_audio(tpath, ff)
+            lead = min(3.0, max(0.0, at))
+            sa = audio_sync.read_audio(spath, ff, start=at - lead, duration=secs + lead + 3.0)
+            return audio_sync.find_offset(take, sa, lead)
+        try:
+            off, conf = await asyncio.get_running_loop().run_in_executor(None, measure)
+        except Exception as err:
+            return error(f"Couldn't compare the audio: {err}", 500)
+        try:
+            os.remove(tpath)                    # a scratch file
+        except OSError:
+            pass
+        return web.json_response({"offset": off, "confidence": conf})
+
+    @routes.post("/longshot/layout")
+    async def layout_route(request):
+        """{overlap, pieces: [{id, seconds, window}]}: every Shot's place on the film."""
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        pieces = body.get("pieces")
+        if not isinstance(pieces, list) or not pieces:
+            return error("Send {overlap, pieces}.")
+        try:
+            return web.json_response(film_layout(pieces[:1000], body.get("overlap", 22)))
+        except LookupError as err:
+            return error(str(err), 409)
+        except (ValueError, TypeError) as err:
+            return error(err)
 
     @routes.post("/longshot/live-preview")
     async def live_preview_route(request):

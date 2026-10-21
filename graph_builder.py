@@ -16,10 +16,12 @@ H3 Ref2V Long Shot workflow:
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import dataclass, field
 
+from . import film
 from . import projects as pj
 
 FPS = 24
@@ -44,12 +46,13 @@ ASPECTS = {
     "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:3": (4, 3), "3:4": (3, 4),
     "3:2": (3, 2), "2:3": (2, 3), "21:9": (21, 9),
 }
-MEGAPIXELS = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.98, 1.0, 1.2, 1.5, 1.8, 2.0]
+MEGAPIXELS = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.98, 1.0, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0]
 
 # Which pack provides each node class, for "missing node" errors.
 PACKS = {
     "MiniMaxH3TimelineShot": "H3 Long Shot 1.4.0+ (github.com/r34vtraining/H3_Longshot)",
     "MiniMaxH3Take": "H3 Long Shot 1.6.0+ (github.com/r34vtraining/H3_Longshot)",
+    "MiniMaxH3SongCut": "H3 Long Shot 1.6.17+ (github.com/r34vtraining/H3_Longshot)",
     "MiniMaxH3FrameRange": "H3 Long Shot 1.6.2+ (github.com/r34vtraining/H3_Longshot)",
     "MiniMaxH3UpscaleChunk": "H3 Long Shot 1.6.2+ (github.com/r34vtraining/H3_Longshot)",
     "MiniMaxH3SaveAudio": "H3 Long Shot 1.6.2+ (github.com/r34vtraining/H3_Longshot)",
@@ -79,7 +82,19 @@ VSR_QUALITIES = ["LOW", "MEDIUM", "HIGH", "ULTRA"]
 TAKE_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}__\d{1,20}__[0-9a-f]{8}\.safetensors")
 
 
-def _clip_nodes(g, n, shot, prev, vae, avae, width, height):
+def _song_gap(shot, env):
+    """0.9.0: the Shots left out of this render right before this one (Long Shot 1.6.17's
+    song_gap), so lip sync keeps its place in the song. None when there are none or
+    Long Shot is older."""
+    gap = str(shot.get("song_gap") or "").strip()
+    if not gap or not env.shot_takes("song_gap"):
+        return None
+    if not re.fullmatch(r"(w\d+|\d+(\.\d+)?)(,(w\d+|\d+(\.\d+)?))*", gap):
+        raise BuildError(f"A Shot's song gap {gap!r} isn't seconds or w<frames> separated by commas.")
+    return gap
+
+
+def _clip_nodes(g, n, shot, prev, vae, avae, width, height, env=None):
     """A Clip Shot: VHS Load Video (24 fps, trimmed) → MiniMax H3 Clip → Clip Shot."""
     clip = shot.get("clip") or {}
     if not clip.get("file"):
@@ -120,6 +135,9 @@ def _clip_nodes(g, n, shot, prev, vae, avae, width, height):
                        join=shot.get("join") if shot.get("join") in ("bridge", "cut") else "bridge")
     if prev is not None:
         shot_inputs["shots"] = prev
+    gap = _song_gap(shot, env) if env is not None else None
+    if gap:
+        shot_inputs["song_gap"] = gap
     return g.add(f"shot{n}", "MiniMaxH3ClipShot", f"[Shot {n}] clip", **shot_inputs)
 
 
@@ -134,6 +152,11 @@ class Env:
     video_formats: list | None = None
     shot_inputs: set | None = None      # MiniMax H3 Timeline Shot's optional inputs
     nvenc: bool | None = None           # ffmpeg can encode with h264_nvenc here
+    planner: object | None = None       # H3 Long Shot's planner module (0.9.2: song positions)
+    longshot: tuple | None = None       # H3 Long Shot's version (None: unknown, assume new)
+
+    def longshot_at_least(self, *v) -> bool:
+        return self.longshot is None or tuple(self.longshot) >= tuple(v)
 
     def has(self, cls: str) -> bool:
         return self.classes is None or cls in self.classes
@@ -221,23 +244,98 @@ def active_voices(project: dict) -> list:
             if isinstance(v, dict) and not v.get("bypassed") and v.get("file")]
 
 
+def song_ref_on(project: dict) -> bool:
+    """0.9.1: the song in the Audio panel goes into every Shot as <Audio 1>, a
+    reference audio like the native Reference to Video node's (switch on, file chosen)."""
+    a = project.get("audio") or {}
+    return bool(a.get("song_ref") and a.get("file"))
+
+
+def song_slot(project: dict) -> int:
+    """1 when the song (or, before 0.8.6, its vocals) takes <Audio 1>, else 0."""
+    a = project.get("audio") or {}
+    return 1 if song_ref_on(project) or a.get("voice_ref") else 0
+
+
+SONG_LABEL = "<Audio 1>"
+SONG_RETENTION = (f"{SONG_LABEL} (the song): fully_copy - the song is reused as the soundtrack; the singer's "
+                  "mouth moves only where its vocals are sung.")
+
+
 def audio_labels(project: dict) -> dict:
-    """{voice id: '<Audio N>'}. The song's vocals (Audio → Voice reference) take
-    <Audio 1> when that's on; voice references follow in card order."""
-    base = 1 if (project.get("audio") or {}).get("voice_ref") else 0
+    """{voice id: '<Audio N>'}. The song takes <Audio 1> when it's on (0.9.1);
+    voice references follow in card order."""
+    base = song_slot(project)
     return {str(v.get("id")): f"<Audio {base + k + 1}>" for k, v in enumerate(active_voices(project))}
 
 
+AUDIO_ROLE_WORD = {"sfx": "sound", "ambience": "ambience", "music": "music"}
+AUDIO_ROLE_NAME = {"sfx": "sound effect", "ambience": "ambience", "music": "music"}
+
+
+def audio_role(v: dict) -> str:
+    """What an audio reference is for (0.12.0): voice (a timbre for pictures), sfx,
+    ambience, music or other (the user's own word)."""
+    r = v.get("role") or "voice"
+    return r if r in ("voice", "sfx", "ambience", "music", "other") else "voice"
+
+
+def sound_word(v: dict) -> str:
+    """The word in "whose <word> comes from <Audio N>" for a sound of its own."""
+    r = audio_role(v)
+    return AUDIO_ROLE_WORD.get(r) or (str(v.get("role_text") or "").strip() or "sound")
+
+
+def voice_keys(project: dict) -> dict:
+    """{voice key: '<Audio N>'}: the voices a picture or RefMod can take (0.12.0): voice
+    references (by id) and audio RefMods ("refmod:<id>")."""
+    labels = audio_labels(project)
+    out = {str(v.get("id")): labels[str(v.get("id"))] for v in active_voices(project)
+           if audio_role(v) == "voice"}
+    for m, label in zip(active_refmods(project), refmod_labels(project)):
+        if m.get("kind") == "audio":
+            out["refmod:" + str(m.get("id"))] = label
+    return out
+
+
 def voice_retention(project: dict) -> list:
-    """retention_analysis lines for the voice references."""
+    """retention_analysis lines for the audio references (and audio RefMods that voice
+    a picture)."""
     labels, cast = audio_labels(project), active_cast(project)
+    mods = [(m, lab) for m, lab in zip(active_refmods(project), refmod_labels(project))]
+
+    def voiced_by(key):
+        who = [c.get("label") or picture_label(k) for k, c in enumerate(cast) if c.get("voice") == key]
+        who += [m.get("label") or lab for m, lab in mods if m.get("kind") != "audio" and m.get("voice") == key]
+        return who
+
     out = []
     for v in active_voices(project):
         a = labels[str(v.get("id"))]
-        who = [c.get("label") or picture_label(k) for k, c in enumerate(cast) if c.get("voice") == v.get("id")]
+        if audio_role(v) != "voice":
+            name = AUDIO_ROLE_NAME.get(audio_role(v)) or sound_word(v)
+            lab = str(v.get("label") or "").strip()
+            what = f"{name}{' ' + lab if lab else ''}"
+            if v.get("use") == "copy":
+                out.append(f"{a} ({what}): fully_copy - the audio is reused as it is.")
+            else:
+                out.append(f"{a} ({what}): reference - the character of the sound only, not the recording itself.")
+            continue
+        who = voiced_by(str(v.get("id")))
         out.append(f"{a} (voice timbre{' of ' + ', '.join(who) if who else ''}): reference - the voice "
                    "timbre only; what is said comes from each Shot's dialogue.")
+    for m, lab in mods:
+        if m.get("kind") == "audio":
+            who = voiced_by("refmod:" + str(m.get("id")))
+            if who:
+                out.append(f"{lab} (voice timbre of {', '.join(who)}): reference - the voice "
+                           "timbre only; what is said comes from each Shot's dialogue.")
     return out
+
+
+def audio_copied(project: dict) -> bool:
+    """Is an audio reference set to Copy (0.12.0)? Then the summary adds "audio reuse"."""
+    return any(audio_role(v) != "voice" and v.get("use") == "copy" for v in active_voices(project))
 
 
 MAX_REFMODS = 8             # Load H3 RefMods' slots
@@ -250,11 +348,25 @@ def active_refmods(project: dict) -> list:
             if isinstance(m, dict) and not m.get("bypassed") and m.get("name") and float(m.get("strength", 1) or 0) > 0]
 
 
+REFMOD_ROLES = ("appearance", "motion", "action", "expression", "pose", "costume", "style", "scene",
+                "environment", "camera and cut structure")
+
+
+def refmod_role(m: dict) -> str:
+    """A RefMod's definition (0.12.1): the one picked in its editor, else by kind
+    (audio: voice timbre; video: motion; picture: appearance)."""
+    if m.get("kind") == "audio":
+        return "voice timbre"
+    if m.get("role") in REFMOD_ROLES:
+        return m["role"]
+    return "motion" if m.get("kind") == "video" else "appearance"
+
+
 def refmod_labels(project: dict) -> list:
     """Each active RefMod's label, numbered after the native references by kind,
     as Long Shot presents them (pictures after the Cast, audio after the voices)."""
     counts = {"image": len(active_cast(project)), "video": 0,
-              "audio": len(audio_labels(project)) + (1 if (project.get("audio") or {}).get("voice_ref") else 0)}
+              "audio": len(audio_labels(project)) + song_slot(project)}
     out = []
     for m in active_refmods(project):
         kind = m.get("kind") if m.get("kind") in _REFMOD_KIND else "image"
@@ -346,6 +458,14 @@ class _Graph:
         self.nodes[node_id] = node
         return [node_id, 0]
 
+    def drop_unused(self, *node_ids):
+        """Leave out loaders nothing ended up using (e.g. the audio VAE when the song
+        replaces every clip's sound)."""
+        for nid in node_ids:
+            if not any(isinstance(v, list) and v and v[0] == nid
+                       for n in self.nodes.values() for v in n["inputs"].values()):
+                self.nodes.pop(nid, None)
+
 
 def _out(link, index):
     return [link[0], index]
@@ -390,6 +510,30 @@ def _maybe_vsr(g, n, s, images):
                  quality=quality)
 
 
+def _song_slices(g, project, items):
+    """0.9.0, "Song in final video": the song's own sound for each item that carries
+    song_at / song_len (seconds into the song file), so a take's clip has the music it
+    sits under on the film. {index: audio node}; empty when the route is off."""
+    audio = project.get("audio") or {}
+    if not audio.get("final_override") or not audio.get("file"):
+        return {}
+    wanted = [(n, it) for n, it in enumerate(items or [], 1)
+              if isinstance(it, dict) and it.get("song_len") not in (None, "")]
+    if not wanted:
+        return {}
+    try:
+        value = pj.input_path_value(audio["file"], audio.get("subfolder", ""))
+    except ValueError as err:
+        raise BuildError(f"Audio file: {err}") from None
+    raw = g.add("song_file", "LoadAudio", "Song", audio=value)
+    out = {}
+    for n, it in wanted:
+        out[n] = g.add(f"songcut{n}", "TrimAudioDuration", f"Song for clip {n}", audio=raw,
+                       start_index=_num(it.get("song_at", 0), "Song position", 0, 1e7),
+                       duration=_num(it.get("song_len"), "Song length", 0.01, 1e5))
+    return out
+
+
 def build_take_clips(project: dict, takes: list, env: Env | None = None) -> Build:
     """Decode takes on their own into clips: [{key, take}] -> one branch each
     (MiniMax H3 Take -> VAE Decode (+audio) -> Video Combine into clips/).
@@ -412,6 +556,7 @@ def build_take_clips(project: dict, takes: list, env: Env | None = None) -> Buil
     vae = g.add("vae_video", "VAELoader", "Video VAE", vae_name=s["video_vae"])
     avae = g.add("vae_audio", "VAELoader", "Audio VAE", vae_name=s["audio_vae"])
     clips = {}
+    songs = _song_slices(g, project, takes)
     for n, t in enumerate(takes or [], 1):
         key, take = str(t.get("key") or ""), str(t.get("take") or "")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", key) or not TAKE_NAME_RE.fullmatch(take):
@@ -419,12 +564,63 @@ def build_take_clips(project: dict, takes: list, env: Env | None = None) -> Buil
         lat = g.add(f"take{n}", "MiniMaxH3Take", f"Take {take}", cache_name=project_slug(project),
                     take=take, shot_id="")
         images = _maybe_vsr(g, n, s, g.add(f"clipdec{n}", "VAEDecode", "VAE Decode", samples=lat, vae=vae))
-        audio = g.add(f"clipaud{n}", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
+        audio = songs.get(n) or g.add(f"clipaud{n}", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
         clips[key] = _clip_save(g, n, project, images, audio, fmt, key)[0]
     if not clips:
         raise BuildError("No takes to make clips for.")
+    g.drop_unused("vae_audio")
     return Build(prompt=g.nodes, width=0, height=0, chain=[], nodes={"clips": clips},
                  filename_prefix=clips_subfolder(project), video_format=fmt, warnings=warnings)
+
+
+def _export_project(project: dict, takes: set) -> dict:
+    """0.10.0: the film cut down to the Shots being exported (locked to their takes), so
+    Long Shot refines just those, in film order. A Shot whose film neighbour is left out
+    starts fresh (Cut) instead of continuing from a Shot that isn't there."""
+    import copy
+    p = copy.deepcopy(project)
+    last_kept = False
+    for sh in p.get("shots") or []:
+        if sh.get("bypassed"):
+            continue
+        lock = sh.get("lock") or (sh.get("take") if sh.get("status") in ("approved", "review") else None)
+        keep = sh.get("kind") != "clip" and lock in takes
+        if keep:
+            sh["lock"] = lock
+            if sh.get("window"):
+                sh["frames"] = sh.get("window")
+            if not last_kept:
+                sh["join"] = "cut"
+        else:
+            sh["bypassed"] = True
+            sh["left_out"] = True
+        last_kept = keep
+    return p
+
+
+def build_take_audio(project: dict, take: str, env: Env | None = None) -> Build:
+    """0.11.0, Align to song: a take's own audio (H3's performance) as a WAV, so the
+    Studio can measure how far it is from the song. Nothing is sampled."""
+    env = env or Env()
+    s = project.get("settings") or {}
+    need = ["MiniMaxH3Take", "VAELoader", "VAEDecodeAudio", "MiniMaxH3SaveAudio"]
+    missing = [c for c in need if not env.has(c)]
+    if missing:
+        raise BuildError("ComfyUI is missing node(s) this needs:\n  " +
+                         "\n  ".join(f"{c} — from {PACKS.get(c, 'ComfyUI core')}" for c in missing))
+    if not s.get("audio_vae"):
+        raise BuildError("Settings: choose an audio vae file.")
+    take = str(take or "")
+    if not TAKE_NAME_RE.fullmatch(take):
+        raise BuildError(f"Not a take: {take!r}")
+    g = _Graph()
+    avae = g.add("vae_audio", "VAELoader", "Audio VAE", vae_name=s["audio_vae"])
+    lat = g.add("take", "MiniMaxH3Take", f"Take {take}", cache_name=project_slug(project), take=take, shot_id="")
+    aud = g.add("aud", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
+    prefix = f"{OUTPUT_SUBFOLDER}/{project_slug(project)}/_align/{take[:-len('.safetensors')]}"
+    g.add("wav", "MiniMaxH3SaveAudio", "Take audio", audio=aud, filename_prefix=prefix)
+    return Build(prompt=g.nodes, width=0, height=0, chain=[], nodes={"audio": "wav"},
+                 filename_prefix=prefix, video_format="", warnings=[])
 
 
 def build_clip_export(project: dict, items: list, env: Env | None = None) -> Build:
@@ -435,8 +631,12 @@ def build_clip_export(project: dict, items: list, env: Env | None = None) -> Bui
     The project's ProRes master setting also makes a ProRes copy of each clip."""
     env = env or Env()
     s = project.get("settings") or {}
+    # 0.10.0: with the refine pass, the takes are refined first (Long Shot, in film order;
+    # kept and reused), and the export is made from the refined takes, upscaled or not
+    rc = refine_settings(project, env)
+    upscale = bool(s.get("export_upscale")) or rc is None
     need = ["MiniMaxH3Take", "VAELoader", "VAEDecode", "VAEDecodeAudio", "MiniMaxH3UpscaleChunk",
-            "MiniMaxH3SaveAudio", "RTXVideoSuperResolution"]
+            "MiniMaxH3SaveAudio"] + (["RTXVideoSuperResolution"] if upscale else [])
     missing = [c for c in need if not env.has(c)]
     if missing:
         raise BuildError("ComfyUI is missing node(s) this needs:\n  " +
@@ -444,28 +644,46 @@ def build_clip_export(project: dict, items: list, env: Env | None = None) -> Bui
     for key in ("video_vae", "audio_vae"):
         if not s.get(key):
             raise BuildError(f"Settings: choose a {key.replace('_', ' ')} file.")
+    base = None
+    if rc is not None:
+        takes = {str((it or {}).get("take") or "") for it in items or []}
+        xp = _export_project(project, takes)
+        if any(not sh.get("bypassed") for sh in xp.get("shots") or []):
+            base = build_prompt(xp, env=env, long_shot_only=True, refine_export=True)
     vsr = s.get("rtx_vsr") or {}
     quality = vsr.get("quality", "ULTRA")
     if quality not in VSR_QUALITIES:
         raise BuildError(f"RTX Super Resolution quality must be one of {', '.join(VSR_QUALITIES)}.")
-    scale = _num(vsr.get("scale", 2.0), "RTX upscale factor", 1, 4)
-    warnings = []
+    scale = _num(vsr.get("scale", 2.0), "RTX upscale factor", 1, 4) if upscale else 1.0
+    warnings = list(base.warnings) if base is not None else []
     fmt = _video_format(env, warnings)
     work = f"{OUTPUT_SUBFOLDER}/{project_slug(project)}/Approved_Clips/_work"
     g = _Graph()
-    vae = g.add("vae_video", "VAELoader", "Video VAE", vae_name=s["video_vae"])
-    avae = g.add("vae_audio", "VAELoader", "Audio VAE", vae_name=s["audio_vae"])
+    if base is not None:
+        g.nodes.update(base.prompt)
+    vae = ["vae_video", 0] if "vae_video" in g.nodes else g.add("vae_video", "VAELoader", "Video VAE", vae_name=s["video_vae"])
+    avae = ["vae_audio", 0] if "vae_audio" in g.nodes else g.add("vae_audio", "VAELoader", "Audio VAE", vae_name=s["audio_vae"])
+    refine_in = dict(refine=rc["key"], after=["longshot", 1]) if base is not None else {}
     out = {}
+    songs = _song_slices(g, project, items)
     for n, it in enumerate(items or [], 1):
         take = str((it or {}).get("take") or "")
         if not TAKE_NAME_RE.fullmatch(take):
             raise BuildError(f"Not a take: {take!r}")
         lat = g.add(f"take{n}", "MiniMaxH3Take", f"Take {take}", cache_name=project_slug(project),
-                    take=take, shot_id="")
+                    take=take, shot_id="", **refine_in)
         images = g.add(f"dec{n}", "VAEDecode", "VAE Decode", samples=lat, vae=vae)
-        audio = g.add(f"aud{n}", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
-        g.add(f"up{n}", "MiniMaxH3UpscaleChunk", f"Upscale clip {n}", images=images, start=0,
-              length=10_000_000, scale=scale, quality=quality, filename_prefix=f"{work}/c{n:03d}",
+        # 0.9.0: the Shot's trims (frames off its take's start / end); a song slice is already cut to them
+        start = int(_num((it or {}).get("trim_in", 0) or 0, "Trim", 0, 1e6))
+        length = int(_num((it or {}).get("length", 0) or 0, "Length", 0, 1e7)) or 10_000_000
+        audio = songs.get(n)
+        if audio is None:
+            audio = g.add(f"aud{n}", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
+            if start or length < 10_000_000:
+                audio = g.add(f"audtrim{n}", "TrimAudioDuration", f"Sound of clip {n}, trimmed", audio=audio,
+                              start_index=start / FPS, duration=length / FPS if length < 10_000_000 else 1e7)
+        g.add(f"up{n}", "MiniMaxH3UpscaleChunk", f"Upscale clip {n}", images=images, start=start,
+              length=length, scale=scale, quality=quality, filename_prefix=f"{work}/c{n:03d}",
               codec="h264_nvenc" if fmt == NVENC else "libx264",
               master_prefix=f"{work}/c{n:03d}_master" if s.get("prores_master") else "", frame_rate=float(FPS))
         g.add(f"wav{n}", "MiniMaxH3SaveAudio", f"Sound of clip {n}", audio=audio,
@@ -473,6 +691,7 @@ def build_clip_export(project: dict, items: list, env: Env | None = None) -> Bui
         out[str(n)] = {"video": f"up{n}", "audio": f"wav{n}"}
     if not out:
         raise BuildError("No approved Shots to export.")
+    g.drop_unused("vae_audio")
     return Build(prompt=g.nodes, width=0, height=0, chain=[], nodes={"export": out},
                  filename_prefix=work, video_format=fmt, warnings=warnings)
 
@@ -490,6 +709,9 @@ def required_classes(project: dict, dry_run: bool = False, final: bool = False) 
         need += ["LoadImage", "ImageScaleToMaxDimension", "MiniMaxH3Subject"]
     if (s.get("turbo") or {}).get("on"):
         need.append("MiniMaxH3TurboLoRA")
+    r = s.get("refine") or {}
+    if r.get("on") and r.get("model") and (r.get("turbo") or {}).get("on"):
+        need.append("MiniMaxH3TurboLoRA")
     if any(l.get("on") and l.get("name") for l in s.get("loras") or []):
         need.append("LoraLoaderModelOnly")
     if final or (s.get("rtx_vsr") or {}).get("on"):
@@ -498,7 +720,8 @@ def required_classes(project: dict, dry_run: bool = False, final: bool = False) 
         need += ["MiniMaxH3LoadVideo", "MiniMaxH3Clip", "MiniMaxH3ClipShot"]
         if final and s.get("clip_pixels"):
             need.append("MiniMaxH3ClipPixels")
-    if a.get("lip_sync") or a.get("voice_ref") or a.get("final_override") or active_voices(project):
+    if a.get("lip_sync") or a.get("voice_ref") or a.get("final_override") or active_voices(project) \
+            or song_ref_on(project):
         need += ["LoadAudio", "TrimAudioDuration"]
     if a.get("lip_sync"):
         need.append("MiniMaxH3SongTrack")
@@ -509,9 +732,64 @@ def required_classes(project: dict, dry_run: bool = False, final: bool = False) 
     return need
 
 
+REFINE_DEFAULTS = {"on": False, "export_only": False, "model": None, "steps": 10, "denoise": 0.3,
+                   "shift_video": 12.0, "turbo": {"on": False, "lora": None, "strength": 1.0}}
+
+
+def refine_settings(project: dict, env: "Env | None" = None):
+    """0.10.0: the Refine panel's settings when the refine pass applies (on, a model chosen
+    that isn't the render model, H3 Long Shot 1.7.0+), with its key; else None."""
+    s = project.get("settings") or {}
+    r = dict(REFINE_DEFAULTS, **(s.get("refine") or {}))
+    r["turbo"] = dict(REFINE_DEFAULTS["turbo"], **(r.get("turbo") or {}))
+    if not r.get("on") or not r.get("model") or r["model"] == s.get("model"):
+        return None
+    if env is not None and not env.longshot_at_least(1, 7, 0):
+        return None
+    r["steps"] = int(_num(r.get("steps", 10), "Refine steps", 1, 200, int))
+    r["denoise"] = _num(r.get("denoise", 0.3), "Refine denoise", 0.01, 1.0)
+    r["shift_video"] = _num(r.get("shift_video", 12), "Refine video shift", 0.01, 100)
+    r["shift_audio"] = _num(s.get("shift_audio", 3), "Audio shift", 0.01, 100)
+    r["scheduler"] = s.get("scheduler", "beta")
+    t = r["turbo"]
+    if t.get("on") and not t.get("lora"):
+        raise BuildError("Refine: Turbo is on but no Turbo LoRA file is chosen.")
+    import hashlib
+    ident = json.dumps([r["model"], r["steps"], round(r["denoise"], 4), round(r["shift_video"], 4),
+                        round(r["shift_audio"], 4), r["scheduler"], s.get("sampler", "er_sde"),
+                        bool(t.get("on")), t.get("lora") if t.get("on") else None,
+                        round(float(t.get("strength", 1) or 0), 4) if t.get("on") else None])
+    r["key"] = "r" + hashlib.sha1(ident.encode()).hexdigest()[:12]
+    return r
+
+
+def _refine_nodes(g, project, r, env, sage):
+    """The refine model (its own model sampling and Turbo LoRA) and its sigmas."""
+    model = g.add("refine_unet", "UNETLoader", "Refine model", unet_name=r["model"],
+                  weight_dtype=(project.get("settings") or {}).get("weight_dtype", "default"))
+    if sage and env.has("PathchSageAttentionKJ"):
+        model = g.add("refine_sage", "PathchSageAttentionKJ", "Patch Sage Attention KJ (refine)",
+                      model=model, sage_attention=sage, allow_compile=False)
+    model = g.add("refine_shift", "MiniMaxH3SigmaShift", "ModelSamplingMiniMaxH3 (refine)", model=model,
+                  shift_video=r["shift_video"], shift_audio=r["shift_audio"])
+    t = r["turbo"]
+    if t.get("on"):
+        strength = _num(t.get("strength", 1.0), "Refine Turbo strength", -10, 10)
+        if env.has("MiniMaxH3TurboLoRA"):
+            model = g.add("refine_turbo", "MiniMaxH3TurboLoRA", "Turbo LoRA (refine)", model=model,
+                          lora_name=t["lora"], strength=strength, low_vram=False)
+        else:
+            model = g.add("refine_turbo", "LoraLoaderModelOnly", "Turbo LoRA (refine)", model=model,
+                          lora_name=t["lora"], strength_model=strength)
+    sigmas = g.add("refine_scheduler", "BasicScheduler", "BasicScheduler (refine)", model=model,
+                   scheduler=r["scheduler"], steps=r["steps"], denoise=r["denoise"])
+    return model, sigmas
+
+
 def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                  env: Env | None = None, final: bool = False, standalone: bool = False,
-                 clips_for=None, chunk=None) -> Build:
+                 clips_for=None, chunk=None, refine_export: bool = False,
+                 long_shot_only: bool = False) -> Build:
     """Turn a Studio project into an API prompt rendering the chain of active
     Shots up to and including `upto` (all active Shots when None).
 
@@ -606,6 +884,23 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
     g = _Graph()
     ids = {}
 
+    # 0.9.2: where each Shot's take starts on the whole film, for its part of the song
+    songref = song_ref_on(project)
+    song_start = _num(audio.get("start", 0) or 0, "Audio start", 0, 1e7)
+    nudge = int(_num(audio.get("sync_nudge", 0) or 0, "Sync nudge", -2400, 2400))
+    positions = None
+    lipsong = bool(audio.get("lip_sync") and audio.get("file"))
+    if (songref or lipsong or (audio.get("final_override") and audio.get("file"))) and env.planner is not None:
+        try:
+            positions = film.frame0_positions(film.film_shots(project), chain, overlap, env.planner)
+        except Exception as err:          # never stop a render over the song's place
+            warnings.append(f"Couldn't work out where the Shots sit in the song ({err}).")
+    per_shot_song = bool(songref and positions is not None and env.shot_takes("song_at")
+                         and env.has("MiniMaxH3LongShot"))
+    # 0.9.3: the pinned song (Song Track) takes each Shot's song_at from Long Shot 1.6.19
+    per_shot_pin = bool(lipsong and positions is not None and env.shot_takes("song_at")
+                        and env.longshot_at_least(1, 6, 19))
+
     # --- models -------------------------------------------------------------
     model = g.add("unet", "UNETLoader", "Load Diffusion Model",
                   unet_name=s["model"], weight_dtype=s.get("weight_dtype", "default"))
@@ -666,11 +961,11 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                          f"{len(cast)} are on. Bypass some.")
     resize_px = _num(s.get("ref_resize_px", 1500), "Reference resize", 16, 8192, int)
     refs, subjects = {}, None
-    voice_of = audio_labels(project)
-    n_audio = len(voice_of) + (1 if (project.get("audio") or {}).get("voice_ref") else 0)
+    voice_of = voice_keys(project)
+    n_audio = len(audio_labels(project)) + song_slot(project)
     if n_audio > MAX_AUDIO_REFS:
         raise BuildError(f"Long Shot takes at most {MAX_AUDIO_REFS} reference audios; {n_audio} are on "
-                         "(voice references, plus the song's voice when Voice reference is on). Bypass some.")
+                         "(voice references, plus the song as <Audio 1>). Bypass some.")
     for k, c in enumerate(cast):
         pic = picture_label(k)
         if not c.get("image"):
@@ -708,13 +1003,30 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             slots[f"copies_{i}"] = 1
         refmod_input["refmods"] = g.add("refmods", "MiniMaxH3RefModsLoader", "Load H3 RefMods", **slots)
         for m, label in zip(mods, refmod_labels(project)):
-            role = {"audio": "voice timbre", "video": "motion"}.get(m.get("kind"), "appearance")
+            role = refmod_role(m)
+            voice = voice_of.get(str(m.get("voice") or "")) if m.get("kind") != "audio" else None
             inputs = dict(label=m.get("label") or label, description=m.get("desc", ""), role=role,
-                          reference=label, role_2="-", reference_2="")
+                          reference=label, role_2="voice timbre" if voice else "-", reference_2=voice or "")
             if subjects is not None:
                 inputs["subjects"] = subjects
             subjects = g.add(f"subject_m{m.get('id') or label}"[:60].replace(" ", ""), "MiniMaxH3Subject",
                              f"{label} subject (RefMod)", **inputs)
+
+    # --- sounds of their own (0.12.0): "<sfx> is cars driving by, whose sound comes from <Audio 2>."
+    # (the compiler's subject roles are for pictures, so the clause goes in the description)
+    alabels = audio_labels(project)
+    for v in active_voices(project):
+        if audio_role(v) == "voice":
+            continue
+        a = alabels[str(v.get("id"))]
+        desc = str(v.get("desc") or "").strip().rstrip(".") or "this audio"
+        inputs = dict(label=str(v.get("label") or "").strip() or a,
+                      description=f"{desc}, whose {sound_word(v)} comes from {a}",
+                      role="appearance", reference="", role_2="-", reference_2="")
+        if subjects is not None:
+            inputs["subjects"] = subjects
+        subjects = g.add(f"subject_a{v.get('id')}"[:60].replace(" ", ""), "MiniMaxH3Subject",
+                         f"{a} subject (audio)", **inputs)
 
     # --- prompt ---------------------------------------------------------------
     # Timeline Shots (Long Shot 1.4): each carries its id, its locked take
@@ -723,7 +1035,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
     shots = None
     for n, shot in enumerate(chain, 1):
         if shot.get("kind") == "clip":
-            shots = _clip_nodes(g, n, shot, shots, vae, avae, width, height)
+            shots = _clip_nodes(g, n, shot, shots, vae, avae, width, height, env)
             continue
         seconds = _num(shot.get("seconds", 5), f"Shot {n} seconds", 0.1, 600)
         lock = shot.get("lock") or ""
@@ -788,19 +1100,48 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                       text=text,
                       shot_seed=_seed(shot.get("shot_seed", -1), f"Shot {n} seed"),
                       lock=lock, join=join, frames=frames, **anchor_inputs)
+        if (per_shot_song or per_shot_pin) and str(shot.get("id")) in positions:
+            # Long Shot 1.6.18: this Shot's own slice of the song, from where its take starts
+            at = song_start + (positions[str(shot.get("id"))][0] + nudge) / film.FPS
+            if at < 0:
+                warnings.append(f"Shot {n} starts before the song (Start plus the sync nudge); "
+                                "its song slice starts at the song's beginning.")
+            inputs["song_at"] = round(max(0.0, at), 4)
         if own_retention:
             inputs["retention"] = own_retention       # Long Shot 1.6.9: this Shot's own lines
+        gap = _song_gap(shot, env)
+        if gap:
+            inputs["song_gap"] = gap                   # Long Shot 1.6.17: its place in the song
+        elif str(shot.get("song_gap") or "").strip() and (project.get("audio") or {}).get("lip_sync"):
+            msg = ("Update H3 Long Shot to 1.6.17 or later: Shots left out of this render don't count "
+                   "toward the song's position, so lip sync starts at the song's beginning.")
+            if msg not in warnings:
+                warnings.append(msg)
         if shots is not None:
             inputs["shots"] = shots
         shots = g.add(f"shot{n}", "MiniMaxH3TimelineShot", f"[Shot {n}]", **inputs)
 
     types = [t for t in (style.get("task_types") or ["reference generation"]) if t][:3]
+    if songref and "audio reuse" not in types:
+        # 0.9.1: the song is reused as the soundtrack: [reference generation + audio reuse]
+        if len(types) < 3:
+            types.append("audio reuse")
+        else:
+            warnings.append("The summary has three task types already, so \"audio reuse\" (the song as "
+                            "<Audio 1>) isn't in it. Drop one in the Style panel.")
+    if audio_copied(project) and "audio reuse" not in types:
+        if len(types) < 3:
+            types.append("audio reuse")
+        else:
+            warnings.append("The summary has three task types already, so \"audio reuse\" (an audio "
+                            "reference set to Copy) isn't in it. Drop one in the Style panel.")
     types += ["-"] * (3 - len(types))
     builder_inputs = dict(
         subject_definitions="", task_type=types[0] if types[0] != "-" else "reference generation",
         task_type_2=types[1], task_type_3=types[2],
         summary=style.get("summary", ""),
-        retention_analysis="\n".join(x for x in [(style.get("retention") or "").strip(), *voice_retention(project)] if x),
+        retention_analysis="\n".join(x for x in [(style.get("retention") or "").strip(),
+                                                  SONG_RETENTION if songref else "", *voice_retention(project)] if x),
         style_line=style.get("style_line", ""), detailed_description="",
         overall_soundscape=style.get("soundscape", ""),
         non_diegetic_music=style.get("music", ""), shots=shots)
@@ -810,10 +1151,35 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                     **builder_inputs)
 
     # --- audio ----------------------------------------------------------------
-    lip, voice, final = (bool(audio.get("lip_sync")), bool(audio.get("voice_ref")),
+    lip, voice, final = (bool(audio.get("lip_sync")), bool(audio.get("voice_ref")) and not songref,
                          bool(audio.get("final_override")))
     loader = None
     long_extra = {}
+    if songref and per_shot_song:
+        # 0.9.2: the whole song to Long Shot, which gives each Shot its slice (its song_at)
+        try:
+            song_value = pj.input_path_value(audio["file"], audio.get("subfolder", ""))
+        except ValueError as err:
+            raise BuildError(f"Audio file: {err}") from None
+        long_extra["song_ref"] = g.add("song_file_ref", "LoadAudio", "Song (<Audio 1>, a slice per Shot)",
+                                       audio=song_value)
+    elif songref:
+        # 0.9.1 (older Long Shot): the song as <Audio 1>, cut to Start / Length for every Shot
+        warnings.append("Update H3 Long Shot to 1.6.18 or later so each Shot gets its own part of the "
+                        "song; until then every Shot gets the song from Start.")
+        try:
+            song_value = pj.input_path_value(audio["file"], audio.get("subfolder", ""))
+        except ValueError as err:
+            raise BuildError(f"Audio file: {err}") from None
+        song_raw = g.add("song_file_ref", "LoadAudio", "Song", audio=song_value)
+        song_len = _num(audio.get("length", 0), "Audio length", 0, 1e7)
+        if not song_len:
+            song_len = round(sum(float(x.get("seconds", 0) or 0) for x in chain), 3) or 5.0
+            warnings.append(f"Audio Length is 0, so {SONG_LABEL} is the song from Start for this render's "
+                            f"length ({song_len:g}s).")
+        long_extra["ref_audios.ref_audio_0"] = g.add(
+            "song_ref", "TrimAudioDuration", f"{SONG_LABEL} the song", audio=song_raw,
+            start_index=_num(audio.get("start", 0), "Audio start", 0, 1e7), duration=song_len)
     if lip or voice or final:
         if not audio.get("file"):
             raise BuildError("An audio route is on but no audio file is chosen.")
@@ -826,7 +1192,14 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         loader = g.add("audio", "TrimAudioDuration", "Trim Audio", audio=raw,
                        start_index=_num(audio.get("start", 0), "Audio start", 0, 1e7),
                        duration=length if length > 0 else 1e7)
-        if lip:
+        if lip and per_shot_pin:
+            # 0.9.3: the whole song, pinned to each Shot's timeline from its song_at
+            long_extra["song"] = g.add("song", "MiniMaxH3SongTrack", "MiniMax H3 Song Track",
+                                       audio=raw, audio_vae=avae)
+        elif lip:
+            if lipsong and positions is not None:
+                warnings.append("Update H3 Long Shot to 1.6.19 or later so the pinned song starts where "
+                                "each Shot sits on the film; until then it follows this render only.")
             long_extra["song"] = g.add("song", "MiniMaxH3SongTrack", "MiniMax H3 Song Track",
                                        audio=loader, audio_vae=avae)
             total = sum(float(x.get("seconds", 0)) for x in chain)
@@ -843,7 +1216,8 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                 "vocals", "MelBandRoFormerSampler", "MelBand vocals", model=mel, audio=loader)
 
     # voice references (audio cards in Cast & Scenes): <Audio N> after the song's vocals
-    base = 1 if voice else 0
+    base = 1 if voice or songref else 0
+    slot0 = 0 if per_shot_song else base           # Long Shot puts song_ref before ref_audios
     for k, v in enumerate(active_voices(project)):
         a_label = f"<Audio {base + k + 1}>"
         try:
@@ -852,12 +1226,23 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             raise BuildError(f"{v.get('label') or a_label}: {err}") from None
         vraw = g.add(f"voicefile{k + 1}", "LoadAudio", f"{a_label} {v.get('label', '')}".strip(), audio=value)
         vlen = _num(v.get("length", 0) or 0, f"{a_label} length", 0, 1e7)
-        long_extra[f"ref_audios.ref_audio_{base + k}"] = g.add(
+        long_extra[f"ref_audios.ref_audio_{slot0 + k}"] = g.add(
             f"voice{k + 1}", "TrimAudioDuration", f"Trim {a_label}", audio=vraw,
             start_index=_num(v.get("start", 0) or 0, f"{a_label} start", 0, 1e7),
             duration=vlen if vlen > 0 else 1e7)
 
     # --- Long Shot ---------------------------------------------------------------
+    # --- refine pass (0.10.0, Long Shot 1.7.0) -------------------------------------
+    rc = refine_settings(project, env)
+    if rc is not None:
+        mode = "new and locked takes" if (upscale_final or refine_export) else \
+            ("off" if rc.get("export_only") else "new takes")
+        if mode != "off":
+            rmodel, rsigmas = _refine_nodes(g, project, rc, env, sage if sage not in ("disabled", "off", False) else None)
+            long_extra.update(refine_model=rmodel, refine_sigmas=rsigmas, refine_mode=mode,
+                              refine_key=rc["key"], model_name=str(s.get("model") or ""),
+                              refine_model_name=str(rc["model"]))
+            ids["refine"] = {"mode": mode, "key": rc["key"]}
     long_shot = g.add("longshot", "MiniMaxH3LongShot", "MiniMax H3 Long Shot",
                       model=model, clip=clip, vae=vae, noise=noise, sampler=sampler,
                       sigmas=sigmas, prompt=_out(builder, 3), width=width, height=height,
@@ -866,6 +1251,12 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                       save_to_disk=True,          # takes are what locked Shots load
                       cache_name=project_slug(project), audio_vae=avae,
                       **long_extra, **refs, **refmod_input)
+
+    if long_shot_only:
+        # 0.10.0: just the run (an export refines its locked takes; Take nodes follow it)
+        ids.update(longshot="longshot", builder="builder")
+        return Build(prompt=g.nodes, width=width, height=height, chain=[x.get("id") for x in chain],
+                     nodes=ids, filename_prefix="", video_format="", warnings=warnings)
 
     # --- output: each new take's own clip (renders while reviewing) -----------------
     ids_in_chain = [str(x.get("id")) for x in chain if x.get("kind") != "clip"]
@@ -877,7 +1268,22 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             lat = g.add(f"take{n}", "MiniMaxH3Take", f"[{sid}] its take", cache_name=project_slug(project),
                         take="", shot_id=sid, after=_out(long_shot, 1))
             imgs = _maybe_vsr(g, n, s, g.add(f"clipdec{n}", "VAEDecode", "VAE Decode", samples=lat, vae=vae))
-            aud = g.add(f"clipaud{n}", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
+            if final and loader is not None and positions is not None and sid in positions:
+                # 0.9.2: the song where this take starts on the film, for its whole window
+                f0, win = positions[sid]
+                aud = g.add(f"clipsong{n}", "TrimAudioDuration", f"[{sid}] its part of the song",
+                            audio=raw, start_index=round(max(0.0, song_start + f0 / film.FPS), 4),
+                            duration=round(win / film.FPS, 4))
+            elif final and loader is not None and env.has("MiniMaxH3SongCut"):
+                # 0.9.0: "Song in final video": the clip carries the song where this take sits
+                aud = g.add(f"clipsong{n}", "MiniMaxH3SongCut", f"[{sid}] its part of the song",
+                            audio=loader, latent=_out(long_shot, 0), shot_id=sid)
+            else:
+                if final and loader is not None:
+                    msg = "Update H3 Long Shot to 1.6.17 or later to put the song on each Shot's clip."
+                    if msg not in warnings:
+                        warnings.append(msg)
+                aud = g.add(f"clipaud{n}", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
             clips[sid] = _clip_save(g, n, project, imgs, aud, fmt,
                                     re.sub(r"[^A-Za-z0-9_-]+", "_", sid)[:64] or "shot")[0]
         ids.update(longshot="longshot", builder="builder", clips=clips)
@@ -928,7 +1334,8 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
               start=chunk["start"], length=chunk["length"], scale=vsr_scale, quality=vsr_quality,
               filename_prefix=cprefix, codec="h264_nvenc" if fmt == NVENC else "libx264",
               master_prefix=cprefix + "_master" if master else "", frame_rate=float(FPS))
-        ids.update(chunk="upscale_chunk", combine="combine")
+        ids.update(chunk="upscale_chunk", combine="combine",
+                   chunk_codec="h264_nvenc" if fmt == NVENC else "libx264")   # 0.9.0: black joins them
         if master:
             ids["prores"] = "combine_prores"
         if chunk["audio"]:

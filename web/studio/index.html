@@ -93,9 +93,10 @@
     <div class="panel" id="shots-panel">
       <div class="panel-head">
         <div class="head-left">
-          <h2>Shots</h2>
+          <h2><button class="fold" data-action="fold" data-fold="shots" aria-expanded="true" title="Show only one line"><span class="fold-ch" aria-hidden="true">▾</span>Shots</button></h2>
+          <span class="muted small shots-sum" id="shots-summary"></span>
           <button class="ghost sm flip-btn" data-action="flip-shots" id="flip-shots" aria-pressed="false" title="Flip the list: newest Shot on top">⇅</button>
-          <span class="muted small">approved shots keep their takes; a re-render is pinned to the shots around it</span>
+          <span class="muted small shots-hint">approved shots keep their takes; a re-render is pinned to the shots around it</span>
         </div>
         <div class="head-right render-btns">
           <button class="ghost sm" data-action="render-all" id="render-all" title="Render every Shot not rendered yet in one go, each continued from the Shot before it. Rendered Shots keep their takes, so gaps render as bridges.">▶ Render all</button>
@@ -117,14 +118,19 @@
     <div id="stage" class="stage">
     <div class="stage-bar-bg" aria-hidden="true"></div>
     <div class="panel viewer" id="viewer-panel">
-      <div class="viewer-mini" id="viewer-mini" hidden>
-        <span class="vm-dot" id="vm-dot" aria-hidden="true"></span>
-        <span class="vm-text" id="vm-text" aria-live="polite">No Shot queued</span>
-        <span class="vm-bar" id="vm-bar" hidden><span id="vm-fill"></span></span>
-        <button class="ghost sm" data-action="viewer-show" title="Show the video, timeline and controls again">Show preview</button>
+      <div class="panel-head viewer-head">
+        <div class="head-left">
+          <h2><button class="fold" data-action="viewer-fold" id="viewer-fold" aria-expanded="true" title="Fold the video, timeline and controls to one status line (Live preview pauses while it's folded)"><span class="fold-ch" aria-hidden="true">▾</span>Preview</button></h2>
+          <span class="viewer-mini" id="viewer-mini" hidden>
+            <span class="vm-dot" id="vm-dot" aria-hidden="true"></span>
+            <span class="vm-text" id="vm-text" aria-live="polite">No Shot queued</span>
+            <span class="vm-bar" id="vm-bar" hidden><span id="vm-fill"></span></span>
+          </span>
+        </div>
       </div>
       <div class="screen" id="screen">
         <video id="video" playsinline preload="auto"></video>
+        <audio id="song-audio" preload="auto" hidden></audio>
         <div class="placeholder" id="placeholder">
           <div class="ph-label">[ Video preview ]</div>
           <div class="ph-shot" id="ph-shot">Nothing rendered yet</div>
@@ -153,7 +159,6 @@
           · <button class="linkbtn" data-action="update-preview" id="tl-update" title="Decode every rendered Shot together for the exact video. Nothing is sampled.">Update preview</button></span>
           <button class="linkbtn" data-action="make-clips" id="tl-make" hidden title="Takes in Take history that have no clip yet: decode each on its own (nothing is sampled)."></button>
         </div>
-        <button class="hide-preview" data-action="viewer-hide" id="hide-btn" title="Fold the video, timeline and controls to one status line (Live preview pauses while it's hidden)">▴ Hide preview</button>
         </div>
         <div id="tl-export" class="tl-approx tl-export" hidden>
           <button class="linkbtn" data-action="export-approved" id="tl-export-btn" title="Copy each approved Shot's own clip (whole, with sound) into output/longshot/&lt;project&gt;/Approved_Clips, numbered as on the timeline. Nothing is decoded.">Export approved clips</button>
@@ -202,6 +207,14 @@
       <div id="audio" hidden></div>
     </div>
 
+    <div class="panel" id="refine-panel">
+      <button class="fold" data-action="toggle" data-key="refineOpen" id="refine-toggle" aria-expanded="false" aria-controls="refine">
+        <span class="head-left"><span class="h2">Refine</span><span class="warn-tag">⚠ all shots</span><span class="muted small" id="refine-summary"></span></span>
+        <span class="muted chev" id="refine-chev">Show ▾</span>
+      </button>
+      <div id="refine" hidden></div>
+    </div>
+
     <div class="panel" id="settings-panel">
       <button class="fold" data-action="toggle" data-key="settingsOpen" id="settings-toggle" aria-expanded="true" aria-controls="settings">
         <span class="head-left"><span class="h2">Settings</span><span class="warn-tag">⚠ all shots</span><span class="muted small" id="settings-summary"></span></span>
@@ -230,6 +243,7 @@
       <div class="panel-head">
         <h2><button class="fold" data-action="fold" data-fold="queue" aria-expanded="true" title="Show only one line"><span class="fold-ch" aria-hidden="true">▾</span>Queue</button> <span class="muted small q-count" id="queue-count"></span></h2>
         <span class="q-btns">
+          <button class="ghost sm" data-action="queue-flip" id="queue-flip" aria-pressed="false" aria-label="Latest on top" title="Oldest on top · click for latest on top">⇅</button>
           <button class="ghost sm" data-action="queue-pause" id="queue-pause" title="Finish the job that's running, then hold the rest">Pause</button>
           <button class="ghost sm" data-action="queue-clear" id="queue-clear" title="Remove finished, failed and stopped jobs from the list">Clear finished</button>
         </span>
@@ -259,7 +273,8 @@
         <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg>
       </button>
     </div>
-    <div class="editor-grid">
+    <div class="editor-alt" id="editor-alt" hidden></div>
+    <div class="editor-grid" id="editor-cast">
       <button class="editor-img" id="editor-img" data-action="editor-zoom" title="Enlarge"></button>
       <div class="editor-fields">
         <div><span class="pic" id="editor-pic"></span> <span class="muted small">set automatically from the order of active references</span></div>
@@ -308,6 +323,7 @@
 
 <div id="toast" class="toast" hidden></div>
 </div>
+<div id="tl-readout" class="tl-readout" role="status" hidden></div>
 <script src="/longshot/static/studio.js"></script>
 </body>
 </html>

@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.8.13"
+STUDIO_VERSION = "0.13.3"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -632,23 +632,38 @@ def _next_number(folder, stem):
 
 
 def _join_run_audio(output_dir, slug, parts, ffmpeg, run):
-    """[{filename, subfolder, skip}] -> one WAV in the chunks folder: each part
-    from `skip` seconds on (sample-exact), in order."""
-    files, skips = [], []
-    for p in parts:
-        files.append(_chunk_path(output_dir, slug, p))
+    """[{filename, subfolder, skip, dur?} | {silence}] -> one WAV in the chunks folder:
+    each part from `skip` seconds on (sample-exact), `dur` seconds long when given
+    (0.9.0: a trimmed run end), and `silence` seconds of nothing between (a gap on
+    the film), in order."""
+    files, chains = [], []
+    for k, p in enumerate(parts):
         try:
-            skips.append(max(0.0, float(p.get("skip") or 0)))
+            if isinstance(p, dict) and "silence" in p:
+                sec = max(0.0, float(p.get("silence") or 0))
+                chains.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={sec:.6f},"
+                              f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{k}]")
+                continue
+            sk = max(0.0, float(p.get("skip") or 0))
+            dur = p.get("dur")
+            dur = None if dur in (None, "") else max(0.0, float(dur))
         except (TypeError, ValueError):
-            raise ValueError("A run's sound needs a number of seconds to skip.") from None
+            raise ValueError("A run's sound needs numbers of seconds (skip, dur, silence).") from None
+        i = len(files)
+        files.append(_chunk_path(output_dir, slug, p))
+        cut = f"atrim=start={sk:.6f}" + (f":duration={dur:.6f}" if dur is not None else "")
+        # a run whose sound is shorter than its pictures is padded, so later parts stay in place
+        pad = f",apad=whole_dur={dur:.6f}" if dur is not None else ""
+        chains.append(f"[{i}:a]{cut},asetpts=PTS-STARTPTS,aresample=48000{pad},"
+                      f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{k}]")
+    if not files:
+        raise ValueError("No sound to join.")
     out = os.path.join(chunks_folder(output_dir, slug), "film_audio.wav")
     cmd = [ffmpeg, "-y", "-v", "error"]
     for f in files:
         cmd += ["-i", f]
-    chains = [f"[{i}:a]atrim=start={sk:.6f},asetpts=PTS-STARTPTS,aresample=48000,"
-              f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}]" for i, sk in enumerate(skips)]
-    graph = ";".join(chains) + ";" + "".join(f"[a{i}]" for i in range(len(files))) + \
-        f"concat=n={len(files)}:v=0:a=1[out]"
+    graph = ";".join(chains) + ";" + "".join(f"[a{k}]" for k in range(len(parts))) + \
+        f"concat=n={len(parts)}:v=0:a=1[out]"
     cmd += ["-filter_complex", graph, "-map", "[out]", "-c:a", "pcm_s24le", out]
     res = run(cmd)
     if getattr(res, "returncode", 1) != 0 or not os.path.isfile(out):
@@ -658,7 +673,48 @@ def _join_run_audio(output_dir, slug, parts, ffmpeg, run):
     return out
 
 
-def join_chunks(output_dir, slug, prefix, chunks, audio=None, masters=None, ffmpeg="ffmpeg", run=None):
+def _song_audio(output_dir, slug, song, seconds, input_dir, ffmpeg, run):
+    """0.9.0: the song file itself, from `at` seconds for the film's length, as a WAV in
+    the chunks folder ("Song in final video", continuous under gaps and edits)."""
+    try:
+        path = resolve_input(input_dir, song.get("file"), song.get("subfolder", ""))
+        at = max(0.0, float(song.get("at") or 0))
+    except (TypeError, ValueError, AttributeError) as err:
+        raise ValueError(f"The song: {err}") from None
+    if not os.path.isfile(path):
+        raise ValueError(f"The song file {song.get('file')} is missing.")
+    out = os.path.join(chunks_folder(output_dir, slug), "film_song.wav")
+    res = run([ffmpeg, "-y", "-v", "error", "-ss", f"{at:.6f}", "-i", path, "-vn",
+               "-af", f"aresample=48000,apad=whole_dur={seconds:.6f},atrim=duration={seconds:.6f}",
+               "-ac", "2", "-c:a", "pcm_s24le", out])
+    if getattr(res, "returncode", 1) != 0 or not os.path.isfile(out):
+        err = getattr(res, "stderr", b"") or b""
+        raise RuntimeError("Cutting the song failed: " +
+                           (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))[-600:])
+    return out
+
+
+def _black(output_dir, slug, like, frames, codec_args, name, ffmpeg, run):
+    """`frames` of black at 24 fps, encoded with the chunks' own settings (so the
+    pictures still join without encoding again), the size of chunk `like`."""
+    probe = run([ffmpeg, "-hide_banner", "-i", like])
+    info = parse_probe((getattr(probe, "stderr", b"") or b"").decode("utf-8", "replace")
+                       if isinstance(getattr(probe, "stderr", b""), bytes) else str(getattr(probe, "stderr", "")))
+    if not info.get("width"):
+        raise RuntimeError("Couldn't read the chunks' size to make the black between them.")
+    out = os.path.join(chunks_folder(output_dir, slug), name)
+    res = run([ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i",
+               f"color=c=black:s={info['width']}x{info['height']}:r=24", "-frames:v", str(int(frames)),
+               *codec_args, out])
+    if getattr(res, "returncode", 1) != 0 or not os.path.isfile(out):
+        err = getattr(res, "stderr", b"") or b""
+        raise RuntimeError("Making the black between the runs failed: " +
+                           (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))[-600:])
+    return out
+
+
+def join_chunks(output_dir, slug, prefix, chunks, audio=None, masters=None, ffmpeg="ffmpeg", run=None,
+                gaps=None, song=None, input_dir=None, codec_args=None, master_args=None):
     """Join chunk videos (in order) and the sound into videos/<Name>_NNNNN-audio.mp4
     (and the ProRes chunks into <Name>_master_NNNNN-audio.mov). The pictures are
     copied, not encoded again. `prefix` is the render's own file prefix
@@ -676,13 +732,38 @@ def join_chunks(output_dir, slug, prefix, chunks, audio=None, masters=None, ffmp
     if not chunks:
         raise ValueError("No chunks to join.")
     vids = [_chunk_path(output_dir, slug, c) for c in chunks]
-    if isinstance(audio, list):
+    mast = [_chunk_path(output_dir, slug, c) for c in (masters or [])]
+    # 0.9.0: black where nothing covers the film (a trim, a move, a Shot not rendered),
+    # [{before: chunk index, frames}]; the masters' chunks run alongside
+    gaps = [g for g in (gaps or []) if isinstance(g, dict) and int(g.get("frames") or 0) > 0]
+    total = None
+    if gaps:
+        if not codec_args:
+            raise ValueError("Black between the runs needs the chunks' codec.")
+        per = len(mast) == len(vids) and bool(mast)
+        vlist, mlist = list(vids), list(mast)
+        for k, g in sorted(enumerate(gaps), key=lambda x: -int(x[1].get("before") or 0)):
+            at = max(0, min(len(vids), int(g.get("before") or 0)))
+            f = int(g["frames"])
+            vlist.insert(at, _black(output_dir, slug, vids[0], f, codec_args, f"black_{k:03d}.mp4", ffmpeg, run))
+            if per and master_args:
+                mlist.insert(at, _black(output_dir, slug, mast[0], f, master_args, f"black_{k:03d}.mov", ffmpeg, run))
+        vids, mast = vlist, mlist
+    if song:
+        try:
+            total = float((song or {}).get("seconds"))
+        except (TypeError, ValueError):
+            raise ValueError("The song needs the film's length in seconds.") from None
+        wav = _song_audio(output_dir, slug, song, total, input_dir or "", ffmpeg, run)
+        audio = None
+    if song:
+        pass
+    elif isinstance(audio, list):
         # a film decoded run by run (0.8.5): each run's sound, its first `skip`
         # seconds dropped (the hidden overlap after a cut), one after another
         wav = _join_run_audio(output_dir, slug, audio, ffmpeg, run) if audio else None
     else:
         wav = _chunk_path(output_dir, slug, audio) if audio else None
-    mast = [_chunk_path(output_dir, slug, c) for c in (masters or [])]
     folder = videos_folder(output_dir, slug)
     n = max(_next_number(folder, stem), _next_number(folder, stem + "_master"))
 
@@ -762,11 +843,16 @@ def _write_manifest(folder, data):
     os.replace(tmp, path)
 
 
-def keep_upscaled(output_dir, slug, items, sig, prores=False):
-    """Before an upscaled export: [{key, name}] wanted at upscale `sig`. Clips
-    already upscaled from the same take at the same settings stay (renamed when
-    their number changed); everything else in the folder goes, so it matches the
-    timeline. Returns {"kept": [names], "todo": [keys still to upscale]}."""
+def keep_upscaled(output_dir, slug, items, sig, prores=False, ffmpeg=None, input_dir=None, song=None, run=None):
+    """Before an upscaled export: [{key, name, sig, asig, cut?, song_at?, song_len?}]
+    wanted. A clip already upscaled from the same take with the same picture `sig`
+    stays (renamed when its number changed); when only its sound changed (`asig`:
+    the song on or off, or the song's place), its sound is mixed again with ffmpeg
+    (0.13.3: from the song, or from the take's own clip), with no new upscale.
+    Everything else in the folder goes, so it matches the timeline.
+    Returns {"kept": [names], "todo": [keys still to upscale], "remixed": [names]}."""
+    import subprocess
+    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, timeout=900))
     if not is_slug(slug):
         raise ValueError("Not a project slug.")
     want = []
@@ -774,14 +860,27 @@ def keep_upscaled(output_dir, slug, items, sig, prores=False):
         key = str((it or {}).get("key") or "")
         if not _CLIP_KEY_RE.fullmatch(key):
             raise ValueError(f"Not a clip: {key!r}")
-        want.append((key, _export_name(str(it.get("name") or ""), ".mp4")))
+        # 0.12.8: each clip's own sig, so approving or moving another Shot doesn't make
+        # every clip "changed"; 0.13.3: the picture's sig, the sound apart (asig)
+        want.append((key, _export_name(str(it.get("name") or ""), ".mp4"), str(it.get("sig") or sig), it))
     folder = approved_folder(output_dir, slug)
     if not os.path.isdir(folder):
-        return {"kept": [], "todo": [k for k, _ in want]}
+        return {"kept": [], "todo": [k for k, _, _, _ in want], "remixed": []}
+    song_path = None
+    if song and ffmpeg:
+        try:
+            song_path = resolve_input(input_dir or "", song.get("file"), song.get("subfolder", ""))
+        except (ValueError, TypeError):
+            song_path = None
+        if song_path and not os.path.isfile(song_path):
+            song_path = None
     man = _read_manifest(folder)
+    sig_of = {key: isig for key, _, isig, _ in want}
     by_key = {}
     for fname, rec in man.items():
-        if not isinstance(rec, dict) or rec.get("sig") != sig or not _plain_file_name(fname):
+        if not isinstance(rec, dict) or not _plain_file_name(fname):
+            continue
+        if rec.get("sig") != sig_of.get(rec.get("key")):
             continue
         if not os.path.isfile(os.path.join(folder, fname)):
             continue
@@ -789,16 +888,22 @@ def keep_upscaled(output_dir, slug, items, sig, prores=False):
         if prores and not os.path.isfile(os.path.join(folder, mov)):
             continue
         by_key.setdefault(rec.get("key"), fname)
-    keep, todo = [], []                       # keep: (old name, new name, key)
-    for key, name in want:
+    keep, todo = [], []                       # keep: (old name, new name, key, item)
+    for key, name, _isig, it in want:
         old = by_key.pop(key, None)
+        if old and str(it.get("asig") or "") != str((man.get(old) or {}).get("asig") or ""):
+            # the sound changed: mixed again below, or upscaled again when it can't be
+            needs_song = bool(it.get("song_len"))
+            clip = os.path.join(clips_folder(output_dir, slug), key + ".mp4")
+            if not ffmpeg or (needs_song and not song_path) or (not needs_song and not os.path.isfile(clip)):
+                old = None
         if old:
-            keep.append((old, name, key))
+            keep.append((old, name, key, it))
         else:
             todo.append(key)
     # rename through temporary names (numbers can shift by one)
     moves = []
-    for i, (old, new, key) in enumerate(keep):
+    for i, (old, new, key, _it) in enumerate(keep):
         for ext in (".mp4", ".mov"):
             src = os.path.join(folder, old[:-4] + ext)
             if os.path.isfile(src):
@@ -808,14 +913,48 @@ def keep_upscaled(output_dir, slug, items, sig, prores=False):
     clear_approved(output_dir, slug, keep_work=False)
     for tmp, dest in moves:
         os.replace(tmp, dest)
-    new_man = {}
-    for old, new, key in keep:
+    new_man, remixed = {}, []
+    for old, new, key, it in keep:
         rec = dict(man.get(old) or {})
-        rec.update(key=key, sig=sig)
+        asig = str(it.get("asig") or "")
+        if asig != str(rec.get("asig") or ""):
+            _remix_sound(folder, new, key, it, output_dir, slug, ffmpeg, song_path, run)
+            remixed.append(new)
+        rec.update(key=key, sig=sig_of.get(key, sig), asig=asig)
         rec["prores"] = os.path.isfile(os.path.join(folder, new[:-4] + ".mov"))
         new_man[new] = rec
     _write_manifest(folder, new_man)
-    return {"kept": [new for _, new, _ in keep], "todo": todo}
+    return {"kept": [new for _, new, _, _ in keep], "todo": todo, "remixed": remixed}
+
+
+def _remix_sound(folder, name, key, it, output_dir, slug, ffmpeg, song_path, run):
+    """An exported clip's picture as it is, with its sound made again: the song from
+    song_at for song_len, or the take's own sound from its clip (cut the same way)."""
+    if it.get("song_len") and song_path:
+        src = ["-ss", f"{max(0.0, float(it.get('song_at') or 0)):.6f}", "-t", f"{float(it['song_len']):.6f}", "-i", song_path]
+    else:
+        clip = os.path.join(clips_folder(output_dir, slug), key + ".mp4")
+        cut = it.get("cut") if isinstance(it.get("cut"), dict) else None
+        src = (["-ss", f"{max(0.0, float(cut.get('start') or 0)):.6f}", "-t", f"{float(cut['dur']):.6f}"] if cut else []) + ["-i", clip]
+    for ext, acodec in ((".mp4", ["aac", "-b:a", "256k"]), (".mov", ["pcm_s24le"])):
+        dest = os.path.join(folder, name[:-4] + ext)
+        if not os.path.isfile(dest):
+            continue
+        tmp = dest + ".remix" + ext
+        cmd = [ffmpeg, "-y", "-v", "error", "-i", dest, *src, "-map", "0:v:0", "-map", "1:a:0?",
+               "-c:v", "copy", "-af", "apad", "-shortest", "-c:a", *acodec]
+        if ext == ".mp4":
+            cmd += ["-movflags", "+faststart"]
+        res = run(cmd + [tmp])
+        if getattr(res, "returncode", 1) != 0 or not os.path.isfile(tmp):
+            err = getattr(res, "stderr", b"") or b""
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise RuntimeError(f"Mixing the sound of {name[:-4]}{ext} failed: " +
+                               (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))[-400:])
+        os.replace(tmp, dest)
 
 
 def clear_approved(output_dir, slug, keep_work=False):
@@ -842,11 +981,21 @@ def _export_name(name, ext):
     return out
 
 
-def copy_approved(output_dir, slug, items):
-    """[{key, name}] -> clips/<key>.mp4 copied as Approved_Clips/<name>.mp4
-    (the folder is emptied first, so it matches the timeline). Returns the names."""
+def copy_approved(output_dir, slug, items, ffmpeg=None, input_dir=None, song=None, run=None):
+    """[{key, name, cut?, song_at?, song_len?}] -> clips/<key>.mp4 as
+    Approved_Clips/<name>.mp4 (the folder is emptied first, so it matches the
+    timeline). Returns the names. 0.9.0: `cut` {start, dur} (seconds into the clip)
+    exports what the film shows of a trimmed Shot, encoded again frame-exactly;
+    with `song` {file, subfolder} and song_at / song_len the clip carries the song."""
+    import subprocess
+    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, timeout=900))
     if not is_slug(slug):
         raise ValueError("Not a project slug.")
+    song_path = None
+    if song:
+        song_path = resolve_input(input_dir or "", song.get("file"), song.get("subfolder", ""))
+        if not os.path.isfile(song_path):
+            raise ValueError(f"The song file {song.get('file')} is missing.")
     plan = []
     for it in items or []:
         key = str((it or {}).get("key") or "")
@@ -855,15 +1004,38 @@ def copy_approved(output_dir, slug, items):
         src = os.path.join(clips_folder(output_dir, slug), key + ".mp4")
         if not os.path.isfile(src):
             raise ValueError(f"The clip for {it.get('name') or key} isn't there yet.")
-        plan.append((src, _export_name(str(it.get("name") or ""), ".mp4")))
+        cut = it.get("cut") if isinstance(it.get("cut"), dict) else None
+        sng = (float(it["song_at"]), float(it["song_len"])) if song_path and it.get("song_len") else None
+        plan.append((src, _export_name(str(it.get("name") or ""), ".mp4"), cut, sng))
     if not plan:
         raise ValueError("No approved clips to export.")
+    if any(c or g for _, _, c, g in plan) and not ffmpeg:
+        raise ValueError("ffmpeg isn't available, so trimmed clips (or the song) can't be exported.")
     folder = approved_folder(output_dir, slug)
     os.makedirs(folder, exist_ok=True)
     clear_approved(output_dir, slug)
-    for src, name in plan:
-        shutil.copy2(src, os.path.join(folder, name))
-    return [name for _, name in plan]
+    for src, name, cut, sng in plan:
+        dest = os.path.join(folder, name)
+        if not cut and not sng:
+            shutil.copy2(src, dest)
+            continue
+        cmd = [ffmpeg, "-y", "-v", "error"]
+        if cut:
+            cmd += ["-ss", f"{max(0.0, float(cut.get('start') or 0)):.6f}", "-t", f"{float(cut['dur']):.6f}"]
+        cmd += ["-i", src]
+        if sng:
+            cmd += ["-ss", f"{max(0.0, sng[0]):.6f}", "-t", f"{sng[1]:.6f}", "-i", song_path,
+                    "-map", "0:v:0", "-map", "1:a:0", "-af", "apad", "-shortest"]
+        else:
+            cmd += ["-map", "0:v:0", "-map", "0:a?"]
+        cmd += (["-c:v", "libx264", "-crf", "16", "-preset", "medium", "-pix_fmt", "yuv420p"] if cut else ["-c:v", "copy"])
+        cmd += ["-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart", dest]
+        res = run(cmd)
+        if getattr(res, "returncode", 1) != 0 or not os.path.isfile(dest):
+            err = getattr(res, "stderr", b"") or b""
+            raise RuntimeError(f"Exporting {name} failed: " +
+                               (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))[-400:])
+    return [name for _, name, _, _ in plan]
 
 
 def _work_path(output_dir, slug, entry):
@@ -904,6 +1076,8 @@ def mux_approved(output_dir, slug, items, ffmpeg="ffmpeg", run=None, sig=None):
         clear_approved(output_dir, slug, keep_work=True)
     man = _read_manifest(folder) if sig is not None else {}
     keys = {str((it or {}).get("name") or ""): str((it or {}).get("key") or "") for it in items or []}
+    sigs = {str((it or {}).get("name") or ""): str((it or {}).get("sig") or sig or "") for it in items or []}
+    asigs = {str((it or {}).get("name") or ""): str((it or {}).get("asig") or "") for it in items or []}
     out = []
     for name, video, wav, master in plan:
         for src, ext, acodec, extra in ((video, ".mp4", ["aac", "-b:a", "256k"], ["-movflags", "+faststart"]),
@@ -921,7 +1095,8 @@ def mux_approved(output_dir, slug, items, ffmpeg="ffmpeg", run=None, sig=None):
                                    (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))[-400:])
             out.append(name + ext)
         if sig is not None and keys.get(name):
-            man[name + ".mp4"] = {"key": keys[name], "sig": sig, "prores": bool(master)}
+            man[name + ".mp4"] = {"key": keys[name], "sig": sigs.get(name) or sig, "asig": asigs.get(name, ""),
+                                  "prores": bool(master)}
     if sig is not None:
         _write_manifest(folder, man)
     shutil.rmtree(os.path.join(folder, _WORK_DIR), ignore_errors=True)
@@ -1057,7 +1232,8 @@ def take_info(output_dir, slug, name):
         return None
     out = {"name": name, "bytes": os.path.getsize(path), "created": raw.get("created", ""),
            "shot_id": raw.get("shot_id", name.split("__")[0]),
-           "seconds": float(raw["seconds"]) if raw.get("seconds") else None}
+           "seconds": float(raw["seconds"]) if raw.get("seconds") else None,
+           "model": raw.get("model") or None, "refine": raw.get("refine") or None}   # Long Shot 1.7.0
     for k in _TAKE_INTS:
         try:
             out[k] = int(raw[k]) if raw.get(k, "") != "" else None

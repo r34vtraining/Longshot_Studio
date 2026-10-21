@@ -329,13 +329,13 @@ kbd { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .theater-slot { padding: 24px 28px 0; max-width: 1600px; margin: 0 auto; box-sizing: border-box; }
 /* Theater: the viewer spans the page; the decision panel sits beside it on wide
    screens (below it on narrow ones) so Continue / Reroll stay in view. */
-.stage.theater .screen { width: min(100%, calc((100vh - 290px) * var(--ar, 1.7778))); margin: 0 auto; aspect-ratio: var(--ar, 16 / 9); }
+.stage.theater .screen { width: min(100%, calc((100vh - 400px) * var(--ar, 1.7778))); margin: 0 auto; aspect-ratio: var(--ar, 16 / 9); }
 @media (min-width: 1100px) {
   .stage.theater { display: grid; grid-template-columns: minmax(0, 1fr) 340px; align-items: end; gap: 18px; }
   .stage.theater .decision .dec-btns > * { flex: 1 1 100%; }
 }
 @media (max-width: 1099px) {
-  .stage.theater .screen { width: min(100%, calc((100vh - 470px) * var(--ar, 1.7778))); }
+  .stage.theater .screen { width: min(100%, calc((100vh - 580px) * var(--ar, 1.7778))); }
 }
 .stage:fullscreen #theater-btn { display: none; }
 .ctl[aria-pressed=true].icon-ctl { border-color: var(--amber); }
@@ -836,3 +836,114 @@ textarea.fit { resize: none; overflow: hidden; line-height: 1.5; }
 .viewer-mini { flex-wrap: wrap; row-gap: 6px; }
 .vm-text { flex: 1 1 auto; white-space: normal; }
 .vm-bar { order: 3; flex: 1 0 100%; }
+
+/* 0.9.0: trims and moves on the timeline, the song on Shot cards */
+.tl-trim { position: absolute; top: 0; bottom: 0; width: 8px; z-index: 4; cursor: ew-resize; touch-action: none; }
+.tl-trim.l { left: 0; border-left: 3px solid transparent; }
+.tl-trim.r { right: 0; border-right: 3px solid transparent; }
+.tl-block:hover .tl-trim.l, .tl-block:hover .tl-trim.r { border-color: var(--amber); }
+.tl-block:hover .tl-trim.sec { border-color: var(--line-4); }
+body.trimming, body.trimming * { cursor: ew-resize !important; user-select: none; }
+.tl-readout { position: fixed; z-index: 50; pointer-events: none; font-family: var(--mono); font-size: 11px;
+  background: rgba(10, 11, 13, .9); color: var(--amber-lt); border: 1px solid var(--amber-line); border-radius: 4px; padding: 3px 7px; }
+.tl-readout[hidden] { display: none; }
+.song-at { color: #8FD3F0; font-family: var(--mono); }
+.edit-tag { color: var(--amber-lt); }
+.reset-edit { margin-left: 2px; }
+
+/* 0.9.1: audio scrub bar */
+.ascrub-row { display: flex; align-items: flex-start; gap: 8px; margin-top: 12px; }
+.ascrub-col { flex: 1; min-width: 0; }
+.ascrub-row > button { margin-top: 9px; }
+#ascrub-pos { color: var(--sub); margin-top: 2px; }
+.ascrub { position: relative; height: 44px; border-radius: 6px; background: var(--field);
+  border: 1px solid var(--field-line); cursor: pointer; overflow: hidden; touch-action: none; }
+.ascrub.off { cursor: default; opacity: .5; }
+.ascrub:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
+.ascrub canvas { position: absolute; inset: 0; width: 100%; height: 100%; color: var(--dim); }
+.ascrub-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: var(--amber); opacity: .18; pointer-events: none; }
+.ascrub-head { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; left: 0; background: var(--amber); pointer-events: none; }
+.ascrub-times { display: flex; justify-content: space-between; gap: 8px; margin-top: 3px; }
+
+/* 0.9.2: seed ▲ ▼ */
+.seed-step { display: inline-flex; flex-direction: column; gap: 1px; margin-left: 4px; vertical-align: middle; }
+.seed-step .ghost.xs { padding: 0 6px; font-size: 9px; line-height: 13px; border-radius: 4px; }
+.seed-field { display: flex; align-items: center; }
+.seed-field input { flex: 1; min-width: 0; }
+.seed-row .seed-field, .seed-row .seed-step { padding-bottom: 0; }
+.seed-field .seed-step { flex: none; }
+
+/* 0.9.5: Audio panel note */
+.note-ref2v { margin-top: 12px; padding: 8px 10px; border-radius: 6px; background: var(--amber-bg);
+  border: 1px solid var(--amber-line); color: var(--sub); font-size: 12px; line-height: 1.45; }
+.note-ref2v b { color: var(--amber-lt); font-weight: 600; }
+
+/* 0.11.0 */
+.hold-tag { color: var(--dim); font-style: italic; }
+.ph-mark { position: absolute; top: 0; bottom: 0; width: 9px; margin-left: -4px; cursor: ew-resize; z-index: 2; }
+.ph-mark::after { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 1px; background: var(--green); }
+.ph-mark::before { content: ""; position: absolute; left: 1px; top: 0; border: 4px solid transparent; border-top-color: var(--green); }
+.ph-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.ph-btns { display: flex; gap: 6px; }
+.ph-opts { margin-top: 6px; }
+.tl-ph { position: absolute; bottom: 0; width: 0; height: 8px; border-left: 1px solid var(--green); pointer-events: auto; }
+.tl-ph::before { content: ""; position: absolute; left: -4px; top: -4px; border: 3.5px solid transparent; border-top-color: var(--green); }
+.sync-ok { color: var(--ok); }
+.sync-off { color: var(--warn); }
+
+/* 0.12.0: the pop-out editor for audio references and RefMods */
+.editor-alt { overflow: auto; min-height: 0; }
+.ed-form { display: flex; flex-direction: column; gap: 12px; max-width: 720px; }
+.ed-form input.field, .ed-form select.field { font-size: 14px; }
+.ed-form textarea { resize: vertical; min-height: 70px; line-height: 1.5; font-size: 14px; }
+.ed-row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.ed-row > .lbl { flex: 1 1 160px; }
+.ed-player { width: 100%; }
+.ed-links { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px solid var(--line-2); border-radius: 8px; max-height: 180px; overflow: auto; }
+.ed-preview { font-style: italic; }
+.ed-mvoice { justify-content: flex-start; margin-top: 0; }
+[hidden].ed-sound, [hidden].ed-other, [hidden].ed-mrole, [hidden].ed-voice, [hidden].ed-mvoice { display: none !important; }
+
+/* 0.12.2: Space plays the song while the Audio panel is selected */
+#audio-panel.selected { outline: 1px solid var(--amber); outline-offset: -1px; }
+
+/* 0.12.3: Shots and Preview fold from their titles, like the other panels */
+.shots-sum { display: none; }
+#shots-panel.folded .shots-sum { display: inline; }
+#shots-panel.folded .shots-hint, #shots-panel.folded .flip-btn, #shots-panel.folded .first-row,
+#shots-panel.folded #shots, #shots-panel.folded #add-shot { display: none !important; }
+.viewer-head { margin-bottom: 10px; }
+.viewer-head .head-left { flex: 1 1 auto; min-width: 0; }
+.viewer.mini .viewer-head { margin-bottom: 0; }
+.viewer.mini .viewer-head .fold-ch { transform: rotate(-90deg); }
+.viewer-head .viewer-mini { flex: 1 1 auto; min-width: 0; min-height: 0; flex-wrap: nowrap; }
+.stage:fullscreen .viewer-head { display: none; }   /* 0.13.2: theater keeps its Preview title */
+
+/* 0.12.4: task type buttons above the Summary */
+.tt-cell { min-width: 0; }
+.tt-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 6px; }
+.tt-chip { background: none; border: 1px solid var(--line-2); border-radius: 999px; padding: 3px 10px; font-size: 12px;
+  color: var(--muted); cursor: pointer; }
+.tt-chip:hover { color: var(--text); border-color: var(--line-4); }
+.tt-chip.on { background: var(--amber); border-color: var(--amber); color: #15120A; font-weight: 600; }
+.tt-chip.auto { border-style: dashed; border-color: var(--amber); color: var(--amber); }
+.tt-preview { margin-bottom: 6px; }
+
+/* 0.12.5: aligned by hand */
+.aligned-btn { display: inline-block; background: none; border: 1px solid var(--line-2); border-radius: 999px; padding: 0 8px; font: inherit; font-size: 11px;
+  color: var(--muted); cursor: pointer; line-height: 18px; }
+.aligned-btn:hover { color: var(--text); border-color: var(--line-4); }
+.aligned-btn.on { background: #1E3B2D; border-color: #3FB37F; color: #7FE0B0; font-weight: 600; }
+.tl-aligned { color: #3FB37F; font-weight: 700; }
+
+/* 0.12.7: a Shot made at another size */
+.size-tag { color: #E8B04A; border: 1px dashed #8A6A2A; border-radius: 4px; padding: 0 5px; font-size: 11px; }
+
+/* 0.12.10: the label first, <Picture N> / <Audio N> after it (smaller); when space runs
+   short, the number gives way first */
+.card-top .label-view { order: 0; flex: 0 0 auto; max-width: 100%; }
+.card-top .pic { order: 1; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 11px; opacity: .75; }
+
+/* 0.13.0: jobs queued in another Studio tab */
+.q-row.other { opacity: .55; }
+.q-row.other .q-name { font-weight: 600; }

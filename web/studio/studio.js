@@ -18,6 +18,19 @@ const SEED_MAX = 4294967295;           // rerolls draw from 0 … 2^32 − 1
 const CORE_NODES = ["MiniMaxH3Shot", "MiniMaxH3Subject", "MiniMaxH3RefPromptBuilder",
   "MiniMaxH3LongShot", "MiniMaxH3SigmaShift", "ImageScaleToMaxDimension", "MiniMaxH3SaveVideo"];
 
+/** Seconds from "13.67", "0:13.67" or "1:02:03.5" (hours:minutes:seconds). */
+function parseTC(v) {
+  const str = String(v ?? "").trim();
+  if (!str) return 0;
+  const parts = str.split(":").map((x) => x.trim());
+  if (parts.length > 3 || parts.some((x) => !/^\d*\.?\d+$/.test(x))) return NaN;
+  return parts.reduce((acc, x) => acc * 60 + Number(x), 0);
+}
+
+/** Snapped to a whole frame. */
+const toFrame = (t) => Math.round((Number(t) || 0) * FPS) / FPS;
+
+/** Player times, in seconds (0.10.0, like the Shots' Seconds field): 00:13.67. */
 function fmt(t) {
   t = Math.max(0, t || 0);
   const m = Math.floor(t / 60), s = t - m * 60;
@@ -36,7 +49,7 @@ function store(key, value) {           // browser storage: conveniences only
 function applyFolds() {
   let f = {};
   try { f = JSON.parse(store("h3studio.folds") || "{}") || {}; } catch (e) { f = {}; }
-  for (const k of ["plan", "queue", "cast"]) {
+  for (const k of ["plan", "queue", "cast", "shots"]) {
     const panel = document.getElementById(k + "-panel"), btn = panel && panel.querySelector("[data-fold]");
     if (!panel) continue;
     panel.classList.toggle("folded", !!f[k]);
@@ -56,9 +69,22 @@ function folded(k) {
   try { return !!(JSON.parse(store("h3studio.folds") || "{}") || {})[k]; } catch (e) { return false; }
 }
 
+// 0.13.0: several Studio tabs at once. Each tab has its own id (ComfyUI sends a run's
+// progress to the tab that queued it) and its own queue; "h3studio.tabs" lists the open
+// tabs ({id: {t, slug}}, a heartbeat every 2 s) so tabs can tell each other apart.
+const TABS_KEY = "h3studio.tabs", TAB_FRESH = 6000;
+const OPEN = { slug: null };
+function readTabs() {
+  try { return JSON.parse(localStorage.getItem(TABS_KEY) || "{}") || {}; } catch (e) { return {}; }
+}
+function writeTabs(t) { try { localStorage.setItem(TABS_KEY, JSON.stringify(t)); } catch (e) { /* storage off */ } }
 const CLIENT_ID = (() => {
   let id = null;
   try { id = sessionStorage.getItem("h3studio.client"); } catch (e) { /* ignore */ }
+  // a duplicated tab copies the session (and this id) from a tab that's still open: a new id.
+  // (A reload keeps it: the tab takes itself off the list as it goes.)
+  const live = id && readTabs()[id];
+  if (live && Date.now() - live.t < TAB_FRESH) id = null;
   if (!id) {
     id = "h3studio-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
     try { sessionStorage.setItem("h3studio.client", id); } catch (e) { /* ignore */ }
@@ -75,7 +101,7 @@ const uid = (p) => p + Date.now().toString(36) + (uidN++).toString(36);
 
 const S = {
   project: null, projects: [], opts: null, local: false,
-  conn: "connecting", open: null, takes: {}, styleOpen: false, audioOpen: false, advOpen: false, settingsOpen: true, uploading: {},
+  conn: "connecting", open: null, takes: {}, styleOpen: false, audioOpen: false, advOpen: false, refineOpen: false, settingsOpen: true, uploading: {},
   busy: null, error: null, loop: false, dry: null, saveState: "",
   refState: {}, refInfo: {}, inputs: null, segStats: null, conflict: null, checkedFor: null,
   clips: {},       // timeline clips of this project: key -> {dur, made, thumb}
@@ -97,6 +123,9 @@ const DEFAULT_SETTINGS = {
   save_png: false, save_noaudio: false,      // Video Combine's side files: deleted after each render
   prores_master: false,                      // Upscale final also writes a 10-bit ProRes 422 HQ .mov
   multi_take: 1,                             // takes per render: the render runs this many times, new seeds
+  // 0.10.0: a refine pass with a second model (e.g. fl2va over ref2va takes), Long Shot 1.7.0+
+  refine: { on: false, export_only: false, model: null, steps: 10, denoise: 0.3, shift_video: 12,
+    turbo: { on: false, lora: null, strength: 1.0 } },
 };
 
 function normalize(p) {
@@ -112,11 +141,17 @@ function normalize(p) {
   if (p.audio && p.audio.voice_ref) { p.audio.voice_ref = false; p.voice_ref_dropped = true; }
   p.refmods = (p.refmods || []).map((m) => ({ id: m.id || uid("m"), name: m.name || "", kind: ["image", "video", "audio"].includes(m.kind) ? m.kind : "image",
     label: m.label || "", desc: m.desc || "", strength: Math.max(0, Math.min(1, m.strength === undefined ? 1 : Number(m.strength) || 0)),
+    voice: m.kind !== "audio" && m.voice ? m.voice : null,   // 0.12.0: a picture / video RefMod's voice
+    role: REFMOD_ROLES.includes(m.role) ? m.role : null,       // 0.12.1: its definition (null: by kind)
     bypassed: !!m.bypassed }));
   p.voices = (p.voices || []).map((v) => ({ id: v.id || uid("v"), label: v.label || "", file: v.file || "",
     subfolder: v.subfolder || "", type: "input", original_name: v.original_name || v.file || "",
     sha256: v.sha256 || null, size_bytes: v.size_bytes ?? null, start: Math.max(0, Number(v.start) || 0),
-    length: Math.max(0, Number(v.length) || 0), bypassed: !!v.bypassed }));
+    length: Math.max(0, Number(v.length) || 0), bypassed: !!v.bypassed,
+    // 0.12.0: what the audio is for. "voice" (a timbre, linked from pictures / RefMods), or a
+    // sound of its own (<sfx> of cars driving by): sfx, ambience, music or your own words
+    role: AUDIO_ROLES.some(([k]) => k === v.role) ? v.role : "voice", role_text: v.role_text || "",
+    desc: v.desc || "", use: v.use === "copy" ? "copy" : "reference" }));
   p.ref_sets = p.ref_sets && typeof p.ref_sets === "object" ? p.ref_sets : {};      // 0.8.13: restore references
   p.take_refs = p.take_refs && typeof p.take_refs === "object" ? p.take_refs : {};
   p.style = Object.assign({ summary: "", retention: "", style_line: "", soundscape: "", music: "N/A",
@@ -137,7 +172,16 @@ function normalize(p) {
     join: s.join === "cut" || s.join === "context" ? s.join : "bridge",
     context_from: s.context_from || null,     // Context: the take of the Shot before it was rendered from
     kind: s.kind === "clip" ? "clip" : "shot",
+    // 0.9.0: trims and move on the film, in frames (non-destructive)
+    place: s.place && typeof s.place === "object" && (s.place.in || s.place.out || s.place.shift)
+      ? { in: Math.max(0, Math.round(Number(s.place.in) || 0)), out: Math.max(0, Math.round(Number(s.place.out) || 0)),
+        shift: Math.round(Number(s.place.shift) || 0) } : null,
     standalone: !!s.standalone && s.kind !== "clip",   // its take was rendered on its own (no pins)
+    render_model: s.render_model || null,              // 0.10.0: the model its take was made with
+    // 0.11.0: its take's singing against the song: {take, at, offset, conf}
+    align: s.align && typeof s.align === "object" && s.align.take ? s.align : null,
+    // 0.12.5: lined up by hand with the song ({key}: the take or clip it was for); locks its place
+    aligned: s.aligned && typeof s.aligned === "object" && s.aligned.key ? { key: String(s.aligned.key) } : null,
     seam: ["ok", "mismatch"].includes(s.seam) ? s.seam : null,   // its left join, as last known
     cleared: !!s.cleared && s.status === "queued",              // Clear render: waiting to render again
     clip: s.kind === "clip" ? Object.assign({ file: "", subfolder: "", original_name: "", sha256: null,
@@ -147,9 +191,24 @@ function normalize(p) {
   p.audio = Object.assign({ file: null, subfolder: "", type: "input", size_bytes: null, sha256: null,
     original_name: null, start: 0, length: 0, lip_sync: false, voice_ref: false,
     final_override: false, melband_model: "Infinite Talk\\MelBandRoformer_fp16.safetensors" }, p.audio || {});
+  // 0.9.1: the song is <Audio 1>, a reference audio like the native ref2v node's. The
+  // lip-sync and song-in-final routes are off until they're reworked.
+  if (p.audio.song_ref === undefined) p.audio.song_ref = !!p.audio.file;
+  p.audio.song_ref = !!p.audio.song_ref;
+  p.audio.lip_sync = false;     // 0.9.5: the pinned song is gone from the Studio (no effect on lip timing)
+  p.audio.final_override = !!p.audio.final_override;
+  p.audio.sync_nudge = Math.max(-240, Math.min(240, Math.round(Number(p.audio.sync_nudge) || 0)));
+  // 0.11.0: phrase starts in the song (seconds into the file), and how they're found
+  p.audio.phrases = (Array.isArray(p.audio.phrases) ? p.audio.phrases : []).map(Number)
+    .filter((x) => Number.isFinite(x) && x >= 0).sort((a, b) => a - b);
+  p.audio.phrase_gap = Math.max(0.1, Math.min(3, Number(p.audio.phrase_gap) || 0.5));
+  p.audio.phrase_sens = Math.max(0, Math.min(1, p.audio.phrase_sens === undefined ? 0.5 : Number(p.audio.phrase_sens) || 0));
+  p.audio.phrase_lead = Math.max(0, Math.min(48, Math.round(Number(p.audio.phrase_lead) || 0)));
   const s = Object.assign({}, DEFAULT_SETTINGS, p.settings || {});
   s.turbo = Object.assign({}, DEFAULT_SETTINGS.turbo, s.turbo || {});
   s.rtx_vsr = Object.assign({}, DEFAULT_SETTINGS.rtx_vsr, s.rtx_vsr || {});
+  s.refine = Object.assign({}, DEFAULT_SETTINGS.refine, s.refine || {});
+  s.refine.turbo = Object.assign({}, DEFAULT_SETTINGS.refine.turbo, s.refine.turbo || {});
   if (![1.5, 2].includes(Number(s.rtx_vsr.scale))) s.rtx_vsr.scale = 2;   // 1.5× or 2× only
   s.loras = [0, 1, 2].map((i) => Object.assign({ on: false, name: null, strength: 1.0 }, (s.loras || [])[i] || {}));
   p.settings = s;
@@ -171,9 +230,12 @@ const liveVoices = () => (P().voices || []).filter((v) => !v.bypassed && v.file)
 const voiceById = (id) => (P().voices || []).find((v) => v.id === id) || null;
 function audioLabelOf(v) {
   const i = v ? liveVoices().indexOf(v) : -1;
-  return i < 0 ? null : `<Audio ${(P().audio.voice_ref ? 1 : 0) + i + 1}>`;
+  return i < 0 ? null : `<Audio ${songSlot() + i + 1}>`;
 }
-const audioRefCount = () => liveVoices().length + (P().audio.voice_ref ? 1 : 0);
+/** 0.9.1: the song takes <Audio 1> while its switch is on and a file is chosen. */
+const songRefOn = () => !!(P() && P().audio && P().audio.song_ref && P().audio.file);
+const songSlot = () => (songRefOn() || P().audio.voice_ref ? 1 : 0);
+const audioRefCount = () => liveVoices().length + songSlot();
 const numOf = (id) => active().findIndex((s) => s.id === id) + 1;
 const titleOf = (s) => (s ? "Shot " + numOf(s.id) : "—");
 const reviewShot = () => {
@@ -198,6 +260,16 @@ function nextToRender() {
 /** Not continued from the Shot before: a Cut, or Context (a cut that takes the
  *  last frame of the Shot before as a reference picture). */
 const isCut = (s) => !!s && (s.join === "cut" || s.join === "context");
+/** 0.12.1: a RefMod's definition ("whose <role> comes from"); the default follows its kind. */
+const REFMOD_ROLES = ["appearance", "motion", "action", "expression", "pose", "costume", "style", "scene",
+  "environment", "camera and cut structure"];
+const refmodRole = (m) => m.kind === "audio" ? "voice timbre" : (m.role || (m.kind === "video" ? "motion" : "appearance"));
+/** 0.12.0: what an audio reference is for, and how the prompt says it. */
+const AUDIO_ROLES = [["voice", "Voice timbre"], ["sfx", "Sound effect"], ["ambience", "Ambience"], ["music", "Music"], ["other", "Other…"]];
+/** 0.11.0: a placeholder — a Shot (not a clip) with an empty prompt and no take in use.
+ *  It never renders and holds its exact length on the film. */
+const isEmptyShot = (s) => !!s && s.kind !== "clip" && !String(s.text || "").trim() &&
+  !((s.status === "approved" || s.status === "review") && s.take);
 
 /** The join chip: what the user wants at this Shot's joins. Its choices come
  *  from the Shots that exist next to it (0.8.3):
@@ -207,14 +279,16 @@ const isCut = (s) => !!s && (s.join === "cut" || s.join === "context");
  *  Continuous reads "Bridge" when the Shots on both sides are approved. Kept in
  *  s.join ("cut" | "context" | "bridge"; Continuous is the default). Render all
  *  and the main button read it as the join with the Shot before; ▶ on one Shot
- *  applies it to the approved Shots next to it at that moment (chipPlan). */
+ *  applies it to the rendered Shots next to it at that moment (chipPlan). */
 function chipNear(s) {
   const act = active(), i = act.indexOf(s);
   return { prev: i > 0 ? act[i - 1] : null, next: i >= 0 ? act[i + 1] || null : null };
 }
 function chipSides(s) {
   const act = active(), i = act.indexOf(s);
-  const ok = (x) => !!x && (x.kind === "clip" || (x.status === "approved" && !!x.take));
+  // 0.9.0: a neighbour under review counts too (its take is pinned as it is); a Shot
+  // queued right behind one still rendering sees its take when its own render starts
+  const ok = (x) => !!x && !otherSize(x) && (x.kind === "clip" || ((x.status === "approved" || x.status === "review") && !!x.take));
   return { prev: i > 0 && ok(act[i - 1]) ? act[i - 1] : null, next: i >= 0 && ok(act[i + 1]) ? act[i + 1] : null };
 }
 function chipOptions(s) {
@@ -234,6 +308,165 @@ function chipName(s, j = chipJoin(s)) {
 /** What ▶ does for Shot s, worked out when the render starts:
  *  { alone } a standalone render (Cut, Context), or { joins } the joins sent
  *  for this render only (the Shot's start and its next Shot's start). */
+// ---------------------------------------------------------------------------
+// The film layout (0.9.0): where every Shot sits on the whole film, from H3 Long
+// Shot's own planner (so it matches a render exactly), Shots not rendered yet
+// included. The song is laid along this film: a Shot's place in the song is its
+// place here, plus the Audio panel's Start.
+// ---------------------------------------------------------------------------
+
+const LAYOUT = { sig: null, byId: {}, total: 0, fps: FPS, pending: null, error: null };
+
+/** A Shot's edit on the film (0.9.0), in frames: trimmed off its start (in) and end
+ *  (out), and moved (shift, + is later). Non-destructive: nothing re-renders. */
+function editOf(s) {
+  const e = (s && s.place) || {};
+  return { in: Math.max(0, Math.round(Number(e.in) || 0)), out: Math.max(0, Math.round(Number(e.out) || 0)),
+    shift: Math.round(Number(e.shift) || 0) };
+}
+const hasEdit = (s) => { const e = effEdit(s); return !!(e.in || e.out || e.shift); };
+
+/** Does the i-th active Shot start a run on the film (0.9.2)? The film's start, a Cut or
+ *  Context join, or a clip right after a clip. Shots joined Continuous make one run. */
+function runStartAt(act, i) {
+  if (i <= 0) return true;
+  const s = act[i], pv = act[i - 1];
+  return isCut(s) || (s.kind === "clip" && pv.kind === "clip") || isEmptyShot(s) || isEmptyShot(pv);
+}
+
+/** The Continuous run a Shot is part of: [first … last]. */
+function runOf(s) {
+  const act = active();
+  let i = act.indexOf(s);
+  if (i < 0) return [s];
+  let a = i, b = i;
+  while (!runStartAt(act, a)) a--;
+  while (b + 1 < act.length && !runStartAt(act, b + 1)) b++;
+  return act.slice(a, b + 1);
+}
+
+/** Free edges: the film's start and end, and joins that are a Cut or Context
+ *  (nothing is pinned across them). Continuous joins can't be trimmed. */
+function freeEdges(s) {
+  const act = active(), i = act.indexOf(s);
+  if (i < 0) return { left: false, right: false };
+  return { left: runStartAt(act, i), right: i + 1 >= act.length || runStartAt(act, i + 1) };
+}
+
+/** The edit that applies now: a trim on an edge that's become Continuous is kept but
+ *  set aside. A move belongs to the Shot's run (0.9.2): its first Shot carries it and
+ *  the whole run moves. */
+function effEdit(s) {
+  const e = editOf(s), f = freeEdges(s), r = runOf(s);
+  return { in: f.left ? e.in : 0, out: f.right ? e.out : 0, shift: editOf(r[0]).shift };
+}
+
+const fmtSec = (frames) => `${(frames / FPS).toFixed(2)} s`;
+
+/** On a Shot card: "✂ 0.40–4.10 s · moved +2 f" and a reset. */
+function editTag(s) {
+  if (!hasEdit(s)) return "";
+  const e = effEdit(s), L = LAYOUT.byId[s.id];
+  const bits = [];
+  if (e.in || e.out) {
+    const len = L ? L.we - L.vs : null;
+    bits.push(len ? `✂ ${fmtSec(e.in)}–${fmtSec(len - e.out)}` : `✂ ${fmtSec(e.in)} / ${fmtSec(e.out)}`);
+  }
+  if (e.shift) bits.push(`moved ${e.shift > 0 ? "+" : ""}${e.shift} f`);
+  return ` · <span class="edit-tag" title="Trimmed / moved on the film (nothing re-renders). Alt + ← / → moves it a frame.">${bits.join(" · ")}</span>` +
+    ` <span class="linkbtn reset-edit" role="button" tabindex="0" data-action="reset-edit" title="Back to the whole take, in its own place">reset</span>`;
+}
+
+/** The frames Long Shot plans a Shot with: a take's or clip's window, else its seconds. */
+function plannedWindow(s) {
+  if (s.kind === "clip") return s.clip && s.clip.frames ? Number(s.clip.frames) : null;
+  if ((s.status === "approved" || s.status === "review") && s.take && s.window) return Number(s.window);
+  if (s.window && Number(s.take_seconds) === Number(s.seconds)) return Number(s.window);
+  return null;
+}
+
+function layoutPieces() {
+  const act = active();
+  return act.map((s, i) => ({ id: s.id, seconds: s.kind === "clip" ? (Number(s.clip && s.clip.frames) || 0) / FPS
+    : Number(s.seconds) || 0, window: plannedWindow(s), cut: i > 0 && runStartAt(act, i),
+    hold: isEmptyShot(s) ? Math.max(1, Math.round((Number(s.seconds) || 0) * FPS)) : 0 }));
+}
+
+/** Ask for the layout when the Shots changed (debounced); render again when it comes. */
+function requestLayout() {
+  if (!P() || S.conn !== "ok") return;
+  const pieces = layoutPieces();
+  if (!pieces.length) { LAYOUT.sig = ""; LAYOUT.byId = {}; LAYOUT.total = 0; return; }
+  const overlap = Number(P().settings.overlap) || 22;
+  const sig = JSON.stringify([overlap, pieces]);
+  if (sig === LAYOUT.sig || sig === LAYOUT.pending) return;
+  LAYOUT.pending = sig;
+  clearTimeout(LAYOUT.timer);
+  LAYOUT.timer = setTimeout(async () => {
+    try {
+      const r = await api("/longshot/layout", { method: "POST", body: { overlap, pieces } });
+      if (LAYOUT.pending !== sig) return;
+      LAYOUT.byId = Object.fromEntries(r.pieces.map((x) => [x.id, x]));
+      LAYOUT.total = r.total;
+      LAYOUT.fps = r.fps || FPS;
+      LAYOUT.error = null;
+    } catch (e) {
+      if (LAYOUT.pending !== sig) return;
+      LAYOUT.byId = {};
+      LAYOUT.error = e.message;
+    }
+    LAYOUT.sig = sig;
+    LAYOUT.pending = null;
+    renderShots();
+    renderViewer();
+  }, 120);
+}
+
+/** A Shot's span on the film in frames, with its trims and move (0.9.0), or null. */
+function filmSpan(s) {
+  const L = LAYOUT.byId[s.id];
+  if (!L) return null;
+  const e = effEdit(s);
+  return { a: L.vs + e.shift + e.in, b: L.we + e.shift - e.out, ws: L.ws, vs: L.vs, we: L.we };
+}
+
+const songOn = () => !!(P() && P().audio && P().audio.file && (P().audio.song_ref || P().audio.lip_sync || P().audio.final_override));
+const songStart = () => Math.max(0, Number(P().audio.start) || 0);
+
+function fmtSong(t) {
+  const neg = t < 0;
+  t = Math.abs(t || 0);
+  const m = Math.floor(t / 60), sec = t - m * 60;
+  return `${neg ? "-" : ""}${m}:${sec.toFixed(2).padStart(5, "0")}`;
+}
+
+/** "♪ 0:45.17–0:50.33" on a Shot card: where it sits in the song. */
+function songSpanHTML(s) {
+  if (!songOn()) return "";
+  const sp = filmSpan(s);
+  if (!sp) return "";
+  // 0.9.2: the part of the song this Shot shows on the film (Audio Start included); a
+  // render gives it the song from where its take starts
+  const a = songStart() + sp.a / LAYOUT.fps, b = songStart() + sp.b / LAYOUT.fps;
+  return ` · <span class="song-at" title="The part of the song under this Shot on the film (Audio Start included). Rendering it gives it the song from here. Shots not rendered yet keep their time.">♪ ${fmtSong(a)}–${fmtSong(b)}</span>`;
+}
+
+/** song_gap for each Shot of a render that has Shots left out right before it
+ *  (Long Shot 1.6.17): seconds for one not rendered yet, w<frames> for a rendered one. */
+function songGaps(project, drop) {
+  let gap = [];
+  for (const x of project.shots) {
+    if (x.bypassed && !drop.has(x.id)) continue;              // bypassed by you: not on the film
+    if (drop.has(x.id)) {
+      const w = plannedWindow(x);
+      gap.push(w && w % 17 === 5 ? "w" + w : String(+(Number(x.kind === "clip" ? (x.clip.frames || 0) / FPS : x.seconds) || 0).toFixed(4)));
+      continue;
+    }
+    if (gap.length) x.song_gap = gap.join(",");
+    gap = [];
+  }
+}
+
 function chipPlan(s) {
   const j = chipJoin(s);
   if (j !== "bridge") return { alone: true, name: chipName(s, j) };
@@ -464,6 +697,8 @@ async function loadProject(slug) {
   S.saveState = p.saved_at ? "Saved · " + clock(p.saved_at) : "";
   S.open = (reviewShot() || nextQueued() || {}).id || null;
   store("h3studio.project", P().slug);
+  OPEN.slug = P().slug;
+  heartbeat();
   loadVideo();
   render();
   await Promise.all([loadInputs(), checkInputs(), loadSegStats(), loadClips(), fetchAllTakes()]);
@@ -530,7 +765,7 @@ async function checkInputs() {
     if (f.state === "changed" && !(f.key === "audio" ? false : item.bypassed)) changed.push(f.key);
   }
   S.refState = state;
-  const audioMatters = p.audio.lip_sync || p.audio.voice_ref;
+  const audioMatters = p.audio.voice_ref;
   if (changed.includes("audio") && audioMatters) sharedChanged("The song file");
   else if (changed.some((k) => k !== "audio")) {
     // a reference picture changed on disk: approved Shots may keep their takes
@@ -602,7 +837,7 @@ function refLabel(key) {
 }
 function refMatters(key) {
   const p = P();
-  if (key === "audio") return p.audio.lip_sync || p.audio.voice_ref;
+  if (key === "audio") return p.audio.voice_ref || p.audio.song_ref || p.audio.lip_sync;
   if (key.startsWith("clip:")) return true;
   const c = refItem(key);
   return c && !c.bypassed;
@@ -876,6 +1111,33 @@ function sendable(project, claimed = {}) {
 }
 
 const isRendered = (s) => s.kind === "clip" || (s.status !== "queued" && !!s.take);
+/** 0.12.7: the size a Shot's take was made at ({width, height}), from Take history; null
+ *  when not known (yet). */
+function takeSize(s) {
+  if (!s || s.kind === "clip" || !s.take) return null;
+  const t = (S.takes[s.id] || []).find((x) => x.name === s.take);
+  return t && t.width && t.height ? { width: t.width, height: t.height } : null;
+}
+/** A rendered Shot whose take is another size than Settings make now: it can't be pinned
+ *  to (H3 shares latent frames only at one size) and can't be stitched with the rest. */
+function otherSize(s) {
+  if (!s || s.bypassed || !isRendered(s)) return false;
+  const t = takeSize(s), cur = P() && sizeOf(P().settings);
+  return !!(t && cur && (t.width !== cur[0] || t.height !== cur[1]));
+}
+const sizeText = (t) => `${t.width}×${t.height}`;
+/** Stitched work (Update preview, the final video, Refine on export) needs one size. */
+function mixedSizeGuard(what) {
+  const odd = active().filter(otherSize);
+  if (!odd.length) return false;
+  const cur = sizeOf(P().settings);
+  confirmBox({ title: `${what} needs one size`,
+    body: `${odd.map((x) => `${titleOf(x)} (${sizeText(takeSize(x))})`).join(", ")} ${odd.length > 1 ? "were" : "was"} made at another size than Settings make now` +
+      (cur ? ` (${cur[0]}×${cur[1]})` : "") + `, so the film can't be stitched as one video.\n\n` +
+      "Export approved clips works with mixed sizes (each clip at its own). Or set Settings back to their size.",
+    yes: "OK" });
+  return true;
+}
 
 /** The chain reaches past the target to the last rendered Shot, so the target
  *  is pinned to what follows it and the preview shows the whole film. */
@@ -927,6 +1189,26 @@ function decodeRuns(omit) {
   }
   return runs;
 }
+/** 0.9.0: where each decode run sits on the film. Per run: frames to skip at its
+ *  start (a take's hidden shared zone, and the first Shot's trim), frames to keep,
+ *  and its first frame on the film. null while the layout isn't known. */
+function filmRuns(runs) {
+  if (!runs || !runs.length) return null;
+  const out = [];
+  for (const ids of runs) {
+    const f = shotById(ids[0]), l = shotById(ids[ids.length - 1]);
+    const Lf = f && LAYOUT.byId[f.id], Ll = l && LAYOUT.byId[l.id];
+    if (!Lf || !Ll) return null;
+    const w = plannedWindow(f);
+    const zone = w && isRendered(f) ? Math.max(0, w - (Lf.we - Lf.vs)) : 0;
+    const ef = effEdit(f), el = effEdit(l);
+    const used = (Ll.we - Lf.vs) - ef.in - el.out;
+    if (used <= 0) return null;
+    out.push({ ids, head: zone + ef.in, used, at: Lf.vs + ef.shift + ef.in });
+  }
+  return out;
+}
+
 /** Long Shot 1.6.10+ encodes a run's frames without upscaling (Upscale Chunk at scale 1). */
 function runsSupported() {
   const v = String((S.opts || {}).longshot_version || "0").split(".").map(Number);
@@ -974,8 +1256,10 @@ async function wholeQueue(opts) {
       return;
     }
   }
-  if (!multi && (!upscales || filmSeconds() <= vsrChunkS() + 0.5)) return runNow(opts);
-  const C = { opts, slug: P().slug, jobId: opts.jobId || null, upscales,
+  const placed = filmRuns(runs);                   // 0.9.0: the film's edit, gaps and song
+  if (!placed && !multi && (!upscales || filmSeconds() <= vsrChunkS() + 0.5)) return runNow(opts);
+  const C = { opts, slug: P().slug, jobId: opts.jobId || null, upscales, placed,
+    t0: placed ? placed[0].at : 0, firstChunk: [],
     L: upscales ? Math.max(24, Math.round(vsrChunkS() * FPS)) : 10_000_000,
     runs: multi ? runs : [null], r: 0, c: 0, nr: 0, n: 0, k: 0,
     trim: Number(P().settings.overlap) || 22,                       // a run after a cut drops its hidden overlap
@@ -988,7 +1272,8 @@ async function wholeQueue(opts) {
 
 async function chunkRun(C, inCtx = true) {
   if (!inCtx) return inProject(C.slug, () => chunkRun(C, true));
-  const i = C.k, o = C.opts, run = C.runs[C.r], trim = C.r > 0 ? C.trim : 0;
+  const i = C.k, o = C.opts, run = C.runs[C.r], pr = C.placed && C.placed[C.r];
+  const trim = pr ? pr.head : C.r > 0 ? C.trim : 0;
   const extra = {};
   if (run) {
     extra.omit = active().map((x) => x.id).filter((id) => !run.includes(id));
@@ -998,7 +1283,8 @@ async function chunkRun(C, inCtx = true) {
   const runTxt = C.runs.length > 1 ? ` · run ${C.r + 1} of ${C.runs.length} (${span})` : "";
   const chunkTxt = C.upscales ? ` · chunk ${C.c + 1}${C.nr ? " of " + C.nr : ""}` : "";
   await runNow(Object.assign({}, o, extra, {
-    chunk: { index: i, start: trim + C.c * C.L, length: C.L, audio: C.c === 0 && (C.r === 0 || !C.song) },
+    chunk: { index: i, start: trim + C.c * C.L, length: pr ? Math.min(C.L, pr.used - C.c * C.L) : C.L,
+      audio: C.c === 0 && (pr ? !C.song : (C.r === 0 || !C.song)) },
     label: `${o.label}${runTxt}${chunkTxt}`,
     note: C.c > 0 ? "The decoded run is reused · upscaling the next chunk"
       : C.runs.length > 1 ? `Decoding ${span} in one piece (a continuous run)${C.upscales ? ", then upscaling it a chunk at a time" : ""}`
@@ -1012,10 +1298,13 @@ function chunkDone(C, { rows, text, outputs, built, sent }) {
   const ui = outputs[built.nodes.chunk] || {};
   const fr = (ui.frame_range || [])[0], v = (ui.chunk_video || [])[0], m = (ui.chunk_master || [])[0];
   if (!fr || !v) throw new Error("The chunk saved no file. Update H3 Long Shot to 1.6.2 or later.");
-  const trim = C.r > 0 ? C.trim : 0;
+  const pr = C.placed && C.placed[C.r];
+  const trim = pr ? pr.head : C.r > 0 ? C.trim : 0;
   if (C.c === 0) {
+    C.firstChunk[C.r] = C.files.length;
+    if (pr) C.offset = (pr.at - C.t0) / FPS;           // 0.9.0: where the run sits on the film
     // this run's frames (after the overlap it hides), and its Shots' times on the whole film
-    const shown = Math.max(0, fr.total - trim);
+    const shown = pr ? pr.used : Math.max(0, fr.total - trim);
     C.nr = Math.max(1, Math.ceil(shown / C.L));
     C.n += C.nr;
     const shift = C.offset - trim / FPS;
@@ -1026,13 +1315,14 @@ function chunkDone(C, { rows, text, outputs, built, sent }) {
     });
     C.chainAll.push(...built.chain);
     if (text) C.texts.push(text);
-    C.offset += shown / FPS;
+    if (!pr) C.offset += shown / FPS;
   }
   C.files.push({ filename: v.filename, subfolder: v.subfolder });
   if (m) C.masters.push({ filename: m.filename, subfolder: m.subfolder });
   const a = built.nodes.audio_file && ((outputs[built.nodes.audio_file] || {}).longshot_audio || [])[0];
   if (a) {
-    if (C.song || C.runs.length === 1) C.audio = { filename: a.filename, subfolder: a.subfolder };
+    if (pr) C.audios[C.r] = { filename: a.filename, subfolder: a.subfolder, skip: trim / FPS, dur: pr.used / FPS };
+    else if (C.song || C.runs.length === 1) C.audio = { filename: a.filename, subfolder: a.subfolder };
     else C.audios.push({ filename: a.filename, subfolder: a.subfolder, skip: trim / FPS });
   }
   C.prefix = built.filename_prefix;
@@ -1065,7 +1355,8 @@ async function chunkJoin(C, inCtx = false) {
   const job = C.jobId && Q.jobs.find((j) => j.id === C.jobId);
   try {
     const out = await api(`/longshot/chunks/${encodeURIComponent(P().slug)}/join`, { method: "POST",
-      body: { prefix: C.prefix, chunks: C.files, audio: C.audio || (C.audios.length ? C.audios : null), masters: C.masters } });
+      body: Object.assign({ prefix: C.prefix, chunks: C.files, audio: C.audio || (C.audios.length ? C.audios : null), masters: C.masters },
+        C.placed ? filmJoin(C) : {}) });
     const outputs = { [built.nodes.combine]: { gifs: [out.video] } };
     if (built.nodes.prores && out.master) outputs[built.nodes.prores] = { gifs: [out.master] };
     S.chunking = null;
@@ -1083,6 +1374,31 @@ async function chunkJoin(C, inCtx = false) {
   render();
   saveNow();
   if (job) endJob(job, "done");
+}
+
+/** 0.9.0: the join of a placed film: black between runs where nothing covers the film,
+ *  and the sound placed in time (the song itself, or each run's sound with silence). */
+function filmJoin(C) {
+  const P0 = C.placed, gaps = [], parts = [];
+  for (let r = 0; r < P0.length; r++) {
+    if (r > 0) {
+      const g = P0[r].at - (P0[r - 1].at + P0[r - 1].used);
+      if (g > 0) {
+        gaps.push({ before: C.firstChunk[r], frames: g });
+        parts.push({ silence: g / FPS });
+      }
+    }
+    if (C.audios[r]) parts.push(C.audios[r]);
+    else parts.push({ silence: P0[r].used / FPS });
+  }
+  const last = P0[P0.length - 1], frames = last.at + last.used - C.t0;
+  const out = { gaps, codec: (C.done.built.nodes || {}).chunk_codec || "libx264" };
+  if (C.song) {
+    const a = P().audio;
+    out.song = { file: a.file, subfolder: a.subfolder || "", at: songStart() + C.t0 / FPS, seconds: frames / FPS };
+    out.audio = null;
+  } else out.audio = C.audios.some(Boolean) ? parts : null;
+  return out;
 }
 
 /** Stopped or failed: nothing half-finished is kept. */
@@ -1129,7 +1445,110 @@ const TAKE_FIELDS = ["take", "shot_seed", "seed_used", "context_from", "window",
 // ---------------------------------------------------------------------------
 
 const Q = { jobs: [], groups: {}, paused: false, seq: 0 };
-const QKEY = "h3studio.queue";
+// 0.13.0: one queue per tab (each tab runs its own); an inbox per tab takes jobs another
+// tab hands over (a job for the project open here); a closed tab's queue is picked up.
+const QPRE = "h3studio.queue.", IPRE = "h3studio.inbox.";
+const QKEY = QPRE + CLIENT_ID, INBOX = IPRE + CLIENT_ID;
+
+/** The other Studio tabs open now: [{id, slug}]. */
+function otherTabs() {
+  const t = readTabs(), now = Date.now();
+  return Object.entries(t).filter(([id, v]) => id !== CLIENT_ID && v && now - v.t < TAB_FRESH)
+    .map(([id, v]) => ({ id, slug: v.slug || null }));
+}
+/** The other tab that has project `slug` open, if any. */
+const tabWith = (slug) => slug ? otherTabs().find((x) => x.slug === slug) || null : null;
+function heartbeat() {
+  const t = readTabs(), now = Date.now();
+  for (const [id, v] of Object.entries(t)) if (!v || now - v.t > 60000) delete t[id];
+  t[CLIENT_ID] = { t: now, slug: OPEN.slug };     // the project shown here (not one swapped in for a job)
+  writeTabs(t);
+}
+window.addEventListener("pagehide", () => {
+  const t = readTabs();
+  delete t[CLIENT_ID];
+  writeTabs(t);
+});
+
+function readJSON(key) {
+  try { return JSON.parse(localStorage.getItem(key) || "null"); } catch (e) { return null; }
+}
+/** Jobs from elsewhere (another tab's hand-over, a closed tab's queue) join this queue. */
+function mergeJobs(jobs, groups) {
+  const have = new Set(Q.jobs.map((j) => j.id));
+  const regroup = {};
+  for (const [g, v] of Object.entries(groups || {})) {
+    const ng = Q.groups[g] ? uid("g") : g;
+    regroup[g] = ng;
+    Q.groups[ng] = v;
+  }
+  let n = 0;
+  for (const j of jobs || []) {
+    if (!j || !liveJob(j)) continue;
+    const nj = Object.assign({}, j, { state: "waiting" });
+    if (have.has(nj.id)) nj.id = uid("j");
+    if (nj.group && regroup[nj.group]) nj.group = regroup[nj.group];
+    Q.jobs.push(nj);
+    have.add(nj.id);
+    n++;
+  }
+  return n;
+}
+function takeInbox() {
+  const d = readJSON(INBOX);
+  if (!d) return;
+  try { localStorage.removeItem(INBOX); } catch (e) { /* ignore */ }
+  if (mergeJobs(d.jobs, d.groups)) { saveQueue(); renderQueue(); render(); setTimeout(queueNext, 0); }
+}
+/** Queues of tabs that closed with jobs waiting (and the one queue before 0.13.0). */
+function adoptOrphans() {
+  const live = new Set([CLIENT_ID, ...otherTabs().map((x) => x.id)]);
+  const keys = [];
+  try { for (let i = 0; i < localStorage.length; i++) keys.push(localStorage.key(i)); } catch (e) { return; }
+  let n = 0;
+  for (const k of keys) {
+    const legacy = k === "h3studio.queue";
+    const id = k.startsWith(QPRE) ? k.slice(QPRE.length) : k.startsWith(IPRE) ? k.slice(IPRE.length) : null;
+    if (!legacy && (id === null || live.has(id))) continue;
+    const d = readJSON(k);
+    try { localStorage.removeItem(k); } catch (e) { /* ignore */ }
+    if (d) n += mergeJobs(d.jobs, d.groups);
+  }
+  if (n) { saveQueue(); renderQueue(); if (S.ready) setTimeout(queueNext, 0); }
+  return n;
+}
+/** Hand a waiting job to the tab that has its project open (it applies the result there,
+ *  so the two tabs never save over each other's copy). */
+function handOver(job, tab) {
+  const key = IPRE + tab.id, d = readJSON(key) || { jobs: [], groups: {} };
+  d.jobs.push(Object.assign({}, job, { state: "waiting" }));
+  if (job.group && Q.groups[job.group]) d.groups[job.group] = Q.groups[job.group];
+  try { localStorage.setItem(key, JSON.stringify(d)); } catch (e) { return false; }
+  Q.jobs = Q.jobs.filter((j) => j !== job);
+  saveQueue();
+  return true;
+}
+/** Live jobs queued in the other tabs, for the queue panel. */
+function othersJobs() {
+  const out = [];
+  for (const t of otherTabs()) {
+    const d = readJSON(QPRE + t.id);
+    for (const j of (d && d.jobs) || []) if (liveJob(j)) out.push(j);
+  }
+  return out;
+}
+let othersSig = "";
+window.addEventListener("storage", (e) => {
+  if (!e.key) return;
+  if (e.key === INBOX && e.newValue) { takeInbox(); return; }
+  if (e.key.startsWith(QPRE) || e.key === TABS_KEY) {
+    const sig = othersJobs().map((j) => j.id + j.state).join(",");
+    if (sig !== othersSig) { othersSig = sig; renderQueue(); }
+  }
+});
+setInterval(() => { heartbeat(); takeInbox(); }, 2000);
+setInterval(() => { if (S.ready) adoptOrphans(); }, 10000);
+heartbeat();
 
 function saveQueue() {
   try { localStorage.setItem(QKEY, JSON.stringify({ jobs: Q.jobs, groups: Q.groups, paused: Q.paused, seq: Q.seq })); }
@@ -1146,6 +1565,8 @@ function loadQueue() {
     // a job that was running when the page closed runs again (finished segments are reused)
     for (const j of Q.jobs) if (j.state === "running") j.state = "waiting";
   } catch (e) { /* a broken entry: start empty */ }
+  takeInbox();
+  adoptOrphans();
 }
 const waitingJobs = () => Q.jobs.filter((j) => j.state === "waiting");
 const liveJob = (j) => j.state === "waiting" || j.state === "running";
@@ -1185,14 +1606,14 @@ function enqueue(specs, takes = 1) {
   const idsOf = (sp) => sp.type === "all" ? sp.ids.slice() : sp.target ? [sp.target] : [];
   let group = null;
   if (takes > 1) {
-    group = "g" + (++Q.seq);
+    group = uid("g");
     Q.groups[group] = { slug: P().slug, ids: [...new Set(specs.flatMap(idsOf))], of: takes, first: {}, seams: null };
   }
   const was = waitingJobs().length + (S.busy || S.chunking ? 1 : 0);
   for (let k = 1; k <= takes; k++) {
     for (const spec of specs) {
       const ids = idsOf(spec);
-      Q.jobs.push({ id: "j" + (++Q.seq), slug: P().slug, name: P().name, spec, ids, pass: k, of: takes, group,
+      Q.jobs.push({ id: uid("j"), slug: P().slug, name: P().name, spec, ids, pass: k, of: takes, group,
         title: jobTitle(spec, k, takes, ids), state: "waiting", added: Date.now() });
     }
   }
@@ -1266,9 +1687,11 @@ function jobOpts(job) {
     if (sp.mode === "chip") {
       const plan = chipPlan(s);
       if (plan.alone) {
+        const nbs = chipNear(s), odd = [nbs.prev, nbs.next].filter(otherSize);
         return { upto: s.id, kind: sp.kind, standalone: true, label: `${verb} Shot ${n} · ${plan.pending ? "on its own" : plan.name}${seed}${take}`,
           note: plan.name === "Context" ? "A hard cut · the last frame of the Shot before as a reference"
-            : plan.pending ? "On its own · no approved Shot next to it to continue from yet" : "A fresh start from the references",
+            : plan.pending && odd.length ? `On its own · ${odd.map(titleOf).join(" and ")} ${odd.length > 1 ? "are" : "is"} another size, so not pinned`
+            : plan.pending ? "On its own · no rendered Shot next to it to continue from yet" : "A fresh start from the references",
           onDone: onRendered(s.id, true) };
       }
       const how = plan.prev && plan.next ? `from ${titleOf(plan.prev)} into ${titleOf(plan.next)}`
@@ -1317,10 +1740,10 @@ function jobOpts(job) {
     if (!items.length) return null;
     const v = P().settings.rtx_vsr || {};
     const skipped = active().filter((x) => x.kind !== "clip" && x.status !== "approved").length;
-    return { kind: "export", exportClips: items.map((x) => ({ take: x.take })),
+    return { kind: "export", exportClips: items.map((x) => Object.assign({ take: x.take }, exportCut(x.s))),
       label: `Exporting ${items.length} approved clip${items.length === 1 ? "" : "s"} · upscaled ${v.scale || 2}× ${v.quality || "ULTRA"}`,
       note: "Each approved take decoded on its own, whole, and upscaled a frame at a time",
-      extra: { items: items.map((x) => ({ name: x.name, key: x.key })), skipped, kept: job.exportKept || 0, sig: upSig() },
+      extra: { items: items.map((x) => ({ name: x.name, key: x.key, sig: itemSig(x), asig: itemAsig(x) })), skipped, kept: job.exportKept || 0, sig: upSig() },
       onDone: () => {} };
   }
   return null;
@@ -1370,11 +1793,28 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 function renderQueue() {
   setTimeout(syncAwake, 0);
   if (S.swapped || !$("queue")) return;
+  // 0.9.2 ⇅: latest on top (per browser); the run order stays the same
+  const flip = store("h3studio.queueNewest") === "1";
+  const fb = $("queue-flip");
+  if (fb) {
+    fb.setAttribute("aria-pressed", flip);
+    fb.title = flip ? "Latest on top · click for oldest on top" : "Oldest on top · click for latest on top";
+  }
+
   const wait = waitingJobs().length, live = Q.jobs.filter(liveJob).length;
   $("queue-count").textContent = live ? `· ${live} to go${Q.paused ? " · paused" : ""}` : Q.paused ? "· paused" : "";
   $("queue-pause").textContent = Q.paused ? "Resume" : "Pause";
   $("queue-pause").setAttribute("aria-pressed", Q.paused);
   $("queue-clear").hidden = !Q.jobs.some((j) => !liveJob(j));
+  // 0.13.0: what the other Studio tabs have queued (they run their own; ComfyUI takes the
+  // runs one at a time, in the order they arrive)
+  const others = othersJobs();
+  othersSig = others.map((j) => j.id + j.state).join(",");
+  const otherRows = others.map((j) => `<div class="q-row other st-${esc(j.state)}" title="Queued in another Studio tab">
+      <span class="q-icon" aria-hidden="true">${Q_ICON[j.state] || "·"}</span>
+      <span class="q-main"><span class="q-name">${esc(j.name)}</span> · ${esc(j.title)}
+        <div class="q-sub">In another tab · ${j.state === "running" ? "rendering" : "waiting"}</div></span><span></span></div>`).join("");
+  if (!Q.jobs.length && otherRows) { $("queue").innerHTML = otherRows; return; }
   if (!Q.jobs.length) {
     $("queue").innerHTML = '<div class="q-empty peek">Nothing queued. Every render goes here and runs in order, from any project, so you can line up work and let it run.</div>';
     return;
@@ -1382,13 +1822,14 @@ function renderQueue() {
   const time = (t) => t ? new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
   const offline = S.conn !== "ok";
   const peek = Q.jobs.find((j) => j.state === "running") || Q.jobs.find((j) => j.state === "waiting") || Q.jobs[Q.jobs.length - 1];
-  $("queue").innerHTML = Q.jobs.map((j) => {
+  const list = flip ? [...Q.jobs].reverse() : Q.jobs;
+  $("queue").innerHTML = list.map((j) => {
     const here = P() && j.slug === P().slug;
     let sub = "", bar = "";
     if (j.state === "running") {
       const b = S.busy && S.busy.jobId === j.id ? S.busy : null;
       const pct = b ? progressOf(b) : 1;
-      sub = b ? `${b.label}${b.note ? " · " + b.note : ""}` : S.restarting ? "Waiting for ComfyUI to restart…" : "Starting…";
+      sub = b ? `${b.label}${b.phase === "queued" && otherTabs().length ? " · waiting for ComfyUI (another tab's run first)" : b.note ? " · " + b.note : ""}` : S.restarting ? "Waiting for ComfyUI to restart…" : "Starting…";
       bar = `<div class="q-bar"><div style="width:${pct}%"></div></div>`;
     } else if (j.state === "waiting") {
       const pos = jobPos(j);
@@ -1397,8 +1838,9 @@ function renderQueue() {
     else if (j.state === "skipped") sub = j.error || "Skipped";
     else sub = `${j.state === "stopped" ? "Stopped" : "Failed"} · ${time(j.ended)}${j.error ? " · " + j.error : ""}`;
     const w = j.state === "waiting", idx = waitingJobs().indexOf(j);
-    const acts = w ? `<button class="ghost sm" data-action="queue-up"${idx <= 0 ? " disabled" : ""} aria-label="Move up">▲</button>
-        <button class="ghost sm" data-action="queue-down"${idx < 0 || idx >= wait - 1 ? " disabled" : ""} aria-label="Move down">▼</button>
+    const sooner = `data-action="queue-up"${idx <= 0 ? " disabled" : ""}`, later = `data-action="queue-down"${idx < 0 || idx >= wait - 1 ? " disabled" : ""}`;
+    const acts = w ? `<button class="ghost sm" ${flip ? later : sooner} aria-label="Move up" title="${flip ? "Run later" : "Run sooner"}">▲</button>
+        <button class="ghost sm" ${flip ? sooner : later} aria-label="Move down" title="${flip ? "Run sooner" : "Run later"}">▼</button>
         <button class="ghost sm" data-action="queue-remove" aria-label="Remove from the queue">${CROSS}</button>`
       : j.state === "running" ? `<button class="ghost sm" data-action="queue-stop" title="Stop this job; the queue goes on">Stop</button>`
       : `${j.state === "failed" || j.state === "stopped" ? '<button class="ghost sm" data-action="queue-retry" title="Run it again">↻</button>' : ""}
@@ -1408,13 +1850,14 @@ function renderQueue() {
       <span class="q-main"><button class="q-name${here ? " here" : ""}" data-action="queue-open" title="${here ? "The open project" : "Open this project"}">${esc(j.name)}</button>
         · ${esc(j.title)}<div class="q-sub">${esc(sub)}</div>${bar}</span>
       <span class="q-act">${acts}</span></div>`;
-  }).join("");
+  }).join("") + otherRows;
 }
 
 async function queueAction(action, el) {
   const row = el.closest("[data-job]");
   const job = row && Q.jobs.find((j) => j.id === row.dataset.job);
   if (action === "queue-pause") { Q.paused = !Q.paused; saveQueue(); renderQueue(); if (!Q.paused) queueNext(); return; }
+  if (action === "queue-flip") { store("h3studio.queueNewest", store("h3studio.queueNewest") === "1" ? "0" : "1"); renderQueue(); return; }
   if (action === "queue-clear") {
     const gone = Q.jobs.filter((j) => !liveJob(j)).map((j) => j.group);
     Q.jobs = Q.jobs.filter(liveJob);
@@ -1483,7 +1926,7 @@ function splitAtContext(job) {
   job.ids = first.type === "all" ? first.ids.slice() : [first.target];
   job.title = jobTitle(first, job.pass, job.of, job.ids);
   const restIds = rest.type === "all" ? rest.ids.slice() : [rest.target];
-  const nj = { id: "j" + (++Q.seq), slug: job.slug, name: job.name, spec: rest, ids: restIds, pass: job.pass, of: job.of,
+  const nj = { id: uid("j"), slug: job.slug, name: job.name, spec: rest, ids: restIds, pass: job.pass, of: job.of,
     group: job.group, title: jobTitle(rest, job.pass, job.of, restIds), state: "waiting", added: Date.now() };
   Q.jobs.splice(Q.jobs.indexOf(job) + 1, 0, nj);
   saveQueue();
@@ -1597,6 +2040,13 @@ async function queueNext() {
   if (S.conn !== "ok") { renderQueue(); return; }
   const job = waitingJobs()[0];
   if (!job) { renderQueue(); return; }
+  const owner = (!P() || job.slug !== P().slug) ? tabWith(job.slug) : null;
+  if (owner && handOver(job, owner)) {
+    toast(`${job.name} is open in another tab: its job went there.`);
+    renderQueue();
+    setTimeout(queueNext, 0);
+    return;
+  }
   S.queueStarting = true;
   job.state = "running";
   job.error = null;
@@ -1613,7 +2063,8 @@ async function queueNext() {
         await exportPrepare(job);
         if (!job.exportTodo.length) {
           outcome = ["done", null];
-          toast(`All ${job.exportKept} approved clip${job.exportKept === 1 ? " is" : "s are"} already upscaled in Approved_Clips; nothing to do.`);
+          toast(`All ${job.exportKept} approved clip${job.exportKept === 1 ? " is" : "s are"} already upscaled in Approved_Clips` +
+            (job.exportRemixed ? `; the sound of ${job.exportRemixed} was mixed again (the song switched on or off, or moved).` : "; nothing to do."));
           return;
         }
       }
@@ -1655,14 +2106,16 @@ function pickFields(o, keys) {
 
 async function queueJob({ upto, dry, kind, label, note, onDone, final = false, standalone = false, batch = null,
   omit = null, trimLeft = false, takeClips = null, chunk = null, exportClips = null, extra = null, jobId = null,
-  joins = null }) {
+  joins = null, takeAudio = null }) {
   if (S.busy) return;
   if (Object.keys(S.uploading).length) { toast("Wait for the image upload to finish."); return; }
   S.error = null;
-  if (comfyTooOld()) { S.error = comfyTooOldText(); render(); return; }
-  const missing = kind === "clips" || kind === "export" ? [] : missingRefs();
+  const dryBox = () => { if (kind === "dry") showModal("Dry run · it stopped with an error", S.error); };
+  if (comfyTooOld()) { S.error = comfyTooOldText(); dryBox(); render(); return; }
+  const missing = kind === "clips" || kind === "export" || kind === "align" ? [] : missingRefs();
   if (missing.length) {
     S.error = `${missing.length} reference${missing.length > 1 ? "s are" : " is"} missing — relink or bypass ${missing.length > 1 ? "them" : "it"}.`;
+    dryBox();
     render();
     return;
   }
@@ -1670,6 +2123,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
   if (lost.length) {
     S.error = `Model file${lost.length > 1 ? "s" : ""} not found in ComfyUI's model folders: ${lost.join(", ")}. ` +
       `Choose ${lost.length > 1 ? "them" : "it"} under Advanced (Browse… can also add a folder ComfyUI doesn't know about).`;
+    dryBox();
     if (!lost.every((x) => x.startsWith("Vocal"))) S.advOpen = true;
     else S.audioOpen = true;
     render();
@@ -1689,6 +2143,8 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
     undoSeeds = c.undo; claimed = c.seeds;
   }
   let project = sendable(P(), claimed);          // seeds are settled on the whole timeline first
+  // 0.9.2: the film's own joins, for where each Shot sits on the film (a render may override them)
+  project.shots.forEach((x) => { x.film_join = x.join || "bridge"; });
   // the join chip: the joins this render uses (the project keeps its own)
   if (joins) project.shots.forEach((x) => { if (joins[x.id]) x.join = joins[x.id]; });
   // Shots left out of this render (sent bypassed; the project itself is untouched):
@@ -1702,11 +2158,38 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
     act.forEach((x, i) => { if (i < ti && !isRendered(x)) k = i; });
     act.slice(0, k + 1).forEach((x) => drop.add(x.id));
   }
-  if (drop.size) project.shots.forEach((x) => { if (drop.has(x.id)) x.bypassed = true; });
-  if (audioMissing() && (project.audio.lip_sync || project.audio.voice_ref || project.audio.final_override)) {
+  // 0.11.0: Shots with an empty prompt never render: left out, and the Shot after one
+  // starts fresh (nothing to continue from)
+  const empties = new Set(active().filter(isEmptyShot).map((x) => x.id));
+  // 0.12.7: takes made at another size can't be loaded at this size: left out the same
+  // way (their time kept), and the Shot after one starts fresh
+  if (kind === "render" || kind === "reroll" || kind === "refresh" || kind === "dry" || kind === "check") {
+    // 0.12.9: the dry run too (its text shows the Shots that do match)
+    active().filter((x) => x.id !== target && otherSize(x)).forEach((x) => empties.add(x.id));
+  }
+  empties.forEach((id) => drop.add(id));
+  if (empties.size) {
+    const act = project.shots.filter((x) => !x.bypassed);
+    act.forEach((x, i) => { if (i > 0 && empties.has(act[i - 1].id) && !empties.has(x.id)) x.join = "cut"; });
+  }
+  if (target && empties.has(target) && (kind === "render" || kind === "reroll")) {
+    undoSeeds();
+    toast(`${titleOf(shotById(target))} has no prompt: it only holds its time on the film. Write a prompt to render it.`);
+    return;
+  }
+  if (!project.shots.some((x) => !x.bypassed && !drop.has(x.id))) {
+    undoSeeds();
+    toast("Nothing to render: the Shots here have empty prompts (they only hold time).");
+    return;
+  }
+  if (drop.size) {
+    songGaps(project, drop);                           // 0.9.0: they keep their place in the song
+    project.shots.forEach((x) => { if (drop.has(x.id) && !x.bypassed) { x.bypassed = true; x.left_out = true; } });
+  }
+  if (audioMissing() && (project.audio.lip_sync || project.audio.voice_ref || project.audio.final_override || project.audio.song_ref)) {
     project = Object.assign({}, project, { audio: Object.assign({}, project.audio,
-      { lip_sync: false, voice_ref: false, final_override: false }) });
-    toast("The audio file is missing, so this render runs without the audio routes.");
+      { lip_sync: false, voice_ref: false, final_override: false, song_ref: false }) });
+    toast("The audio file is missing, so this render runs without the song.");
   }
   let built;
   try {
@@ -1714,12 +2197,13 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
     // gets a new take is decoded on its own into its clip (Long Shot 1.6).
     const clipsFor = !dry && (kind === "render" || kind === "reroll")
       ? project.shots.filter((x) => !x.bypassed && x.kind !== "clip" && !x.lock).map((x) => x.id) : null;
-    const body = takeClips ? { project, take_clips: takeClips } : exportClips ? { project, export_clips: exportClips }
+    const body = takeAudio ? { project, take_audio: takeAudio } : takeClips ? { project, take_clips: takeClips } : exportClips ? { project, export_clips: exportClips }
       : { project, upto, dry_run: !!dry, final, standalone, clips_for: clipsFor, chunk };
     built = await api("/longshot/build", { method: "POST", body });
   } catch (e) {
     undoSeeds();
     S.error = e.message;
+    if (kind === "dry") showModal("Dry run · it stopped with an error", S.error);
     render();
     return;
   }
@@ -1734,6 +2218,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
   } catch (e) {
     undoSeeds();
     S.error = describeQueueError(e);
+    if (kind === "dry") showModal("Dry run · it stopped with an error", S.error);
     render();
     return;
   }
@@ -1825,6 +2310,8 @@ async function finishIn(b, promptId, entry) {
   } else if (failed) {
     const d = failed[1];
     S.error = `${d.node_type || "A node"} failed: ${d.exception_message || "unknown error"}`.trim();
+    // 0.12.9: a dry run that fails still opens its box, with the error in it
+    if (b.kind === "dry") showModal("Dry run · it stopped with an error", S.error);
   } else if (stopped || b.stopped) {
     toast("Stopped. Finished segments stay in Long Shot's memory.");
   } else if (!entry) {
@@ -1834,6 +2321,8 @@ async function finishIn(b, promptId, entry) {
     if (S.exportAfter) { S.exportAfter = false; setTimeout(exportApproved, 0); }
   } else if (b.kind === "export") {
     await exportDone(b, entry.outputs || {});
+  } else if (b.kind === "align") {
+    await alignDone(b, entry.outputs || {});
   } else {
     const outputs = entry.outputs || {};
     let ls = outputs[b.built.nodes.longshot] || {};
@@ -1902,6 +2391,7 @@ async function finishIn(b, promptId, entry) {
  *  (Shots not rendered yet left out). Nothing is sampled. */
 function updatePreview() {
   if (!active().some(isRendered)) return;
+  if (mixedSizeGuard("Update preview")) return;
   if (Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "preview")) { toast("Update preview is already in the queue."); return; }
   enqueue({ type: "preview", focus: S.focus || null });
 }
@@ -1977,6 +2467,7 @@ function adoptRows(rows, sent, standalone = false) {
     const sh = r.id && byId.get(r.id);
     if (!sh || !r.take || sh.kind === "clip") continue;
     sh.take = r.take;
+    if (r.status !== "locked") sh.render_model = P().settings.model || null;   // 0.10.0: what made it
     sh.window = r.window_frames;
     sh.take_seconds = Number(sh.seconds);
     // a Shot on auto stays on auto; the seed its take used is kept beside it
@@ -2201,13 +2692,19 @@ function clearRender(s) {
 }
 
 function dryRun() {
-  const shots = active();
-  if (!shots.length) return;
+  // 0.12.9: Shots made at another size are left out (Long Shot can't load them at this size)
+  const shots = active().filter((x) => !otherSize(x));
+  if (!shots.length) {
+    showModal("Dry run", active().length ? "Every rendered Shot was made at another size than Settings make now, so there's nothing to plan at this size. Set the size back to see them." : "");
+    return;
+  }
   if (S.busy || S.chunking) { toast("The dry run starts when ComfyUI is free (a render is running)."); return; }
   runNow({ upto: shots[shots.length - 1].id, dry: true, kind: "dry", label: "Dry run · planning every shot",
     note: "Nothing is sampled", onDone: ({ rows, text, built }) => {
       S.dry = { rows, text, chain: built.chain };
-      showModal("Dry run · full prompts", text);
+      const odd = active().filter(otherSize);
+      showModal("Dry run · full prompts", (odd.length ? `Left out (made at another size than Settings make now): ` +
+        odd.map((x) => `${titleOf(x)} (${sizeText(takeSize(x))})`).join(", ") + "\n\n" : "") + text);
     } });
 }
 
@@ -2541,6 +3038,10 @@ function setViewerHidden(on) {
 function applyViewerHidden() {
   $("viewer-panel").classList.toggle("mini", VIEW.hidden);
   $("viewer-mini").hidden = !VIEW.hidden;
+  const fb = $("viewer-fold");
+  fb.setAttribute("aria-expanded", String(!VIEW.hidden));
+  fb.title = VIEW.hidden ? "Show the video, timeline and controls again"
+    : "Fold the video, timeline and controls to one status line (Live preview pauses while it's folded)";
   if (VIEW.hidden) renderMini();
 }
 
@@ -2670,6 +3171,15 @@ function drawRuler(px, L, R) {
       h += `<div class="tl-rt major" style="left:${x}px"></div>` +
         `<div class="tl-rl${f % FPS ? " sub" : ""}" style="left:${x}px">${rulerLabel(f)}</div>`;
     } else h += `<div class="tl-rt" style="left:${x}px"></div>`;
+  }
+  // 0.11.0: phrase starts, where the song sits under the film
+  if (songOn()) {
+    const st = songStart();
+    for (const t of phrases()) {
+      const f = (t - st) * FPS;
+      if (f < a - minor || f > b + minor) continue;
+      h += `<div class="tl-ph" style="left:${(f * pf).toFixed(1)}px" title="Phrase at ${fmtSong(t)} in the song"></div>`;
+    }
   }
   $("tl-ruler").innerHTML = h;
 }
@@ -2852,7 +3362,7 @@ function tlOpenPrompt(id) {
   }, true);
   tlView.addEventListener("pointerdown", (e) => {
     if (e.button !== 0 && e.button !== 1) return;
-    if (e.target.closest("#scrub, .tl-arrow")) return;
+    if (e.target.closest("#scrub, .tl-arrow, .tl-trim")) return;
     d = { x: e.clientX, s: tlView.scrollLeft, id: e.pointerId, moved: false, ruler: !!e.target.closest("#tl-ruler") };
     if (e.button === 1) e.preventDefault();
   });
@@ -2968,12 +3478,51 @@ async function adoptClips(items, outputs) {
 
 const takeStem = (name) => (name || "").replace(/\.safetensors$/, "");
 
+/** The Shot a take belongs to. */
+function shotOfTake(name) {
+  for (const [sid, list] of Object.entries(S.takes)) if ((list || []).some((t) => t.name === name)) return sid;
+  const s = P().shots.find((x) => x.take === name);
+  return s ? s.id : null;
+}
+
+/** A take's window in frames. */
+function takeWindow(sid, name) {
+  const t = (S.takes[sid] || []).find((x) => x.name === name), s = shotById(sid);
+  return Number((t && t.window_frames) || (s && s.take === name ? s.window : 0)) || 0;
+}
+
+/** 0.9.0, "Song in final video": the song for a take's whole clip, where the take sits in
+ *  the song ({song_at, song_len} in seconds of the song file), or {} when off / unknown. */
+function takeSong(name) {
+  if (!songMode()) return {};
+  const sid = shotOfTake(name), L = sid && LAYOUT.byId[sid], w = sid ? takeWindow(sid, name) : 0;
+  if (!L || !w) return {};
+  const sh = shotById(sid), shift = sh ? effEdit(sh).shift : 0;
+  return { song_at: +(songStart() + (L.we - w + shift) / LAYOUT.fps).toFixed(4), song_len: +(w / LAYOUT.fps).toFixed(4) };
+}
+
+/** An approved Shot as the film shows it (0.9.0): with trims, the take's frames from
+ *  trim_in for length, and the song under it on the film (its move included). */
+function exportCut(s) {
+  const L = LAYOUT.byId[s.id], w = takeWindow(s.id, s.take), out = {};
+  if (L && w && hasEdit(s)) {
+    const e = effEdit(s), t0 = L.we - w;
+    out.trim_in = Math.max(0, L.vs - t0 + e.in);
+    out.length = Math.max(1, w - out.trim_in - e.out);
+    if (songMode()) {
+      out.song_at = +(songStart() + (t0 + out.trim_in + e.shift) / LAYOUT.fps).toFixed(4);
+      out.song_len = +(out.length / LAYOUT.fps).toFixed(4);
+    }
+  } else Object.assign(out, takeSong(s.take));
+  return out;
+}
+
 /** Decode takes on their own into clips (nothing samples, nothing is stitched). */
 async function makeClips(takes) {
   const list = takes.filter((t) => t && t.take && !S.clips[takeStem(t.take)]).slice(0, 24);
   if (!list.length || S.busy || S.queuing || !S.clipsReady) return;
   list.forEach((t) => S.clipTried.add(t.take));
-  await runNow({ kind: "clips", takeClips: list.map((t) => ({ key: takeStem(t.take), take: t.take })),
+  await runNow({ kind: "clips", takeClips: list.map((t) => Object.assign({ key: takeStem(t.take), take: t.take }, takeSong(t.take))),
     label: `Making clip${list.length > 1 ? "s" : ""} · ${list.length} take${list.length > 1 ? "s" : ""}`,
     note: "Each take decoded on its own · nothing is sampled", onDone: () => {} });
   // it didn't start (ComfyUI busy, another job first…): try again later
@@ -3016,17 +3565,50 @@ function approvedForExport() {
   }));
 }
 
+/** 0.12.8: what one upscaled export file was made with. 0.13.3: the picture (upscale
+ *  settings, refine, that Shot's own trim) and the sound (asig: the song and its place,
+ *  or the take's own) apart, so turning the song on or off only mixes the sound again. */
+function itemSig(x) {
+  const v = P().settings.rtx_vsr || {};
+  const c = exportCut(x.s);
+  const cut = c.length ? `${c.trim_in}+${c.length}` : "";
+  const ref = refineActive() ? JSON.stringify(P().settings.refine) : "";
+  const str = cut + "|" + ref;
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+  return `${Number(v.scale || 2)}x ${v.quality || "ULTRA"}` + (str !== "|" ? ` · ${(h >>> 0).toString(36)}` : "");
+}
+function itemAsig(x) {
+  const c = exportCut(x.s), a = P().audio;
+  return c.song_len ? `song:${a.subfolder || ""}/${a.file}@${c.song_at}+${c.song_len}` : "own";
+}
+/** An export item as the server needs it to mix its sound again (0.13.3). */
+function exportItem(x) {
+  const c = exportCut(x.s), it = { key: x.key, name: x.name, sig: itemSig(x), asig: itemAsig(x) };
+  if (c.length) it.cut = { start: c.trim_in / FPS, dur: c.length / FPS };
+  if (c.song_len) Object.assign(it, { song_at: c.song_at, song_len: c.song_len });
+  return it;
+}
 /** What an upscaled export file was made with: same take + same settings = reuse it. */
-const upSig = () => { const v = P().settings.rtx_vsr || {}; return `${Number(v.scale || 2)}x ${v.quality || "ULTRA"}`; };
+const upSig = () => {
+  const v = P().settings.rtx_vsr || {};
+  // 0.9.0: trims, moves and the song are part of what an upscaled file was made with
+  const cuts = approvedForExport().map((x) => JSON.stringify(exportCut(x.s))).join("|");
+  let h = 0;
+  for (let i = 0; i < cuts.length; i++) h = (h * 31 + cuts.charCodeAt(i)) | 0;
+  return `${Number(v.scale || 2)}x ${v.quality || "ULTRA"}` + (cuts.replace(/\{\}|\|/g, "") ? ` · ${(h >>> 0).toString(36)}` : "");
+};
 
 /** Before an upscaled export: clips already upscaled from the same take stay
  *  (renamed if their number moved); stale ones leave the folder. */
 async function exportPrepare(job) {
   const items = approvedForExport();
   const r = await api(`/longshot/approved/${encodeURIComponent(P().slug)}`, { method: "POST",
-    body: { mode: "keep", sig: upSig(), prores: !!P().settings.prores_master, items: items.map((x) => ({ key: x.key, name: x.name })) } });
+    body: { mode: "keep", sig: upSig(), prores: !!P().settings.prores_master, items: items.map(exportItem),
+      song: songMode() ? { file: P().audio.file, subfolder: P().audio.subfolder || "" } : null } });
   job.exportTodo = r.todo || [];
   job.exportKept = (r.kept || []).length;
+  job.exportRemixed = (r.remixed || []).length;
   saveQueue();
 }
 
@@ -3045,8 +3627,9 @@ async function exportApproved() {
   const items = approvedForExport();
   if (!items.length) { toast("No approved Shots to export yet."); return; }
   const skipped = active().filter((s) => s.kind !== "clip" && s.status !== "approved").length;
-  if (P().settings.export_upscale) {
-    enqueue({ type: "export" });
+  if (P().settings.export_upscale || refineActive()) {
+    if (refineActive() && mixedSizeGuard("Refine on export")) return;
+    enqueue({ type: "export" });                 // 0.10.0: with Refine, the export refines first
     return;
   }
   const missing = items.filter((x) => !S.clips[x.key]);
@@ -3060,7 +3643,13 @@ async function exportApproved() {
   }
   try {
     const r = await api(`/longshot/approved/${encodeURIComponent(P().slug)}`, { method: "POST",
-      body: { mode: "copy", items: items.map((x) => ({ key: x.key, name: x.name })) } });
+      body: { mode: "copy", song: songMode() ? { file: P().audio.file, subfolder: P().audio.subfolder || "" } : null,
+        items: items.map((x) => {
+          const c = exportCut(x.s), it = { key: x.key, name: x.name };
+          if (c.length) it.cut = { start: c.trim_in / FPS, dur: c.length / FPS };
+          if (c.song_len) Object.assign(it, { song_at: c.song_at, song_len: c.song_len });
+          return it;
+        }) } });
     exportedToast(r, skipped);
   } catch (e) { toast("Export failed: " + e.message); }
 }
@@ -3070,7 +3659,7 @@ async function exportDone(b, outputs) {
   const items = (b.extra.items || []).map((it, i) => {
     const nd = ex[String(i + 1)] || {};
     const ui = outputs[nd.video] || {};
-    return { name: it.name, key: it.key, video: (ui.chunk_video || [])[0] || null, master: (ui.chunk_master || [])[0] || null,
+    return { name: it.name, key: it.key, sig: it.sig || null, asig: it.asig || "", video: (ui.chunk_video || [])[0] || null, master: (ui.chunk_master || [])[0] || null,
       audio: ((outputs[nd.audio] || {}).longshot_audio || [])[0] || null };
   });
   if (items.some((x) => !x.video)) { S.error = "The export saved no file. Update H3 Long Shot to 1.6.6 or later."; return; }
@@ -3101,7 +3690,8 @@ function buildTL() {
     return r && (s.kind === "clip" || r.take === s.take) ? r : null;
   };
   const exact = !!loUrl && !!vplan && !!vchain && act.length > 0 && act.length === vchain.length &&
-    act.every((s, i) => vchain[i] === s.id && !!rowOf(s));
+    act.every((s, i) => vchain[i] === s.id && !!rowOf(s)) && !act.some(hasEdit) &&
+    !act.some((s, i) => i > 0 && runStartAt(act, i));      // 0.9.2: a Cut shows its whole take
   const half = (Number(P() && P().settings.overlap) || 22) / 24 / 2;
   const entries = [];
   for (const s of act) {
@@ -3111,8 +3701,9 @@ function buildTL() {
     if (exact) e = { src: loUrl, off: r.start, dur: r.end - r.start, kind: "video" };
     else if (s.kind === "clip" && s.clip.file) {
       e = { src: viewURL({ filename: s.clip.file, subfolder: s.clip.subfolder, type: "input" }),
-        off: Number(s.clip.trim_in) || 0, dur: (s.clip.frames || 24) / 24, kind: "source" };
-    } else if (c && c.dur > 0) e = { src: clipFile(key, ".mp4"), off: 0, dur: c.dur, kind: "take" };
+        off: Number(s.clip.trim_in) || 0, dur: (s.clip.frames || 24) / 24, kind: "source",
+        srcOff: Number(s.clip.trim_in) || 0 };
+    } else if (c && c.dur > 0) e = { src: clipFile(key, ".mp4"), off: 0, dur: c.dur, kind: "take", clipDur: c.dur };
     else if (r && loUrl) e = { src: loUrl, off: r.start, dur: r.end - r.start, kind: "video" };
     else e = { src: null, off: 0, dur: Math.max(0.5, Number(s.seconds) || 1), kind: "gap" };
     e.thumb = c && c.thumb ? clipFile(key, ".jpg") : null;
@@ -3132,14 +3723,238 @@ function buildTL() {
     }
   }
   let t = 0;
-  for (const e of entries) {
-    e.start = exact ? e.off : t;
-    t = e.start + e.dur;
-  }
-  const sig = JSON.stringify(entries.map((e) => [e.id, e.src, e.off, e.dur]));
+  const placed = !exact && placeOnFilm(act, entries);
+  if (!placed) {
+    for (const e of entries) {
+      e.start = exact ? e.off : t;
+      t = e.start + e.dur;
+    }
+  } else t = placed;
+  const sig = JSON.stringify(entries.map((e) => [e.id, e.src, e.off, e.dur, e.start]));
   const changed = sig !== TL.sig;
   TL = { exact, entries, total: t, sig };
   return changed;
+}
+
+/** 0.9.0: put each Shot where it sits on the film (Long Shot's layout), with its trims
+ *  and move, and black where nothing covers the film. Returns the film's end in
+ *  seconds, or 0 (use the old end-to-end layout) while the layout isn't known. */
+function placeOnFilm(act, entries) {
+  if (!act.length || !act.every((s) => LAYOUT.byId[s.id])) return 0;
+  const fps = LAYOUT.fps, half = Math.round((Number(P().settings.overlap) || 22) / 2);
+  const byId = new Map(entries.map((e) => [e.id, e]));
+  const list = [];
+  act.forEach((s, i) => {
+    const e = byId.get(s.id);
+    if (!e) return;
+    const L = LAYOUT.byId[s.id];
+    let fa = L.vs, fb = L.we, off;
+    if (e.kind === "take") off = (L.vs - (L.we - Math.round(e.clipDur * fps))) / fps;
+    else if (e.kind === "source") off = e.srcOff + (L.vs - L.ws) / fps;
+    else off = e.off;                                 // a piece of the last stitched video, or a gap
+    // two takes joined Continuous: switch halfway through the frames they share
+    const pv = list.length ? list[list.length - 1] : null;
+    if (pv && pv.e.kind === "take" && e.kind === "take" && !isCut(s) && pv.s === act[i - 1]) {
+      pv.fb -= half;
+      fa -= half;
+      off -= half / fps;
+    }
+    const ed = effEdit(s);
+    fa += ed.in + ed.shift;
+    off += ed.in / fps;
+    fb += ed.shift - ed.out;
+    list.push({ s, e, fa, fb, off });
+  });
+  const out = [];
+  let end = 0;
+  for (const x of list) {
+    if (x.fa > end) out.push({ src: null, off: 0, dur: (x.fa - end) / fps, kind: "black", id: null, start: end / fps });
+    const fa = Math.max(x.fa, end);                   // never on top of the one before
+    if (x.fb <= fa) continue;
+    Object.assign(x.e, { start: fa / fps, off: x.off + (fa - x.fa) / fps, dur: (x.fb - fa) / fps });
+    out.push(x.e);
+    end = x.fb;
+  }
+  entries.length = 0;
+  entries.push(...out);
+  return end / fps;
+}
+
+// ---------------------------------------------------------------------------
+// Trims and moves on the timeline (0.9.0). Non-destructive: a trim hides frames
+// of a take (or clip) at a free edge and can be dragged back out any time; a move
+// (Alt + ← / →) shifts a Shot a frame along the film, overwriting: frames it
+// covers on its neighbour become that neighbour's trim, the side it leaves is
+// black. Shots not rendered yet: dragging the right edge sets their seconds.
+// ---------------------------------------------------------------------------
+
+const MIN_SHOWN = 6;                       // frames a trimmed Shot keeps at least
+
+/** Which edges of a block can be dragged, and what dragging does. */
+function trimEdges(s) {
+  if (!LAYOUT.byId[s.id] || busyHere()) return { left: null, right: null };
+  if (s.kind === "clip" || isRendered(s)) {
+    const f = freeEdges(s);
+    return { left: f.left ? "in" : null, right: f.right ? "out" : null };
+  }
+  return { left: null, right: "seconds" };
+}
+
+function trimHandles(s) {
+  const e = trimEdges(s);
+  const tip = { in: "Drag to trim the start (nothing re-renders)", out: "Drag to trim the end (nothing re-renders)",
+    seconds: "Drag to change this Shot's seconds (not rendered yet)" };
+  return (e.left ? `<span class="tl-trim l" data-trim="${e.left}" title="${tip[e.left]}"></span>` : "") +
+    (e.right ? `<span class="tl-trim r${e.right === "seconds" ? " sec" : ""}" data-trim="${e.right}" title="${tip[e.right]}"></span>` : "");
+}
+
+/** Frames a Shot shows before trims (its place on the film). */
+function shownFrames(s) {
+  const L = LAYOUT.byId[s.id];
+  return L ? L.we - L.vs : 0;
+}
+
+const TRIM = { drag: null, swallow: 0 };
+
+function trimReadout(x, y, text) {
+  const r = $("tl-readout");
+  r.hidden = false;
+  r.textContent = text;
+  r.style.left = Math.min(window.innerWidth - r.offsetWidth - 8, x + 12) + "px";
+  r.style.top = (y - 34) + "px";
+}
+
+$("tl-strip").addEventListener("pointerdown", (e) => {
+  const h = e.target.closest(".tl-trim");
+  if (!h || e.button !== 0) return;
+  const b = h.closest("[data-tl]"), s = b && shotById(b.dataset.tl);
+  if (!s || setupGuard()) return;
+  if (inRender(s)) { toast("This shot is part of the render in progress; edit it when it finishes."); return; }
+  e.preventDefault();
+  e.stopPropagation();
+  const ed = editOf(s);
+  TRIM.drag = { s, kind: h.dataset.trim, x: e.clientX, in: ed.in, out: ed.out, seconds: Number(s.seconds) || 0,
+    moved: false };
+  document.body.classList.add("trimming");
+});
+
+document.addEventListener("pointermove", (e) => {
+  const d = TRIM.drag;
+  if (!d) return;
+  const df = Math.round((e.clientX - d.x) / (tlPx() / FPS));
+  if (!d.moved && Math.abs(e.clientX - d.x) < 3) return;
+  d.moved = true;
+  const s = d.s, len = shownFrames(s);
+  if (d.kind === "seconds") {
+    s.seconds = isEmptyShot(s) ? Math.max(12, Math.round(d.seconds * FPS) + df) / FPS        // frame-exact
+      : Math.max(0.5, Math.round((d.seconds + df / FPS) * 100) / 100);
+    trimReadout(e.clientX, e.clientY, `${s.seconds.toFixed(2)} s`);
+  } else {
+    const pl = Object.assign({ in: 0, out: 0, shift: 0 }, s.place || {});
+    if (d.kind === "in") pl.in = Math.max(0, Math.min(d.in + df, len - pl.out - MIN_SHOWN));
+    else pl.out = Math.max(0, Math.min(d.out - df, len - pl.in - MIN_SHOWN));
+    s.place = pl.in || pl.out || pl.shift ? pl : null;
+    trimReadout(e.clientX, e.clientY,
+      `in ${fmtSec(pl.in)} · out ${fmtSec(len - pl.out)} · ${fmtSec(len - pl.in - pl.out)} long`);
+  }
+  renderViewer();
+});
+
+document.addEventListener("pointerup", () => {
+  const d = TRIM.drag;
+  if (!d) return;
+  TRIM.drag = null;
+  document.body.classList.remove("trimming");
+  $("tl-readout").hidden = true;
+  if (!d.moved) return;
+  TRIM.swallow = performance.now() + 120;         // the click after a drag isn't a pick
+  if (d.kind === "seconds") {
+    if (Number(d.s.seconds) !== d.seconds) {
+      shotEdited(d.s, "seconds");
+      if (songOn() && active().slice(active().indexOf(d.s) + 1).some(isRendered)) {
+        toast("The Shots after it move along the song: re-render them to keep their lip sync.");
+      }
+    }
+  }
+  commit();
+});
+
+$("tl-view").addEventListener("click", (e) => {
+  if (performance.now() < TRIM.swallow) { e.stopPropagation(); e.preventDefault(); }
+}, true);
+
+/** 0.11.0: an empty Shot (placeholder) before the run takes up the move — it gets
+ *  longer or shorter, frame-exact — and an empty Shot after it gives the frames back,
+ *  so nothing else on the film moves. A rendered Shot after it stays where it is: the
+ *  run covers its start (a trim) or leaves black. Returns false when there's no
+ *  placeholder before the run (the usual move then applies). */
+function absorbMove(run, d) {
+  const act = active(), first = run[0], last = run[run.length - 1];
+  const before = act[act.indexOf(first) - 1], after = act[act.indexOf(last) + 1];
+  if (!before || !isEmptyShot(before)) return false;
+  if (busyHere() && run.some(inRender)) { toast("This run is part of the render in progress; move it when it finishes."); return true; }
+  const MIN = 12;                                          // half a second, at least
+  const bf = Math.round((Number(before.seconds) || 0) * FPS) + d;
+  if (bf < MIN) { toast(`${titleOf(before)} can't get any shorter.`); return true; }
+  if (after && isEmptyShot(after)) {
+    const af = Math.round((Number(after.seconds) || 0) * FPS) - d;
+    if (af < MIN) { toast(`${titleOf(after)} can't get any shorter.`); return true; }
+    after.seconds = af / FPS;
+  } else if (after) {
+    // a rendered Shot after: it keeps its place on the film; the run covers its start or leaves black
+    const ar = runOf(after), head = ar[0];
+    const pl = Object.assign({ in: 0, out: 0, shift: 0 }, head.place || {});
+    if (d > 0 && shownFrames(head) - (pl.in + d) - pl.out < MIN_SHOWN) { toast(`${titleOf(head)} can't be covered any further.`); return true; }
+    pl.shift -= d;
+    if (d > 0) pl.in += d;
+    else pl.in = Math.max(0, pl.in + d);
+    head.place = pl.in || pl.out || pl.shift ? pl : null;
+  }
+  before.seconds = bf / FPS;
+  commit();
+  return true;
+}
+
+/** Alt + ← / →: move a Shot one frame along the film, overwriting its neighbour. Shots
+ *  joined Continuous move together as one run (0.9.2). */
+function moveShot(s, d) {
+  const run = runOf(s);
+  const locked = run.find(isAligned);
+  if (locked) {
+    toast(`${titleOf(locked)} is marked aligned, so it stays put. Unmark aligned to move it.`);
+    return;
+  }
+  if (run.length === 1 && isEmptyShot(run[0])) {
+    toast(`${titleOf(s)} has no prompt: it holds time. Move the Shot next to it, and this one makes room.`);
+    return;
+  }
+  if (absorbMove(run, d)) return;
+  if (busyHere() && run.some(inRender)) { toast("This run is part of the render in progress; move it when it finishes."); return; }
+  if (!run.some((x) => x.kind === "clip" || isRendered(x))) { toast(`Render ${titleOf(s)} first; then Alt + ← / → moves it.`); return; }
+  const act = active(), first = run[0], last = run[run.length - 1];
+  const sa = filmSpan(first), sb = filmSpan(last);
+  if (!sa || !sb) { toast("One moment: working out where the Shots sit…"); return; }
+  if (sa.a + d < 0) { toast(`${titleOf(first)} is at the start of the film.`); return; }
+  // what the run would cover on its neighbour becomes that neighbour's trim
+  const nb = d > 0 ? act[act.indexOf(last) + 1] : act[act.indexOf(first) - 1];
+  const q = nb && filmSpan(nb);
+  if (q) {
+    const over = d > 0 ? sb.b + d - q.a : q.b - (sa.a + d);
+    if (over > 0) {
+      const side = d > 0 ? "in" : "out";
+      const pl = Object.assign({ in: 0, out: 0, shift: 0 }, nb.place || {});
+      if (shownFrames(nb) - pl.in - pl.out - over < MIN_SHOWN) {
+        toast(`${run.length > 1 ? `Shots ${numOf(first.id)}–${numOf(last.id)} can't` : `${titleOf(s)} can't`} cover more of ${titleOf(nb)}.`);
+        return;
+      }
+      pl[side] += over;
+      nb.place = pl;
+    }
+  }
+  const pl = Object.assign({ in: 0, out: 0, shift: 0 }, first.place || {});
+  pl.shift += d;
+  first.place = pl.in || pl.out || pl.shift ? pl : null;
+  commit();
 }
 
 const totalSeconds = () => TL.total;
@@ -3154,12 +3969,21 @@ function tlTime() {
   const e = TL.entries[PL.k];
   if (!e) return PL.t;
   if (e.src && PL.src === e.src && video.readyState >= 1) return Math.min(e.start + e.dur, e.start + Math.max(0, video.currentTime - e.off));
-  if (!e.src && PL.playing) return PL.gapT + (performance.now() - PL.gapWall) / 1000;
+  if (!e.src && PL.playing) {
+    // 0.9.2: nothing rendered here: the song (when it plays under the film) is the clock
+    if (songClock()) return Math.max(e.start, songEl.currentTime - songStart());
+    return PL.gapT + (performance.now() - PL.gapWall) / 1000;
+  }
   return PL.t;
 }
 
 function showEntry(e) {
   const any = TL.entries.some((x) => x.src);
+  if (e && e.kind === "black") {                   // a gap a trim or move left: black, no words
+    video.style.visibility = "hidden";
+    $("placeholder").hidden = true;
+    return;
+  }
   video.style.visibility = e && e.src ? "visible" : "hidden";
   $("placeholder").hidden = !!(e && e.src);
   const sh = e && shotById(e.id);
@@ -3217,6 +4041,8 @@ function play() {
   cancelAnimationFrame(rafId);
   rafId = requestAnimationFrame(tick);
   syncLive();                                      // playing: the player, not the preview
+  applyVolume();
+  syncSong(true);
 }
 
 function pausePlayer() {
@@ -3227,6 +4053,7 @@ function pausePlayer() {
   $("play").setAttribute("aria-label", "Play");
   updateTime();
   syncLive();
+  syncSong(true);
 }
 
 function togglePlay() {
@@ -3252,6 +4079,7 @@ function tick() {
   else if (e && t >= e.start + e.dur - 0.02) nextEntry();
   else PL.t = t;
   updateTime();
+  syncSong();
   rafId = requestAnimationFrame(tick);
 }
 
@@ -3332,44 +4160,107 @@ const VOL_PATHS = {
   high: '<path d="M2 6h2.5L8 3v10L4.5 10H2z"/><path d="M10.5 6.2a2.5 2.5 0 0 1 0 3.6"/><path d="M12.3 4.3a5.2 5.2 0 0 1 0 7.4"/>',
 };
 
+// Volume (0.9.0): what you set, kept here and remembered in this browser. With
+// "Song in final video" the song file plays under the film and the video's own
+// sound is muted; the same controls set the song's volume.
+const VOL = (() => {
+  const v = Number(store("h3studio.volume"));
+  return { volume: Number.isFinite(v) && v >= 0 && v <= 1 && store("h3studio.volume") !== null ? v : 1,
+    muted: store("h3studio.muted") === "1" };
+})();
+const songEl = $("song-audio");
+
+function applyVolume() {
+  const song = songMode();
+  video.volume = VOL.volume;
+  video.muted = VOL.muted || song;
+  songEl.volume = VOL.volume;
+  songEl.muted = VOL.muted;
+  store("h3studio.volume", String(VOL.volume));
+  store("h3studio.muted", VOL.muted ? "1" : "0");
+  if (VOL.volume > 0) store("h3studio.volumeBeforeMute", String(VOL.volume));
+  renderVolume();
+}
+
 function renderVolume() {
-  const silent = video.muted || video.volume === 0;
-  $("vol-icon").innerHTML = silent ? VOL_PATHS.muted : video.volume < 0.5 ? VOL_PATHS.low : VOL_PATHS.high;
+  const silent = VOL.muted || VOL.volume === 0;
+  $("vol-icon").innerHTML = silent ? VOL_PATHS.muted : VOL.volume < 0.5 ? VOL_PATHS.low : VOL_PATHS.high;
   $("mute-btn").setAttribute("aria-pressed", silent);
   $("mute-btn").setAttribute("aria-label", silent ? "Unmute (M)" : "Mute (M)");
-  $("mute-btn").title = silent ? "Unmute (M)" : "Mute (M)";
-  $("volume").value = String(video.muted ? 0 : video.volume);
+  $("mute-btn").title = (silent ? "Unmute (M)" : "Mute (M)") + (songMode() ? " · the song plays under the film" : "");
+  $("volume").value = String(VOL.muted ? 0 : VOL.volume);
 }
 
 function toggleMute() {
-  if (video.muted || video.volume === 0) {
-    video.muted = false;
-    if (video.volume === 0) video.volume = Number(store("h3studio.volumeBeforeMute")) || 0.8;
-  } else {
-    video.muted = true;
-  }
-  renderVolume();          // don't wait for the async volumechange event
+  if (VOL.muted || VOL.volume === 0) {
+    VOL.muted = false;
+    if (VOL.volume === 0) VOL.volume = Number(store("h3studio.volumeBeforeMute")) || 0.8;
+  } else VOL.muted = true;
+  applyVolume();
 }
 
-(function initVolume() {
-  const v = Number(store("h3studio.volume"));
-  video.volume = Number.isFinite(v) && v >= 0 && v <= 1 && store("h3studio.volume") !== null ? v : 1;
-  video.muted = store("h3studio.muted") === "1";
-  renderVolume();
-})();
-
-video.addEventListener("volumechange", () => {
-  store("h3studio.volume", String(video.volume));
-  store("h3studio.muted", video.muted ? "1" : "0");
-  if (video.volume > 0) store("h3studio.volumeBeforeMute", String(video.volume));
-  renderVolume();
-});
 $("volume").addEventListener("input", (e) => {
   const v = Number(e.target.value);
-  video.volume = v;
-  video.muted = v === 0;
-  renderVolume();
+  VOL.volume = v;
+  VOL.muted = v === 0;
+  applyVolume();
 });
+
+// ---------------------------------------------------------------------------
+// The song under the film (0.9.0): with "Song in final video" on, the timeline
+// plays the song file at the film's time (Audio Start included), so trims and
+// moves are heard against the music as they'll be in the final video.
+// ---------------------------------------------------------------------------
+
+function songMode() {
+  const a = P() && P().audio;
+  return !!(a && a.final_override && a.file && !audioMissing());
+}
+
+/** 0.12.6: the song for playback, as a WAV (made from an mp3 / m4a once by the server):
+ *  browsers jump into a compressed file by estimate, which put the song late after a
+ *  click on the timeline. */
+function songSrc() {
+  const a = P().audio;
+  return "/longshot/song-preview?" + new URLSearchParams({ file: a.file, subfolder: a.subfolder || "" });
+}
+
+/** Keep the song where the film is: start it, move it, stop it. 0.9.2: a seek takes
+ *  a while on a compressed file, so the song is only moved when it's well off (and
+ *  never again while a seek is still going): re-seeking at every small drift made it
+ *  stutter. Where nothing is rendered, the song is the clock (see tlTime). */
+const SONG_SYNC = { last: 0 };
+function songClock() {
+  return songMode() && PL.playing && !songEl.paused && !songEl.seeking && songEl.readyState >= 2;
+}
+function syncSong(force = false) {
+  if (!P() || !songMode() || !TL.entries.length) {
+    if (!songEl.paused) songEl.pause();
+    return;
+  }
+  const src = songSrc();
+  if (songEl.dataset.src !== src) { songEl.dataset.src = src; songEl.src = src; }
+  const want = songStart() + (PL.playing ? tlTime() : PL.t);
+  const seek = (t) => {
+    SONG_SYNC.last = performance.now();
+    if (songEl.readyState >= 1) songEl.currentTime = Math.max(0, t);
+    else songEl.addEventListener("loadedmetadata", () => { songEl.currentTime = Math.max(0, songStart() + tlTime()); }, { once: true });
+  };
+  if (!PL.playing) {
+    if (!songEl.paused) songEl.pause();
+    if (force) seek(want);
+    return;
+  }
+  const e = TL.entries[PL.k];
+  const onVideo = !!(e && e.src);
+  if (force) seek(want);
+  else if (onVideo && !songEl.seeking && performance.now() - SONG_SYNC.last > 600 &&
+           Math.abs(songEl.currentTime - want) > 0.08) seek(want);
+  if (songEl.paused) songEl.play().catch(() => { /* the browser wants a click first */ });
+}
+
+applyVolume();
+
 
 
 video.addEventListener("error", () => {
@@ -3435,6 +4326,7 @@ function render() {
   renderAudio();
   renderSettings();
   renderAdvanced();
+  renderRefine();
   renderPlan();
   renderQueue();
 }
@@ -3601,8 +4493,8 @@ function renderCast() {
   cards.push(`<button class="addtile" data-action="add-cast" data-drop="add">${PLUS} <span>Add reference · ${esc(`<Picture ${n + 1}>`)}<br><span class="muted small">or drop images here</span></span></button>`);
   cards.push('<div class="cast-break"></div>');
   for (const v of P().voices || []) cards.push(voiceCard(v));
-  const nextA = (P().audio.voice_ref ? 1 : 0) + liveVoices().length + 1;
-  cards.push(`<button class="addtile voice-add" data-action="add-voice">${PLUS} <span>Add audio reference · ${esc(`<Audio ${nextA}>`)}<br><span class="muted small">a voice timbre · or drop audio here</span></span></button>`);
+  const nextA = songSlot() + liveVoices().length + 1;
+  cards.push(`<button class="addtile voice-add" data-action="add-voice">${PLUS} <span>Add audio reference · ${esc(`<Audio ${nextA}>`)}<br><span class="muted small">a voice or a sound · or drop audio here</span></span></button>`);
   cards.push('<div class="cast-break"></div>');
   for (const m of P().refmods || []) cards.push(refmodCard(m));
   cards.push(hasPack("refmod")
@@ -3641,39 +4533,64 @@ async function installPack(k) {
 }
 
 /** On a picture card: the voice reference it gets its voice timbre from. */
+/** A voice key: a voice reference's id, or "refmod:<id>" for an audio RefMod (0.12.0).
+ *  {label: "<Audio N>", name, there: still on} */
+function voiceSource(key) {
+  if (!key) return null;
+  if (String(key).startsWith("refmod:")) {
+    const m = (P().refmods || []).find((x) => x.id === key.slice(7));
+    return { label: m ? refmodLabelOf(m) : null, name: m ? m.label || m.name : "", there: !!m };
+  }
+  const v = voiceById(key), isVoice = !!v && (v.role || "voice") === "voice";
+  return { label: isVoice ? audioLabelOf(v) : null, name: v ? v.label || v.original_name || "" : "", there: isVoice };
+}
+/** Every voice a picture or RefMod can take: voice references, then audio RefMods. */
+function voiceChoices() {
+  const out = (P().voices || []).filter((v) => (v.role || "voice") === "voice")
+    .map((v) => ({ key: v.id, label: audioLabelOf(v), name: v.label || v.original_name || "" }));
+  for (const m of P().refmods || []) {
+    if (m.kind === "audio") out.push({ key: "refmod:" + m.id, label: refmodLabelOf(m), name: (m.label || m.name) + " (RefMod)" });
+  }
+  return out;
+}
 function voiceTag(c) {
   if (!c.voice) return "";
-  const v = voiceById(c.voice), a = audioLabelOf(v);
-  if (a) return `<div><span class="voice-tag" title="Gets its voice timbre from ${esc(a)}${v.label ? " " + esc(v.label) : ""}">🔊 ${esc(a)}</span></div>`;
-  return `<div><span class="voice-tag missing" title="Its voice reference is ${v ? "bypassed" : "removed"}, so the prompt leaves the voice out. Pick another in its editor.">🔊 voice ${v ? "off" : "removed"}</span></div>`;
+  const v = voiceSource(c.voice), a = v && v.label;
+  if (a) return `<div><span class="voice-tag" title="Gets its voice timbre from ${esc(a)}${v.name ? " " + esc(v.name) : ""}">🔊 ${esc(a)}</span></div>`;
+  return `<div><span class="voice-tag missing" title="Its voice reference is ${v && v.there ? "bypassed" : "removed"}, so the prompt leaves the voice out. Pick another in its editor.">🔊 voice ${v && v.there ? "off" : "removed"}</span></div>`;
 }
 
-/** An audio reference card: <Audio N>, label, player, trim. */
+/** An audio reference card: <Audio N>, label, what it's for, a player. Click to edit (0.12.0). */
+function audioRoleText(v) {
+  const r = v.role || "voice";
+  return r === "other" ? (v.role_text || "audio") : (AUDIO_ROLES.find(([k]) => k === r) || [, "Voice timbre"])[1].toLowerCase();
+}
 function voiceCard(v) {
   const a = audioLabelOf(v), state = S.refState["voice:" + v.id];
   const missing = !!v.file && (state === "missing" || state === "invalid");
-  const who = liveCast().filter((c) => c.voice === v.id).map((c) => c.label || picOf(c));
+  const role = v.role || "voice";
+  const who = [...liveCast().filter((c) => c.voice === v.id).map((c) => c.label || picOf(c)),
+    ...(P().refmods || []).filter((m) => !m.bypassed && m.voice === v.id).map((m) => m.label || m.name)];
   const over = !v.bypassed && a && Number(a.match(/\d+/)[0]) > MAX_AUDIO_REFS;
   const src = v.file && !missing ? viewURL({ filename: v.file, subfolder: v.subfolder, type: "input" }) : "";
   const up = S.uploading["voice:" + v.id] ? '<div class="drop-busy">Uploading…</div>' : "";
+  const what = role === "voice" ? (who.length ? `Voice timbre of ${esc(who.join(", "))}` : "Voice timbre · not linked to a picture yet")
+    : `${esc(audioRoleText(v))} · ${v.use === "copy" ? "copied" : "reference"}`;
   return `<div class="card voice-card${v.bypassed ? " off" : ""}${missing && !v.bypassed ? " missing" : ""}" data-voice="${esc(v.id)}">${up}
-      <div class="thumb-col"><button class="thumb voice-thumb" data-action="voice-replace" title="Choose another audio file, or drop one on this card" aria-label="Replace the audio of ${esc(v.label || a || "this voice")}">♪</button></div>
+      <div class="thumb-col"><button class="thumb voice-thumb" data-action="voice-replace" title="Choose another audio file, or drop one on this card" aria-label="Replace the audio of ${esc(v.label || a || "this audio")}">🔊</button></div>
       <div class="card-body">
         <div class="card-top"><span class="pic">${esc(v.bypassed ? "bypassed" : a || "—")}</span>
-          <input class="inline voice-label" data-voice-field="label" value="${esc(v.label)}" placeholder="<voice>" spellcheck="false" aria-label="Voice reference label"></div>
-        <div class="muted small">${over ? '<span class="warn">Long Shot takes 3 reference audios: bypass one.</span>'
-          : who.length ? `Voice timbre of ${esc(who.join(", "))}` : "Not linked yet: pick it in a picture's editor (gets its voice timbre from)."}</div>
+          <button class="label-view" data-action="edit-voice" title="Edit this audio reference">${esc(v.label) || '<i class="muted">no label</i>'}</button></div>
+        <div class="muted small">${over ? '<span class="warn">Long Shot takes 3 reference audios: bypass one.</span>' : what}</div>
+        ${v.desc ? `<button class="desc-view" data-action="edit-voice" title="Edit this audio reference">${esc(v.desc)}</button>` : ""}
         ${missing ? `<div class="missing">Missing: ${esc(v.original_name || v.file)}</div>`
           : src ? `<audio class="voice-play" controls preload="none" src="${esc(src)}"></audio>` : ""}
-        <div class="voice-trim">
-          <label class="lbl-row">Start <input type="number" min="0" step="0.1" data-voice-field="start" value="${esc(v.start || 0)}" style="width:64px"> s</label>
-          <label class="lbl-row">Length <input type="number" min="0" step="0.1" data-voice-field="length" value="${v.length ? esc(v.length) : ""}" placeholder="all" style="width:64px"> s</label>
-        </div>
-        <div class="muted small voice-file" title="${esc((v.subfolder ? v.subfolder + "/" : "") + v.file)}">${esc(v.original_name || v.file)}</div>
+        <div class="muted small voice-file" title="${esc((v.subfolder ? v.subfolder + "/" : "") + v.file)}">${esc(v.original_name || v.file)}${v.start || v.length ? ` · from ${Number(v.start || 0).toFixed(2)} s${v.length ? ` for ${Number(v.length).toFixed(2)} s` : ""}` : ""}</div>
       </div>
       <div class="card-tools">
+        <button class="icon" data-action="edit-voice" title="Edit" aria-label="Edit ${esc(v.label || a || "this audio reference")}">${PENCIL}</button>
         <button class="icon${v.bypassed ? " on" : ""}" data-action="bypass-voice" aria-pressed="${v.bypassed}" title="${v.bypassed ? "Turn back on" : "Bypass"}">${POWER}</button>
-        <button class="icon x" data-action="remove-voice" title="Remove" aria-label="Remove ${esc(v.label || "this voice reference")}">${CROSS}</button>
+        <button class="icon x" data-action="remove-voice" title="Remove" aria-label="Remove ${esc(v.label || "this audio reference")}">${CROSS}</button>
       </div></div>`;
 }
 /** RefMods (0.8.6): <Picture|Video|Audio N>, numbered after the references of that kind. */
@@ -3682,23 +4599,24 @@ const liveRefmods = () => (P().refmods || []).filter((m) => !m.bypassed && m.nam
 function refmodLabelOf(m) {
   const i = liveRefmods().indexOf(m);
   if (i < 0) return null;
-  const counts = { image: liveCast().length, video: 0, audio: liveVoices().length };
+  const counts = { image: liveCast().length, video: 0, audio: songSlot() + liveVoices().length };
   let label = null;
   liveRefmods().slice(0, i + 1).forEach((x) => { counts[x.kind] += 1; label = `<${{ image: "Picture", video: "Video", audio: "Audio" }[x.kind]} ${counts[x.kind]}>`; });
   return label;
 }
 function refmodCard(m) {
-  const a = refmodLabelOf(m);
+  const a = refmodLabelOf(m), v = m.voice ? voiceSource(m.voice) : null;
   return `<div class="card refmod-card${m.bypassed ? " off" : ""}" data-refmod="${esc(m.id)}">
-      <div class="thumb-col"><div class="thumb refmod-thumb" title="RefMod (${esc(m.kind)}): no preview">${REFMOD_ICON[m.kind] || "🖼"}</div></div>
+      <div class="thumb-col"><button class="thumb refmod-thumb" data-action="edit-refmod" title="RefMod (${esc(m.kind)}) · edit">${REFMOD_ICON[m.kind] || "🖼"}</button></div>
       <div class="card-body">
         <div class="card-top"><span class="pic">${esc(m.bypassed ? "bypassed" : a || "—")}</span>
-          <input class="inline refmod-label" data-refmod-field="label" value="${esc(m.label)}" placeholder="<name>" spellcheck="false" aria-label="RefMod label"></div>
-        <input class="inline refmod-desc" data-refmod-field="desc" value="${esc(m.desc)}" placeholder="Add a description…" aria-label="RefMod description">
-        <div class="muted small refmod-name">RefMod · ${esc(m.name)}</div>
-        <label class="lbl-row small">Strength <input type="number" min="0" max="1" step="0.05" data-refmod-field="strength" value="${esc(m.strength)}" style="width:64px"></label>
+          <button class="label-view" data-action="edit-refmod" title="Edit this RefMod">${esc(m.label) || '<i class="muted">no label</i>'}</button></div>
+        ${v ? `<div>${v.label ? `<span class="voice-tag" title="Gets its voice timbre from ${esc(v.label)} ${esc(v.name)}">🔊 ${esc(v.label)}</span>` : '<span class="voice-tag missing">🔊 voice off</span>'}</div>` : ""}
+        <button class="desc-view" data-action="edit-refmod" title="Edit this RefMod">${esc(m.desc) || "<i>Add a description…</i>"}</button>
+        <div class="muted small refmod-name">RefMod · ${esc(m.name)} · ${esc(refmodRole(m))} · strength ${Number(m.strength).toFixed(2)}</div>
       </div>
       <div class="card-tools">
+        <button class="icon" data-action="edit-refmod" title="Edit" aria-label="Edit ${esc(m.label || m.name)}">${PENCIL}</button>
         <button class="icon${m.bypassed ? " on" : ""}" data-action="bypass-refmod" aria-pressed="${m.bypassed}" title="${m.bypassed ? "Turn back on" : "Bypass"}">${POWER}</button>
         <button class="icon x" data-action="remove-refmod" title="Remove" aria-label="Remove ${esc(m.label || m.name)}">${CROSS}</button>
       </div></div>`;
@@ -3782,8 +4700,50 @@ function renderStyle() {
   if (!S.styleOpen) return;
   const st = P().style;
   $("style").innerHTML = STYLE_FIELDS.map(([k, label, rows]) =>
+    (k === "summary" ? taskTypesHTML() : "") +
     `<label for="f-${k}">${label}</label><textarea class="fit" id="f-${k}" data-style="${k}" rows="${rows}">${esc(st[k])}</textarea>`).join("");
   fitAll($("style"));
+}
+
+/** 0.12.4: the summary's task types (the prompt compiler's), toggled in click order. */
+const TASK_TYPES = ["keyframe completion", "reference generation", "video editing", "video continuation",
+  "audio reuse", "audio reference"];
+const MAX_TASK_TYPES = 3;
+/** Added by the Studio itself: the song as <Audio 1>, or an audio reference set to Copy. */
+function autoAudioReuse() {
+  return songRefOn() || (P().voices || []).some((v) => !v.bypassed && v.file && (v.role || "voice") !== "voice" && v.use === "copy");
+}
+/** The types as the prompt writes them: yours, then "audio reuse" when it's automatic. */
+function taskTypesOut() {
+  const t = (P().style.task_types || []).filter((x) => TASK_TYPES.includes(x)).slice(0, MAX_TASK_TYPES);
+  const out = t.length ? t.slice() : ["reference generation"];
+  if (autoAudioReuse() && !out.includes("audio reuse") && out.length < MAX_TASK_TYPES) out.push("audio reuse");
+  return out;
+}
+function taskTypesHTML() {
+  const on = P().style.task_types || [];
+  const auto = autoAudioReuse() && !on.includes("audio reuse") && on.length < MAX_TASK_TYPES;
+  const typed = (P().style.summary || "").trim().startsWith("[");
+  const chips = TASK_TYPES.map((t) => {
+    const isOn = on.includes(t), isAuto = t === "audio reuse" && auto;
+    return `<button class="tt-chip${isOn ? " on" : ""}${isAuto ? " auto" : ""}" data-action="task-type" data-t="${esc(t)}" aria-pressed="${isOn}"
+      title="${isAuto ? "Added automatically (the song as <Audio 1>, or an audio reference set to Copy). Click to keep it on yourself." : isOn ? "Click to remove" : "Click to add"}">${esc(t)}${isAuto ? " · auto" : ""}</button>`;
+  }).join("");
+  return `<label>Task types</label><div class="tt-cell"><div class="tt-row">${chips}
+      <button class="ghost sm" data-action="task-types-clear"${on.length ? "" : " disabled"}>Clear</button></div>
+    <div class="muted small tt-preview">${typed
+      ? '<span class="warn">Your Summary starts with [ … ], so the prompt uses it as written and these buttons are ignored.</span>'
+      : `The summary starts with <span class="mono">[${esc(taskTypesOut().join(" + "))}]</span>${on.length ? "" : " (the default)"}` +
+        (autoAudioReuse() && !on.includes("audio reuse") && on.length >= MAX_TASK_TYPES
+          ? ' <span class="warn">· no room for the automatic "audio reuse": remove one.</span>' : "")}</div></div>`;
+}
+async function setTaskTypes(next) {
+  if (setupGuard()) return;
+  const mode = await askSettingChange("Change the task types");
+  if (!mode) return;
+  P().style.task_types = next;
+  applyRefChange(mode, "Style & Sound");
+  commit();
 }
 
 /** Retention: with the mouse resting on the field, the markers it takes (0.8.4).
@@ -3869,7 +4829,7 @@ const CHIP_HELP = {
   cut: "a fresh start from the references; nothing pinned.",
   context: "a hard cut; the last frame of the Shot before goes in as a reference picture (same characters, place and light).",
   from: "continues from the end of the Shot before; its end is free.",
-  pending: "continues from the Shot before in Render all. ▶ on this Shot alone pins it to the approved Shots next to it; with none approved yet it renders on its own.",
+  pending: "continues from the Shot before in Render all. ▶ on this Shot alone pins it to the rendered Shots next to it (approved or under review; one still rendering is waited for); with none rendered yet it renders on its own.",
   into: "a fresh start that flows into the start of the Shot after.",
   bridge: "pinned at both ends: flows from the Shot before into the Shot after.",
 };
@@ -3923,12 +4883,14 @@ function shotRowHTML(s) {
       title="${s.id === rid ? "Rendering now" : "In the queue"}. Click to queue another take of ${title} after it (next seed)." aria-label="Queue another take of ${title}">▶</button>`
     : `<button class="sdot sdot-play" data-action="render-alone"${aloneOff ? " disabled" : ""}
       title="Render ${title} · ${chipName(s)}: ${esc(CHIP_HELP[chipKey(s)])}" aria-label="Render ${title} (${chipName(s)})">▶</button>`;
-  // the join chip: how ▶ renders it, from the approved Shots next to it
+  // the join chip: how ▶ renders it, from the rendered Shots next to it
   const actR = active(), prevR = !s.bypassed ? actR[actR.indexOf(s) - 1] : null;
   const cj = chipJoin(s), opts = chipOptions(s);
   const icon = { bridge: "↔", context: "⧉", cut: "|" }[cj];
   const joinChip = !s.bypassed && s.kind !== "clip"
     ? `<button class="join-chip j-${esc(cj)}${opts.length < 2 ? " only" : ""}" data-action="cycle-join" title="${esc(chipName(s) + ": " + CHIP_HELP[chipKey(s)])}${
+      (() => { const nb = chipNear(s), odd = [nb.prev, nb.next].filter(otherSize);
+        return odd.length ? esc(` ${odd.map(titleOf).join(" and ")} ${odd.length > 1 ? "are" : "is"} another size, so not pinned to (a hard cut there).`) : ""; })()}${
       opts.length < 2 ? " No Shot next to it, so Cut is the only choice." : ` Click to switch: ${opts.map((o) => chipName(s, o)).join(" → ")}.`}">${icon} ${chipName(s)}</button>` : "";
   const ctxStale = s.join === "context" && s.status !== "queued" && s.context_from && prevR &&
     (prevR.kind === "clip" ? `clip:${prevR.id}` : prevR.take) !== s.context_from;
@@ -3937,7 +4899,8 @@ function shotRowHTML(s) {
   return `${play}<button class="shot-head${play ? " has-play" : ""}" data-action="toggle-shot" aria-expanded="${open}">
           ${play ? "" : `<span class="sdot" style="background:${L.dot};color:${L.fg}">${L.icon}</span>`}
           <span class="stitle">${title}</span>
-          <span class="smeta">${esc(s.seconds)}s · seed ${esc(seed)}</span>
+          <span class="smeta">${isEmptyShot(s) ? `${(Number(s.seconds) || 0).toFixed(2)}s · <span class="hold-tag" title="No prompt: it holds its time on the film and never renders. Moving the Shot next to it makes it longer or shorter.">holds time</span>`
+            : `${esc(s.seconds)}s · seed ${esc(seed)}`}${songSpanHTML(s)}${editTag(s)}${phraseTag(s)}${alignedTag(s)}${sizeTag(s)}</span>
           <span class="sprev">${esc(s.text) || '<i class="muted">empty</i>'}</span>
           ${flag}${cut}${standaloneTag}${ctxFlag}
           <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span>
@@ -4074,6 +5037,7 @@ function anchorPick(key) {
 }
 
 function renderShots() {
+  requestLayout();
   if (deferIfHeld("shots")) return;
   let prevActive = null;
   const slots = new Set(anchorKeys());
@@ -4082,6 +5046,11 @@ function renderShots() {
   const tiles = (s) => s.bypassed ? "" : (slots.has(s.id) ? anchorSlot(s.id, "top") : "") +
     (s.id === lastId && slots.has("end") ? anchorSlot("end", "bottom") : "");
   $("shots-panel").classList.toggle("has-anchors", slots.size > 0);
+  {                                                  // 0.12.3: the one line when Shots is folded
+    const act = active().filter((s) => !isEmptyShot(s));
+    const ok = act.filter((s) => s.status === "approved").length;
+    $("shots-summary").textContent = `${act.length} Shot${act.length === 1 ? "" : "s"} · ${ok} approved`;
+  }
   // ⇅ (0.8.5): newest Shot on top; display only, kept per browser
   const flip = store("h3studio.flipShots") === "1";
   $("shots-panel").classList.toggle("flipped", flip);
@@ -4106,7 +5075,7 @@ function renderShots() {
         <textarea class="field fit" data-shot-field="text" rows="3" aria-label="${title} text">${esc(s.text)}</textarea>
         <div class="shot-opts">
           <label class="lbl-row">Seconds <input type="number" step="0.1" min="0.1" data-shot-field="seconds" value="${esc(s.seconds)}" style="width:72px"${ro}></label>
-          <label class="lbl-row">Seed <input class="mono" data-shot-field="shot_seed" value="${s.shot_seed < 0 ? "" : esc(s.shot_seed)}" placeholder="auto${isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used) ? ` · ${s.seed_used}` : ""}" style="width:120px"${ro}></label>
+          <label class="lbl-row">Seed <input class="mono" data-shot-field="shot_seed" value="${s.shot_seed < 0 ? "" : esc(s.shot_seed)}" placeholder="auto${isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used) ? ` · ${s.seed_used}` : ""}" style="width:120px"${ro}></label>${seedStepHTML("shot-seed-step", !!ro, isAuto(s) ? "On auto: gives this Shot its own seed, one from its last take's" : "")}
           <button class="ghost sm" data-action="wrap" data-before="&lt;d&gt;[English] " data-after="&lt;/d&gt;">Wrap &lt;d&gt; dialogue</button>
           <button class="ghost sm" data-action="wrap" data-before="&quot;" data-after="&quot;">Wrap "on-screen text"</button>
           ${canReroll ? '<button class="ghost sm" data-action="reroll-shot">⟳ Reroll this Shot</button>' : ""}
@@ -4157,7 +5126,7 @@ function clipCard(s) {
       <button class="shot-head" data-action="toggle-shot" aria-expanded="${open}">
         <span class="sdot" style="background:${L.dot};color:${L.fg}">${L.icon}</span>
         <span class="stitle">${title}</span>
-        <span class="smeta">${(s.clip.frames / 24).toFixed(2)}s · clip</span>
+        <span class="smeta">${(s.clip.frames / 24).toFixed(2)}s · clip${songSpanHTML(s)}${editTag(s)}</span>
         <span class="sprev">${missing ? '<span class="missing">Missing: </span>' : ""}${esc(s.clip.original_name || s.clip.file) || '<i class="muted">no video</i>'}</span>
         ${cut}
         <span class="chip" style="background:${L.chipBg};color:${L.chipFg}">${L.label}</span>
@@ -4197,8 +5166,8 @@ function renderViewer() {
     return `<div class="tl-block st-${st}${S.focus === e.id ? " focus" : ""}${e.src ? "" : " gap"}" data-tl="${esc(e.id)}"
         style="left:${(e.start / total) * 100}%;width:${(e.dur / total) * 100}%">
       <button class="tl-pick" data-action="tl-pick" title="${esc(titleOf(sh))} · ${esc(why)} · click to go there"
-        ${e.thumb ? `style="background-image:url('${esc(e.thumb)}')"` : ""}><span class="tl-num">${sh.kind === "clip" ? "▶" : "S"}${numOf(sh.id)}</span></button>
-      ${nav}</div>`;
+        ${e.thumb ? `style="background-image:url('${esc(e.thumb)}')"` : ""}><span class="tl-num">${sh.kind === "clip" ? "▶" : "S"}${numOf(sh.id)}${isAligned(sh) ? ' <span class="tl-aligned" title="Aligned">✓</span>' : ""}</span></button>
+      ${nav}${trimHandles(sh)}</div>`;
   }).join("") : "";
   const approx = !TL.exact && TL.entries.some((e) => e.rendered);
   $("tl-approx").hidden = !approx;
@@ -4248,6 +5217,7 @@ function renderViewer() {
   $("download").toggleAttribute("disabled", !hasFile);
   $("download").hidden = S.local || !hasFile;
   layoutTL();
+  applyVolume();
   renderLiveToggle();
   syncLive();
   if (S.focus !== TLV.focus) { TLV.focus = S.focus; if (S.focus) tlReveal(S.focus); }
@@ -4356,8 +5326,11 @@ function throughTarget() {
   return lastKept && act.indexOf(lastKept) > act.indexOf(nx) ? lastKept : null;
 }
 
-const ROUTES = [["lip_sync", "Lip sync to song", "song → Song Track → Long Shot", "per segment"],
-  ["final_override", "Song in final video", "replaces generated audio in Video Combine", "output"]];
+// 0.9.1: one route. The song goes into every Shot as <Audio 1>, a reference audio like
+// the native Reference to Video node's; the sound of the video is H3's own. (Lip sync
+// to song and Song in final video are off until they're reworked.)
+const ROUTES = [["song_ref", "Song as <Audio 1>", "each Shot gets the part of the song under it as reference audio; H3 lip-syncs to it", "reference"],
+  ["final_override", "Song in final video", "the song replaces H3's sound in clips, previews and exports", "output"]];
 
 function switchHTML(on, attrs, sm) {
   return `<button class="switch${sm ? " sm" : ""}" role="switch" aria-checked="${!!on}" ${attrs}><span></span></button>`;
@@ -4380,6 +5353,7 @@ function apLabel() {
 function stopPreview() {
   if (!preview.on) return;
   preview.on = false;
+  if (!preview.el.ended && preview.el.currentTime < preview.end) SCRUB.pos = preview.el.currentTime;
   preview.el.pause();
   cancelAnimationFrame(preview.raf);
   if (P()) renderAudio();
@@ -4388,9 +5362,11 @@ function stopPreview() {
 function previewTick() {
   if (!preview.on) return;
   const el = preview.el;
-  if (el.currentTime >= preview.end || el.ended) { stopPreview(); return; }
+  if (el.currentTime >= preview.end || el.ended) { SCRUB.pos = preview.start; stopPreview(); return; }
+  if (!SCRUB.drag) SCRUB.pos = el.currentTime;
   const t = $("ap-time");
   if (t) t.textContent = apLabel();
+  updateScrub();
   preview.raf = requestAnimationFrame(previewTick);
 }
 
@@ -4398,11 +5374,14 @@ function startPreview() {
   const a = P().audio;
   if (!a.file || audioMissing()) return;
   const el = preview.el;
-  const src = viewURL({ filename: a.file, subfolder: a.subfolder, type: "input" });
+  const src = songSrc();
   if (preview.src !== src) { el.src = src; preview.src = src; }
-  preview.start = Math.max(0, Number(a.start) || 0);
-  const len = Math.max(0, Number(a.length) || 0);
-  preview.end = len ? preview.start + len : Infinity;
+  const r = scrubRange();
+  preview.start = r.a;
+  preview.end = isFinite(r.b) ? r.b : Infinity;
+  let from = scrubPos();
+  if (isFinite(r.b) && from >= r.b - 0.05) from = r.a;      // at the end: from the top
+  SCRUB.pos = from;
   if (PL.playing) pausePlayer();
   el.volume = video.volume;
   preview.on = true;
@@ -4414,7 +5393,7 @@ function startPreview() {
       stopPreview();
       return;
     }
-    el.currentTime = preview.start;
+    el.currentTime = from;
     el.play().then(() => { preview.raf = requestAnimationFrame(previewTick); })
       .catch((err) => { if (preview.on) { toast("Couldn't play the audio: " + err.message); stopPreview(); } });
   };
@@ -4427,37 +5406,464 @@ function startPreview() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phrase markers (0.11.0): where singing starts after a pause, in seconds into the
+// song file. Press M while the song plays (or with the scrub bar focused) to mark
+// one; drag a marker to move it, double-click to delete it. Detect suggests them
+// from the full mix (the centre channel in the voice range). A Shot card's
+// "Start on the next phrase" moves the Shot onto the next one.
+// ---------------------------------------------------------------------------
+
+const PH = { drag: null };
+
+function phrases() { return (P() && P().audio.phrases) || []; }
+
+function setPhrases(list) {
+  const a = P().audio;
+  a.phrases = [...new Set(list.map((t) => Math.round(Math.max(0, t) * FPS) / FPS))].sort((x, y) => x - y);
+  commit();
+}
+
+function markPhrase(t) {
+  const at = t !== undefined ? t : previewing() ? preview.el.currentTime : scrubPos();
+  if (!P().audio.file) return;
+  if (phrases().some((x) => Math.abs(x - at) < 0.1)) { toast("There's a marker there already."); return; }
+  setPhrases([...phrases(), at]);
+  toast(`Phrase marked at ${fmtSong(at)} (${phrases().length} in all).`);
+}
+
+function drawPhraseMarks() {
+  const bar = $("ascrub");
+  if (!bar) return;
+  bar.querySelectorAll(".ph-mark").forEach((x) => x.remove());
+  const r = scrubRange();
+  if (!isFinite(r.b) || r.b <= r.a) return;
+  phrases().forEach((t, i) => {
+    if (t < r.a || t > r.b) return;
+    const m = document.createElement("div");
+    m.className = "ph-mark";
+    m.dataset.ph = String(i);
+    m.style.left = ((t - r.a) / (r.b - r.a) * 100) + "%";
+    m.title = `Phrase at ${fmtSong(t)} · drag to move, double-click to delete`;
+    bar.appendChild(m);
+  });
+}
+
+document.addEventListener("pointerdown", (e) => {
+  const m = e.target.closest && e.target.closest(".ph-mark");
+  if (!m || e.button !== 0) return;
+  e.preventDefault();
+  e.stopPropagation();
+  PH.drag = { i: Number(m.dataset.ph), el: m };
+}, true);
+document.addEventListener("pointermove", (e) => {
+  if (!PH.drag) return;
+  const bar = $("ascrub"), r = scrubRange();
+  if (!bar || !isFinite(r.b)) return;
+  const box = bar.getBoundingClientRect();
+  const t = r.a + (r.b - r.a) * Math.max(0, Math.min(1, (e.clientX - box.left) / box.width));
+  PH.drag.t = t;
+  PH.drag.el.style.left = ((t - r.a) / (r.b - r.a) * 100) + "%";
+  trimReadout(e.clientX, e.clientY, fmtSong(t));
+});
+document.addEventListener("pointerup", () => {
+  const d = PH.drag;
+  if (!d) return;
+  PH.drag = null;
+  $("tl-readout").hidden = true;
+  if (d.t === undefined) return;
+  const list = phrases().slice();
+  list[d.i] = d.t;
+  setPhrases(list);
+});
+document.addEventListener("dblclick", (e) => {
+  const m = e.target.closest && e.target.closest(".ph-mark");
+  if (!m) return;
+  const list = phrases().slice();
+  list.splice(Number(m.dataset.ph), 1);
+  setPhrases(list);
+});
+
+async function detectPhrases() {
+  const a = P().audio;
+  if (!a.file || audioMissing()) return;
+  if (phrases().length && !confirm(`Replace the ${phrases().length} phrase marker${phrases().length === 1 ? "" : "s"} with detected ones?`)) return;
+  S.detecting = true;
+  renderAudio();
+  try {
+    const r = await api("/longshot/phrases", { method: "POST", body: { file: a.file, subfolder: a.subfolder || "",
+      min_gap: a.phrase_gap, sensitivity: a.phrase_sens } });
+    setPhrases(r.phrases || []);
+    toast(r.phrases && r.phrases.length ? `${r.phrases.length} phrases found. Check them on the scrub bar: drag to move, double-click to delete, M to add.`
+      : "No clear phrase starts found. Lower Min pause or raise Sensitivity, or mark them with M.");
+  } catch (e) { toast("Couldn't detect phrases: " + e.message); }
+  finally { S.detecting = false; renderAudio(); }
+}
+
+function phraseHTML(a) {
+  const ok = a.file && !audioMissing(), n = phrases().length;
+  return `<div class="ph-row">
+      <span class="small"><b>Phrases</b> <span class="muted">${n ? `${n} marked` : "none yet"} · M marks one while the song plays</span></span>
+      <span class="ph-btns">
+        <button class="ghost sm" data-action="phrase-mark"${ok ? "" : " disabled"} title="Mark a phrase at the playhead (M while the song plays)">+ Mark</button>
+        <button class="ghost sm" data-action="phrase-detect"${ok && !S.detecting ? "" : " disabled"} title="Suggest phrase starts from the song (the centre channel in the voice range)">${S.detecting ? "Detecting…" : "Detect"}</button>
+        <button class="ghost sm" data-action="phrase-clear"${n ? "" : " disabled"}>Clear</button>
+      </span>
+    </div>
+    <div class="shot-opts ph-opts">
+      <label class="lbl-row" title="How long the singing has to stop before the next start counts as a new phrase">Min pause <input type="number" min="0.1" max="3" step="0.1" data-audio="phrase_gap" value="${esc(a.phrase_gap)}" style="width:64px"> s</label>
+      <label class="lbl-row" title="Higher finds quieter phrase starts (and more false ones)">Sensitivity <input type="range" min="0" max="1" step="0.05" data-audio="phrase_sens" value="${esc(a.phrase_sens)}" style="width:90px"></label>
+      <label class="lbl-row" title="Start on the next phrase starts the Shot this many frames before the word">Lead-in <input type="number" min="0" max="48" step="1" data-audio="phrase_lead" value="${esc(a.phrase_lead)}" style="width:56px"> frames</label>
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Align to song (0.11.0): decode a take's own audio (H3's performance of the song),
+// compare it with the song where the take sits, and move the take by the difference.
+// ---------------------------------------------------------------------------
+
+/** Where a Shot's take starts in the song now (seconds), and how long it is. */
+function takeSongPlace(s) {
+  const L = LAYOUT.byId[s.id];
+  if (!L) return null;
+  return { at: songStart() + (L.ws + effEdit(s).shift) / LAYOUT.fps, seconds: (L.we - L.ws) / LAYOUT.fps };
+}
+
+async function checkAlign(s) {
+  if (!s || !s.take || !isRendered(s)) return;
+  if (!P().audio.file || audioMissing()) { toast("Choose the song in the Audio panel first."); return; }
+  if (S.busy || S.chunking || S.queuing) { toast("ComfyUI is busy: check the sync when the queue is done."); return; }
+  const place = takeSongPlace(s);
+  if (!place) { toast("One moment: working out where the Shots sit…"); return; }
+  await runNow({ kind: "align", takeAudio: { take: s.take }, extra: { sid: s.id, take: s.take, at: place.at, seconds: place.seconds },
+    label: `Checking ${titleOf(s)} against the song`, note: "Its own audio decoded · nothing is sampled", onDone: () => {} });
+}
+
+async function alignDone(b, outputs) {
+  const x = b.extra || {}, sh = shotById(x.sid);
+  const wav = ((outputs[b.built.nodes.audio] || {}).longshot_audio || [])[0];
+  if (!sh || !wav) { S.error = "The take's audio wasn't saved. Update H3 Long Shot."; return; }
+  try {
+    const a = P().audio;
+    const r = await api("/longshot/align", { method: "POST", body: { audio: { filename: wav.filename, subfolder: wav.subfolder || "" },
+      song: { file: a.file, subfolder: a.subfolder || "" }, at: x.at, seconds: x.seconds } });
+    sh.align = { take: x.take, at: x.at, offset: r.offset, conf: r.confidence };
+    scheduleSave();
+    if (r.offset === null || r.confidence < 1.15) toast(`${titleOf(sh)}: no clear match with the song (too little singing to compare?).`);
+  } catch (e) { toast("Couldn't compare with the song: " + e.message); }
+}
+
+function alignTag(s) {
+  if (!isRendered(s) || !s.take || s.kind === "clip") return "";
+  const al = s.align, place = takeSongPlace(s);
+  const fresh = al && al.take === s.take && place && Math.abs(al.at - place.at) < 0.5 / FPS;
+  if (!fresh) return ` · <span class="linkbtn" role="button" tabindex="0" data-action="align-check" title="Compare this take's own singing with the song where it sits (its audio is decoded; nothing is sampled)">check sync</span>`;
+  if (al.offset === null || al.conf < 1.15) return ` · <span class="muted" title="Too little singing to compare, or it doesn't match the song here">no clear match</span>`;
+  const f = Math.round(al.offset * FPS);
+  if (!f) return ` · <span class="sync-ok" title="Its singing lines up with the song">in sync ✓</span>`;
+  const run = runOf(s);
+  return ` · <span class="sync-off">sung ${Math.abs(al.offset).toFixed(2)} s ${al.offset > 0 ? "early" : "late"}</span> ` +
+    `<span class="linkbtn" role="button" tabindex="0" data-action="align-apply" title="Move ${run.length > 1 ? "its whole run" : "it"} ${Math.abs(f)} frames ${f > 0 ? "later" : "earlier"} so its singing sits on the song (the empty Shot before it makes room)">align</span>`;
+}
+
+function applyAlign(s) {
+  const al = s && s.align;
+  if (!al || al.offset === null) return;
+  const f = Math.round(al.offset * FPS), first = runOf(s)[0];
+  const before = filmSpan(first);
+  moveShot(first, f);
+  const after = filmSpan(first);
+  if (before && after && after.a !== before.a) {
+    const moved = after.a - before.a;
+    al.at += moved / FPS;
+    al.offset -= moved / FPS;
+    scheduleSave();
+    renderShots();
+  }
+}
+
+/** On a Shot card: "▸ next phrase" (and, for a rendered Shot, Align to song). */
+function phraseTag(s) {
+  if (!songOn() || isEmptyShot(s)) return "";
+  let h = "";
+  if (phrases().length && runOf(s)[0] === s && nextPhraseFrame(s) !== null) {
+    h += ` · <span class="linkbtn" role="button" tabindex="0" data-action="phrase-next" title="Move this Shot so it starts on the next phrase marker (the empty Shot before it makes room)">▸ next phrase</span>`;
+  }
+  return h;
+}
+
+/** 0.12.7: "1056×608" on a Shot made at another size than Settings make now. */
+function sizeTag(s) {
+  if (!otherSize(s)) return "";
+  const t = takeSize(s), cur = sizeOf(P().settings);
+  return ` · <span class="size-tag" title="Made at ${sizeText(t)}; Settings make ${cur[0]}×${cur[1]} now. Shots of another size aren't pinned to it (a hard cut there), and the film can't be stitched until every Shot is one size. Export approved clips works.">${sizeText(t)}</span>`;
+}
+
+/** 0.12.5: "aligned ✓": the user lined this Shot up with the song by hand. It's for the
+ *  take (or clip) it has now; a new take needs lining up again. */
+const alignKey = (s) => s.kind === "clip" ? (s.clip && s.clip.file) || "" : s.take || "";
+const isAligned = (s) => !!(s && s.aligned && isRendered(s) && alignKey(s) && s.aligned.key === alignKey(s));
+function alignedTag(s) {
+  if (!isRendered(s) || isEmptyShot(s)) return "";
+  return isAligned(s)
+    ? ` · <span class="aligned-btn on" role="button" tabindex="0" data-action="aligned" aria-pressed="true" title="Lined up with the song: Alt + ← / → won't move it. Click to unmark.">aligned ✓</span>`
+    : ` · <span class="aligned-btn" role="button" tabindex="0" data-action="aligned" aria-pressed="false" title="Mark this Shot as lined up with the song (it then stays put)">aligned</span>`;
+}
+
+/** The next phrase after a Shot's start on the film, as a film frame (null: none). */
+function nextPhraseFrame(s) {
+  const sp = filmSpan(s);
+  if (!sp) return null;
+  const lead = Number(P().audio.phrase_lead) || 0, st = songStart();
+  for (const t of phrases()) {
+    const f = Math.round((t - st) * FPS) - lead;
+    if (f > sp.a) return f;
+  }
+  return null;
+}
+
+/** Start on the next phrase: move the Shot (its run) so it starts on the next marker. */
+function startOnPhrase(s) {
+  const f = nextPhraseFrame(s), sp = filmSpan(s);
+  if (f === null || !sp) { toast(phrases().length ? "No phrase marker after this Shot's start." : "Mark the phrases first (Audio panel: M while the song plays, or Detect)."); return; }
+  const run = runOf(s);
+  if (run[0] !== s) { toast(`${titleOf(s)} continues from the Shot before; move the first Shot of the run.`); return; }
+  moveShot(s, f - sp.a);
+}
+
+// ---------------------------------------------------------------------------
+// Audio scrub bar (0.9.1): the song from Start for Length (both 0: the whole song),
+// with its waveform. Click or drag to move the playhead; Play plays from there.
+// Set start / Set end put Start or the end (Length) at the playhead.
+// ---------------------------------------------------------------------------
+
+const SCRUB = { pos: null, dur: null, peaks: null, src: "", drag: false, loading: false };
+
+function scrubSrc() {
+  const a = P().audio;
+  return a.file ? viewURL({ filename: a.file, subfolder: a.subfolder || "", type: "input" }) : "";
+}
+
+/** The stretch the bar shows: Start → Start + Length (Length 0: to the end of the song). */
+function scrubRange() {
+  const a = P().audio;
+  const start = Math.max(0, Number(a.start) || 0), len = Math.max(0, Number(a.length) || 0);
+  const dur = SCRUB.dur || (isFinite(preview.el.duration) ? preview.el.duration : null);
+  const b = len ? start + len : (dur || Infinity);
+  return { a: start, b: dur ? Math.min(b, Math.max(dur, start)) : b, dur };
+}
+
+function scrubPos() {
+  const r = scrubRange();
+  const p = SCRUB.pos == null ? r.a : SCRUB.pos;
+  return Math.max(r.a, isFinite(r.b) ? Math.min(p, r.b) : p);
+}
+
+/** Load the song once: its length and a waveform (peaks over the whole song). */
+function ensureScrub() {
+  const src = scrubSrc();
+  if (!src || audioMissing() || SCRUB.src === src) return;
+  Object.assign(SCRUB, { src, dur: null, peaks: null, pos: null, loading: true });
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  fetch(src).then((r) => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); })
+    .then((buf) => new Promise((res, rej) => {
+      const ctx = new Ctx();
+      ctx.decodeAudioData(buf, (d) => { ctx.close(); res(d); }, (e) => { ctx.close(); rej(e); });
+    }))
+    .then((d) => {
+      if (SCRUB.src !== src) return;
+      const n = 4000, ch = [];
+      for (let c = 0; c < Math.min(2, d.numberOfChannels); c++) ch.push(d.getChannelData(c));
+      const step = Math.max(1, Math.floor(d.length / n)), peaks = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        let m = 0;
+        const from = i * step, to = Math.min(d.length, from + step);
+        for (const data of ch) for (let j = from; j < to; j += 8) { const v = Math.abs(data[j]); if (v > m) m = v; }
+        peaks[i] = m;
+      }
+      SCRUB.dur = d.duration;
+      SCRUB.peaks = peaks;
+    })
+    .catch(() => {
+      // no waveform: the length comes from the player instead
+      const el = preview.el;
+      if (preview.src !== src) { el.src = src; preview.src = src; }
+      el.preload = "metadata";
+      el.addEventListener("loadedmetadata", () => { if (SCRUB.src === src) { SCRUB.dur = el.duration; drawScrub(); } },
+        { once: true });
+      el.load();
+    })
+    .finally(() => { if (SCRUB.src === src) { SCRUB.loading = false; drawScrub(); } });
+}
+
+function drawScrub() {
+  const cv = $("ascrub-wave");
+  if (!cv) return;
+  const w = cv.clientWidth, h = cv.clientHeight, dpr = window.devicePixelRatio || 1;
+  cv.width = Math.max(1, Math.round(w * dpr));
+  cv.height = Math.max(1, Math.round(h * dpr));
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const r = scrubRange();
+  if (SCRUB.peaks && SCRUB.dur && isFinite(r.b) && r.b > r.a) {
+    const n = SCRUB.peaks.length, col = getComputedStyle(cv).color;
+    g.fillStyle = col;
+    for (let x = 0; x < w; x++) {
+      const t0 = r.a + (r.b - r.a) * x / w, t1 = r.a + (r.b - r.a) * (x + 1) / w;
+      const i0 = Math.floor(t0 / SCRUB.dur * n), i1 = Math.max(i0 + 1, Math.ceil(t1 / SCRUB.dur * n));
+      let m = 0;
+      for (let i = i0; i < i1 && i < n; i++) if (SCRUB.peaks[i] > m) m = SCRUB.peaks[i];
+      const bh = Math.max(1, m * (h - 4));
+      g.fillRect(x, (h - bh) / 2, 1, bh);
+    }
+  }
+  updateScrub();
+}
+
+function updateScrub() {
+  const bar = $("ascrub");
+  if (!bar) return;
+  const r = scrubRange(), pos = scrubPos(), span = isFinite(r.b) ? r.b - r.a : 0;
+  const f = span > 0 ? Math.max(0, Math.min(1, (pos - r.a) / span)) : 0;
+  $("ascrub-head").style.left = (f * 100) + "%";
+  $("ascrub-fill").style.width = (f * 100) + "%";
+  bar.setAttribute("aria-valuemin", r.a.toFixed(2));
+  bar.setAttribute("aria-valuemax", isFinite(r.b) ? r.b.toFixed(2) : r.a.toFixed(2));
+  bar.setAttribute("aria-valuenow", pos.toFixed(2));
+  bar.setAttribute("aria-valuetext", `${fmtSong(pos)} in the song`);
+  $("ascrub-a").textContent = fmtSong(r.a);
+  $("ascrub-b").textContent = isFinite(r.b) ? fmtSong(r.b) : (SCRUB.loading ? "loading…" : "—");
+  $("ascrub-pos").textContent = `${fmtSong(pos)} in the song · ${(pos - r.a).toFixed(2)} s after Start`;
+  drawPhraseMarks();
+}
+
+function scrubTo(t) {
+  const r = scrubRange();
+  SCRUB.pos = Math.max(r.a, isFinite(r.b) ? Math.min(t, r.b) : t);
+  if (preview.on) preview.el.currentTime = SCRUB.pos;
+  updateScrub();
+}
+
+function scrubFromX(e) {
+  const bar = $("ascrub"), r = scrubRange();
+  if (!bar || !isFinite(r.b)) return;
+  const box = bar.getBoundingClientRect();
+  scrubTo(r.a + (r.b - r.a) * Math.max(0, Math.min(1, (e.clientX - box.left) / box.width)));
+}
+
+/** Set start / Set end: Start, or the end (Length), at the playhead. */
+function scrubSet(which) {
+  if (setupGuard()) return;
+  const a = P().audio, pos = toFrame(scrubPos());
+  const len = Math.max(0, Number(a.length) || 0), end = len ? (Number(a.start) || 0) + len : null;
+  if (which === "start") {
+    a.start = pos;
+    if (end != null) a.length = end > pos + 0.05 ? toFrame(end - pos) : 0;
+    SCRUB.pos = pos;
+  } else {
+    if (pos <= (Number(a.start) || 0) + 0.05) { toast("Move the playhead after Start first."); return; }
+    a.length = toFrame(pos - (Number(a.start) || 0));
+    SCRUB.pos = null;
+  }
+  stopPreview();
+  S.dry = null;
+  commit();
+}
+
+document.addEventListener("pointerdown", (e) => {
+  const bar = e.target.closest && e.target.closest("#ascrub");
+  if (!bar || e.button !== 0) return;
+  e.preventDefault();
+  bar.focus();
+  SCRUB.drag = true;
+  scrubFromX(e);
+});
+/** 0.12.2: the Audio panel is selected after a click in it, until a click anywhere else;
+ *  then Space plays / pauses the song only. */
+let audioSel = false;
+const audioSelected = () => audioSel && !!$("audio-panel");
+document.addEventListener("pointerdown", (e) => {
+  const inside = !!(e.target.closest && e.target.closest("#audio-panel"));
+  if (inside === audioSel) return;
+  audioSel = inside;
+  $("audio-panel").classList.toggle("selected", inside);
+}, true);
+document.addEventListener("pointermove", (e) => { if (SCRUB.drag) scrubFromX(e); });
+document.addEventListener("pointerup", () => { SCRUB.drag = false; });
+document.addEventListener("keydown", (e) => {
+  if (!e.target.closest || !e.target.closest("#ascrub")) return;
+  const step = e.shiftKey ? 1 : 0.1, r = scrubRange();
+  let t = null;
+  if (e.key === "ArrowLeft" || e.key === "ArrowDown") t = scrubPos() - step;
+  else if (e.key === "ArrowRight" || e.key === "ArrowUp") t = scrubPos() + step;
+  else if (e.key === "Home") t = r.a;
+  else if (e.key === "End" && isFinite(r.b)) t = r.b;
+  else if (e.key === " " || e.key === "Enter") { previewing() ? stopPreview() : startPreview(); }
+  else return;
+  e.preventDefault();
+  e.stopImmediatePropagation();                     // not the video player too
+  e.stopPropagation();
+  if (t != null) scrubTo(t);
+}, true);
+window.addEventListener("resize", () => { if ($("ascrub-wave")) drawScrub(); });
+
+function scrubHTML(a) {
+  const ok = a.file && !audioMissing();
+  return `<div class="ascrub-row">
+      <div class="ascrub-col">
+        <div class="ascrub${ok ? "" : " off"}" id="ascrub" role="slider" tabindex="${ok ? 0 : -1}" aria-label="Song playhead"
+          title="Click or drag to move the playhead. ← / → 0.1 s (Shift: 1 s), Space plays from here">
+          <canvas id="ascrub-wave" aria-hidden="true"></canvas>
+          <div class="ascrub-fill" id="ascrub-fill"></div><div class="ascrub-head" id="ascrub-head"></div>
+        </div>
+        <div class="ascrub-times mono muted small"><span id="ascrub-a"></span><span id="ascrub-b"></span></div>
+      </div>
+      <button class="ghost sm" data-action="audio-set-start"${ok ? "" : " disabled"} title="Start the song here (the end stays put)">Set start</button>
+      <button class="ghost sm" data-action="audio-set-end"${ok ? "" : " disabled"} title="End the song here: sets Length">Set end</button>
+    </div>
+    <div class="mono small" id="ascrub-pos" aria-live="off"></div>`;
+}
+
 
 video.addEventListener("volumechange", () => { preview.el.volume = video.volume; });
 
 function renderAudio() {
   const a = P().audio;
-  const names = [["lip_sync", "lip sync"], ["voice_ref", "voice ref"], ["final_override", "song in final"]]
-    .filter(([k]) => a[k]).map(([, n]) => n);
-  $("audio-summary").textContent = names.length ? "On: " + names.join(" · ") : "Off · generated audio only";
+  const on = [songRefOn() ? "song as <Audio 1>" : "", a.file && a.final_override ? "song in final" : ""].filter(Boolean);
+  $("audio-summary").textContent = on.length ? "On: " + on.join(" · ") : "Off · generated audio only";
   $("audio-chev").textContent = S.audioOpen ? "Hide ▴" : "Show ▾";
   $("audio").hidden = !S.audioOpen;
   if (!S.audioOpen) { stopPreview(); return; }
-  $("audio").innerHTML = `<div style="margin-top:12px">
+  $("audio").innerHTML = `<div class="note-ref2v" role="note"><b>Lip sync:</b> the ref2va model finds where the singing starts by itself. With fl2va, start each singing Shot on a sung word: it sings from the Shot's first frame. Phrase markers and “Start on the next phrase” help with that; “Align to song” lines up a take afterwards.</div>
+    <div style="margin-top:12px">
       <div class="lbl">Audio file <span class="muted small">· drop a song anywhere on this panel</span>
         <div class="pick"><select class="field" data-relink="audio" aria-label="Audio file">${inputOptions("audio", a.subfolder, a.file, "No audio")}</select>
           <button class="ghost sm browse" data-action="pick-audio"${S.uploading.audio ? " disabled" : ""}>${S.uploading.audio ? "Uploading…" : "Upload…"}</button></div></div>
-      ${audioMissing() ? `<div class="err" style="margin-top:8px"><span>Missing: ${esc(a.original_name || a.file)}. Renders run without the audio routes until you pick the file again.</span></div>`
+      ${audioMissing() ? `<div class="err" style="margin-top:8px"><span>Missing: ${esc(a.original_name || a.file)}. Renders run without the song until you pick the file again.</span></div>`
         : S.refState.audio === "changed" ? '<div class="warnbox" style="margin-top:8px"><span>The audio file changed since it was saved.</span></div>' : ""}
       <div class="shot-opts" style="margin-top:10px">
-        <label class="lbl-row">Start <input class="field" type="number" step="0.1" min="0" data-audio="start" value="${esc(a.start)}" style="width:80px"> s</label>
-        <label class="lbl-row">Length <input class="field" type="number" step="0.1" min="0" data-audio="length" value="${esc(a.length)}" style="width:80px"> s</label>
+        <label class="lbl-row" title="Where the film's 0:00 sits in the song. Each Shot rendered from now on gets the part of the song under it.">Start <input class="field mono" type="text" inputmode="decimal" spellcheck="false" data-audio="start" value="${esc((Number(a.start) || 0).toFixed(2))}" style="width:80px" aria-label="Start in seconds"> s</label>
+        <label class="lbl-row" title="How much of the song the scrub bar and Play cover (0: to the end). Renders cut each Shot's own part.">Length <input class="field mono" type="text" inputmode="decimal" spellcheck="false" data-audio="length" value="${esc((Number(a.length) || 0).toFixed(2))}" style="width:80px" aria-label="Length in seconds"> s</label>
         <button class="ghost sm audio-play" data-action="audio-preview" aria-pressed="${previewing()}"${a.file && !audioMissing() ? "" : " disabled"}
           title="${a.file ? "Play the clip the render will use: from Start, for Length (0 = to the end)" : "Choose an audio file first"}"
           aria-label="${previewing() ? "Stop audio preview" : "Play audio preview"}">${previewing() ? STOP_ICON : PLAY_ICON}<span>${previewing() ? "Stop" : "Play"}</span></button>
         <span class="mono muted small" id="ap-time">${previewing() ? apLabel() : ""}</span>
       </div>
+      ${scrubHTML(a)}
+      ${phraseHTML(a)}
       <div style="display:flex;flex-direction:column;gap:2px;margin-top:14px">
-      ${ROUTES.map(([k, t, r, badge]) => `<div class="route">${switchHTML(a[k], `data-action="audio-route" data-key="${k}" aria-label="${t}"`)}
-        <span class="route-text"><b>${t}</b><i>${r}</i></span><span class="badge">${badge}</span></div>`).join("")}
+      ${ROUTES.map(([k, t, r, badge]) => `<div class="route">${switchHTML(a[k], `data-action="audio-route" data-key="${k}" aria-label="${esc(t)}"`)}
+        <span class="route-text"><b>${esc(t)}</b><i>${esc(r)}</i></span><span class="badge">${badge}</span></div>`).join("")}
+      ${a.song_ref ? `<div class="muted small" style="margin-top:4px">The Studio adds “audio reuse” to the summary and this retention line: <span class="mono">&lt;Audio 1&gt; (the song): fully_copy</span>. Each Shot's card shows ♪ where it sits in the song.</div>` : ""}
+      <div class="shot-opts" style="margin-top:10px">
+        <label class="lbl-row" title="H3 sings a little late? Each Shot's song slice starts this many frames later in the song, so the singing lands on time. Negative: earlier. For Shots rendered from now on.">Sync nudge <input class="field" type="number" step="1" min="-240" max="240" data-audio="sync_nudge" value="${esc(Number(a.sync_nudge) || 0)}" style="width:72px"> frames</label>
+      </div>
       </div>
       ${a.voice_ref ? `<div style="margin-top:10px">${modelField("Vocal separation model (MelBand RoFormer)", "diffusion_models", "melband",
         `<select data-melband aria-label="Vocal separation model">${fileOptions((S.opts || {}).melband, a.melband_model, "Choose…")}</select>`)}</div>` : ""}<div class="muted small" style="margin-top:8px">Pick from audio files in ComfyUI's input folder, or this project's input/longshot/${esc(P().slug)} folder.</div></div>`;
+  ensureScrub();
+  requestAnimationFrame(drawScrub);
 }
 
 function sizeOf(s) {
@@ -4527,7 +5933,7 @@ function renderSettings() {
   const asp = (o.aspects || ["16:9"]).map((a) => `<option${a === s.aspect ? " selected" : ""}>${a}</option>`).join("");
   $("settings").innerHTML = `
     <div class="seed-row">
-      <label class="lbl">Seed <input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-describedby="seed-help" title="Drag left / right to change it (Shift: by 10), or click and type"></label>
+      <label class="lbl">Seed <span class="seed-field"><input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-describedby="seed-help" title="Drag left / right to change it (Shift: by 10), or click and type">${seedStepHTML("base-seed-step", false, "Shots on auto follow it")}</span></label>
       <label class="lbl seed-mode" title="Increment: the seed goes up by one for every Shot rendered, like ComfyUI's control after generate. Fixed: it stays.">Seed mode
         <select data-set="seed_mode" aria-label="Seed mode"><option value="increment"${s.seed_mode !== "same" ? " selected" : ""}>Increment</option><option value="same"${s.seed_mode === "same" ? " selected" : ""}>Fixed</option></select></label>
       <button class="ghost sm reset-seeds" data-action="reset-seeds"${P().shots.some((x) => x.kind !== "clip" && Number(x.shot_seed) >= 0) ? "" : " disabled"}
@@ -4585,6 +5991,74 @@ function renderSettings() {
 }
 
 /** Sampler, scheduler, overlap… — its own section under Settings. */
+// ---------------------------------------------------------------------------
+// Refine (0.10.0): resample each take with a second model, e.g. the sharper fl2va
+// model over takes made with ref2va (for lip sync). Long Shot does it right after a
+// Shot is sampled (the refined take is the take), or only for exports. Takes made
+// with the refine model itself are never refined.
+// ---------------------------------------------------------------------------
+
+function lsAtLeast(...want) {
+  const v = String((S.opts || {}).longshot_version || "0").split(".").map(Number);
+  for (let i = 0; i < want.length; i++) { if ((v[i] || 0) !== want[i]) return (v[i] || 0) > want[i]; }
+  return true;
+}
+const shortModel = (m) => (m || "").split(/[\\/]/).pop().replace(/\.(safetensors|gguf|ckpt|pt)$/i, "");
+
+/** The refine pass applies: on, a model chosen that isn't the render model, Long Shot 1.7.0+. */
+function refineActive() {
+  const s = P() && P().settings, r = s && s.refine;
+  return !!(r && r.on && r.model && r.model !== s.model && lsAtLeast(1, 7, 0));
+}
+
+/** The model a Shot's current take was made with (null: unknown, an older take). */
+function takeModel(s) {
+  const t = (S.takes[s.id] || []).find((x) => x.name === s.take);
+  return (t && t.model) || s.render_model || null;
+}
+
+function renderRefine() {
+  const s = P().settings, r = s.refine, o = S.opts || {}, t = r.turbo;
+  const rendered = active().filter((x) => x.kind !== "clip" && x.take && isRendered(x));
+  const todo = rendered.filter((x) => takeModel(x) !== r.model);
+  $("refine-summary").textContent = !r.on ? "Off" : !r.model ? "On · choose a model"
+    : `On · ${shortModel(r.model)} · ${r.steps} steps · denoise ${Number(r.denoise).toFixed(2)}${r.export_only ? " · on export" : ""}`;
+  $("refine-chev").textContent = S.refineOpen ? "Hide ▴" : "Show ▾";
+  $("refine-toggle").setAttribute("aria-expanded", String(!!S.refineOpen));
+  $("refine").hidden = !S.refineOpen;
+  if (!S.refineOpen) return;
+  let note;
+  if (!lsAtLeast(1, 7, 0)) note = "Update H3 Long Shot to 1.7.0 or later for the refine pass.";
+  else if (r.model && r.model === s.model) note = "That's the render model: nothing to refine. Choose the other model.";
+  else if (!r.model) note = "Choose the model that refines, e.g. the fl2va model when you render with ref2va.";
+  else if (r.export_only) note = `Renders stay as they are. Export approved clips and Upscale final refine ${todo.length} of ${rendered.length} rendered take${rendered.length === 1 ? "" : "s"} (takes made with ${esc(shortModel(r.model))} are left as they are); refined takes are kept for the next export.`;
+  else note = `Each new take is refined right after it's sampled, and that's the take you review. Takes made with ${esc(shortModel(r.model))} are left as they are. Export and Upscale final also refine older takes still unrefined.`;
+  const dis = r.on ? "" : " disabled";
+  $("refine").innerHTML = `
+    <div class="route" style="margin-top:12px">${switchHTML(r.on, 'data-action="refine-on" aria-label="Refine"')}
+      <span class="route-text"><b>Refine each take</b><i>resample it with a second model, e.g. fl2va over ref2va for a sharper picture</i></span></div>
+    <div class="route">${switchHTML(r.export_only, `data-action="refine-export" aria-label="Refine on export only"${dis}`)}
+      <span class="route-text"><b>Refine on export only</b><i>renders stay quick; Export approved clips and Upscale final refine</i></span></div>
+    <div class="model-files" style="margin-top:10px">
+      ${modelField("Refine model", "diffusion_models", "refine_model", `<select data-refine="model" aria-label="Refine model"${dis}>${fileOptions(o.models, r.model, "Choose a model…")}</select>`)}
+    </div>
+    <div class="grid3" style="margin-top:10px">
+      <label class="lbl">Steps <input type="number" min="1" max="200" step="1" data-refine="steps" value="${esc(r.steps)}"${dis}></label>
+      <label class="lbl" title="How much of each take is redrawn: lower keeps the motion and lip timing, higher lets the refine model change more">Denoise <input type="number" min="0.05" max="1" step="0.05" data-refine="denoise" value="${esc(r.denoise)}"${dis}></label>
+      <label class="lbl" title="ModelSamplingMiniMaxH3 for the refine model. Lower (3–5) makes the same denoise a lighter touch">Video shift <input type="number" min="0.5" max="100" step="0.5" data-refine="shift_video" value="${esc(r.shift_video)}"${dis}></label>
+    </div>
+    <div class="box" style="margin-top:10px">
+      <div class="box-row">
+        ${switchHTML(t.on, `data-action="refine-turbo-on" aria-label="Refine Turbo LoRA"${dis}`)}
+        <div style="flex:1;min-width:140px"><div>Turbo LoRA (refine model)</div>
+          <div class="pick" style="margin-top:4px"><select data-refine="turbo.lora" aria-label="Refine Turbo LoRA file"${t.on && r.on ? "" : " disabled"}>${fileOptions(o.loras, t.lora, "Choose…")}</select></div></div>
+        <label class="strength" style="flex:1 1 180px">Strength
+          <input type="range" min="0" max="2" step="0.05" data-refine="turbo.strength" value="${esc(t.strength)}"${t.on && r.on ? "" : " disabled"}><output>${Number(t.strength).toFixed(2)}</output></label>
+      </div>
+    </div>
+    <div class="muted small" style="margin-top:10px">${note}</div>`;
+}
+
 function renderAdvanced() {
   const s = P().settings, o = S.opts || {};
   const modelShort = (s.model || "no model").split(/[\\/]/).pop().replace(/\.(safetensors|gguf|ckpt|pt)$/i, "");
@@ -4755,6 +6229,16 @@ document.addEventListener("click", async (e) => {
     case "dry-run": dryRun(); break;
     case "dismiss-error": S.error = null; renderDecision(); break;
     case "toggle": S[el.dataset.key] = !S[el.dataset.key]; render(); break;
+    case "refine-on": case "refine-export": case "refine-turbo-on": {
+      if (setupGuard()) return;
+      const r = p.settings.refine;
+      if (a === "refine-on") r.on = !r.on;
+      else if (a === "refine-export") r.export_only = !r.export_only;
+      else r.turbo.on = !r.turbo.on;
+      S.dry = null;
+      commit();
+      break;
+    }
     case "toggle-shot": { const s = shotOf(el); S.open = S.open === s.id ? null : s.id; renderShots(); break; }
     case "bypass-shot": {
       const s = shotOf(el);
@@ -4838,8 +6322,20 @@ document.addEventListener("click", async (e) => {
     case "install-pack": installPack(el.dataset.pack); break;
     case "install-preview": installPreview(); break;
     case "viewer-hide": setViewerHidden(true); break;
+    case "viewer-fold": setViewerHidden(!VIEW.hidden); break;
     case "viewer-show": setViewerHidden(false); break;
     case "restore-refs": restoreRefs(shotOf(el)); break;
+    case "reset-edit": {
+      const sh = shotOf(el);
+      if (!sh) break;
+      const lk = runOf(sh).find(isAligned);
+      if (lk && editOf(runOf(sh)[0]).shift) { toast(`${titleOf(lk)} is marked aligned, so it stays put. Unmark aligned first.`); break; }
+      sh.place = null;
+      const first = runOf(sh)[0];                       // the run's move, too
+      if (first !== sh && first.place) { first.place.shift = 0; if (!first.place.in && !first.place.out) first.place = null; }
+      commit();
+      break;
+    }
     case "add-refmod": pickRefmod(); break;
     case "use-refmod": {
       $("modal").hidden = true;
@@ -4902,10 +6398,38 @@ document.addEventListener("click", async (e) => {
     case "edit-cast": openEditor(castOf(el)); break;
     case "editor-save": editorSave(); break;
     case "editor-cancel": closeEditor(); break;
-    case "editor-zoom": if (editing) openLightbox(editing.id); break;
+    case "editor-zoom": if (editing && editing.kind === "cast") openLightbox(editing.id); break;
+    case "edit-voice": openVoiceEditor(voiceOf(el)); break;
+    case "task-type": {
+      const t = el.dataset.t, cur = (p.style.task_types || []).filter((x) => TASK_TYPES.includes(x));
+      if (cur.includes(t)) { setTaskTypes(cur.filter((x) => x !== t)); break; }
+      if (cur.length >= MAX_TASK_TYPES) { toast(`The summary takes ${MAX_TASK_TYPES} task types at most: remove one first.`); break; }
+      setTaskTypes([...cur, t]);
+      break;
+    }
+    case "task-types-clear": setTaskTypes([]); break;
+    case "edit-refmod": openRefmodEditor(refmodOf(el)); break;
+    case "ed-set-start": case "ed-set-end": {
+      const pl = $("ed-player"), alt = $("editor-alt");
+      if (!pl) break;
+      const t = Math.round(pl.currentTime * 100) / 100;
+      const st = alt.querySelector("[data-ed=start]"), ln = alt.querySelector("[data-ed=length]");
+      if (a === "ed-set-start") st.value = String(t);
+      else ln.value = String(Math.max(0, Math.round((t - (Number(st.value) || 0)) * 100) / 100) || "");
+      break;
+    }
     case "lb-close": closeLightbox(); break;
     case "reroll-shot": rerollShot(shotOf(el)); break;
     case "use-seed": useSeed(shotOf(el), Number(el.dataset.seed)); break;
+    case "shot-seed-step": stepShotSeed(shotOf(el), Number(el.dataset.d) || 0); break;
+    case "base-seed-step": {
+      const inp = document.querySelector("[data-base-seed]");
+      if (!inp) break;
+      inp.value = String(Math.max(0, Math.min(SEED_MAX, (Number(P().settings.seed) || 0) + (Number(el.dataset.d) || 0))));
+      await changeBaseSeed(inp);
+      renderSettings();
+      break;
+    }
     case "render-through": renderThrough(); break;
     case "theater": setTheater(!S.theater); break;
     case "fullscreen": toggleFullscreen(); break;
@@ -4918,10 +6442,24 @@ document.addEventListener("click", async (e) => {
       if (setupGuard()) return;
       const k = el.dataset.key;
       p.audio[k] = !p.audio[k];
-      if (k !== "final_override") sharedChanged("Audio");
+      if (k === "song_ref" || k === "lip_sync") S.dry = null;   // for Shots rendered from now on: nothing re-queues
+      else if (k !== "final_override") sharedChanged("Audio");
       commit();
       break;
     }
+    case "audio-set-start": scrubSet("start"); break;
+    case "phrase-mark": markPhrase(); break;
+    case "phrase-detect": detectPhrases(); break;
+    case "phrase-clear": if (confirm("Delete all phrase markers?")) setPhrases([]); break;
+    case "phrase-next": { const sh = shotOf(el); if (sh) startOnPhrase(sh); break; }
+    case "aligned": {
+      const sh = shotOf(el);
+      if (!sh || !isRendered(sh)) break;
+      sh.aligned = isAligned(sh) ? null : { key: alignKey(sh) };
+      commit();                                       // a mark only: nothing re-renders
+      break;
+    }
+    case "audio-set-end": scrubSet("end"); break;
     case "turbo-on": {
       if (setupGuard()) return;
       const mode = await askSettingChange(p.settings.turbo.on ? "Turn Turbo off" : "Turn Turbo on");
@@ -4980,7 +6518,7 @@ document.addEventListener("click", async (e) => {
     case "open-folder": openFolder(el.dataset.which); break;
     case "export-approved": exportApproved(); break;
     case "queue-pause": case "queue-clear": case "queue-open": case "queue-stop": case "queue-retry":
-    case "queue-remove": case "queue-up": case "queue-down": queueAction(a, el); break;
+    case "queue-remove": case "queue-up": case "queue-down": case "queue-flip": queueAction(a, el); break;
     case "anchor-pick": { const k = el.closest("[data-anchor]"); if (k) anchorPick(k.dataset.anchor); break; }
     case "anchor-clear": { const k = el.closest("[data-anchor]"); if (k && !setupGuard()) setAnchor(k.dataset.anchor, null); break; }
     case "menu": toggleMenu(); break;
@@ -5196,6 +6734,17 @@ document.addEventListener("change", async (e) => {
     if (changed) clipChanged(sh);
     return commit();
   }
+  if (el.dataset.refine) {
+    const r = p.settings.refine, k = el.dataset.refine;
+    if (k === "model") r.model = el.value || null;
+    else if (k === "turbo.lora") r.turbo.lora = el.value || null;
+    else if (k === "turbo.strength") r.turbo.strength = Math.max(0, Math.min(2, Number(el.value) || 0));
+    else if (k === "steps") r.steps = Math.max(1, Math.min(200, Math.round(Number(el.value) || 10)));
+    else if (k === "denoise") r.denoise = Math.max(0.05, Math.min(1, Number(el.value) || 0.3));
+    else if (k === "shift_video") r.shift_video = Math.max(0.5, Math.min(100, Number(el.value) || 12));
+    S.dry = null;
+    return commit();
+  }
   if (el.dataset.melband !== undefined) {
     p.audio.melband_model = el.value || null;
     if (changed && p.audio.voice_ref) sharedChanged("Audio");
@@ -5203,9 +6752,22 @@ document.addEventListener("change", async (e) => {
   }
   if (el.dataset.audio) {
     const k = el.dataset.audio;
-    p.audio[k] = Math.max(0, parseFloat(el.value) || 0);
+    if (k === "sync_nudge") {
+      p.audio.sync_nudge = Math.max(-240, Math.min(240, Math.round(Number(el.value) || 0)));
+    } else if (k === "phrase_gap" || k === "phrase_sens" || k === "phrase_lead") {
+      const v = Number(el.value) || 0;
+      p.audio[k] = k === "phrase_gap" ? Math.max(0.1, Math.min(3, v)) : k === "phrase_sens" ? Math.max(0, Math.min(1, v))
+        : Math.max(0, Math.min(48, Math.round(v)));
+      return commit();
+    } else {
+      const v = parseTC(el.value);
+      if (!Number.isFinite(v)) { toast("Type the time in seconds, e.g. 13.67."); render(); return; }
+      p.audio[k] = toFrame(Math.max(0, v));
+    }
     stopPreview();
-    if (changed && (p.audio.lip_sync || p.audio.voice_ref)) sharedChanged("Audio");
+    SCRUB.pos = null;
+    S.dry = null;
+    if (changed && p.audio.voice_ref) sharedChanged("Audio");
     return commit();
   }
   if (el.dataset.set) {
@@ -5225,6 +6787,22 @@ document.addEventListener("change", async (e) => {
       return commit();
     }
     // size and overlap: old takes can't be used, everything renders again
+    if (changed && (k === "megapixels" || k === "aspect") && approvedShots().length) {
+      // 0.12.7: approved Shots keep their takes at their own size
+      const nxt = Object.assign({}, p.settings, { [k]: v }), sz = sizeOf(nxt), was = sizeOf(p.settings);
+      const ok = await confirmBox({ title: `Change the ${k === "aspect" ? "aspect ratio" : "resolution"}?`,
+        body: `Approved Shots keep their takes${was ? ` at ${was[0]}×${was[1]}` : ""}; new renders are ${sz ? `${sz[0]}×${sz[1]}` : "the new size"}. ` +
+          "Shots under review render again.\n\nMixed sizes: Shots of different sizes aren't pinned to each other (a hard cut there), and " +
+          "Update preview, the final video and Refine on export need every Shot at one size. Export approved clips works. " +
+          "Setting the size back makes them match again.",
+        yes: "Change size", no: "Keep as is" });
+      if (!ok) return render();
+      p.settings[k] = v;
+      if (S.busy && busyHere() && S.busy.built) S.busy.built.staleSize = true;
+      keepApproved(k === "megapixels" ? "Resolution" : "Aspect ratio");
+      layoutStage();
+      return commit();
+    }
     if (changed && (k === "megapixels" || k === "aspect")) {
       const rendered = active().filter((x) => x.kind !== "clip" && x.status !== "queued");
       if (rendered.length || inRenderAny()) {
@@ -5370,11 +6948,25 @@ document.addEventListener("keydown", (e) => {
   // the timeline scrubber is the player itself: Space and ← → act on it there too
   const onScrub = t.id === "scrub";
   if (!onScrub && t.closest && t.closest("input, textarea, select, [contenteditable]")) return;
+  if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+    e.preventDefault();                             // not the browser's Back / Forward
+    const sh = shotById(S.focus || S.open || "");
+    if (sh) moveShot(sh, e.key === "ArrowLeft" ? -1 : 1);
+    return;
+  }
   if (e.metaKey || e.ctrlKey || e.altKey) return;
-  if (e.key === "m" || e.key === "M") { e.preventDefault(); toggleMute(); }
+  if (e.key === "m" || e.key === "M") {
+    e.preventDefault();
+    if (previewing() && S.audioOpen) markPhrase();       // 0.11.0: M while the song plays marks a phrase
+    else toggleMute();
+  }
   else if (e.key === "f" || e.key === "F") { e.preventDefault(); toggleFullscreen(); }
   else if (e.key === "t" || e.key === "T") { e.preventDefault(); setTheater(!S.theater); }
-  else if (e.key === " ") { e.preventDefault(); togglePlay(); }
+  else if (e.key === " ") {
+    e.preventDefault();
+    if (audioSelected()) { previewing() ? stopPreview() : startPreview(); }   // 0.12.2: the song only
+    else togglePlay();
+  }
   else if (e.key === "ArrowLeft") { e.preventDefault(); stepFrame(-1); }
   else if (e.key === "ArrowRight") { e.preventDefault(); stepFrame(1); }
 });
@@ -5388,6 +6980,11 @@ $("modal").addEventListener("click", (e) => { if (e.target === $("modal")) $("mo
 async function switchProject(slug) {
   while (S.applying) await new Promise((r) => setTimeout(r, 100));     // a queue job being saved
   if (P() && P().slug === slug) return;
+  if (tabWith(slug)) {
+    // 0.13.0: two tabs editing one project would save over each other
+    toast("That project is open in another Studio tab. Switch to that tab, or open another project there first.");
+    return;
+  }
   await saveNow();
   try { await loadProject(slug); } catch (e) { toast("Couldn't open that project: " + e.message); }
 }
@@ -5467,6 +7064,7 @@ async function openList() {
       <span class="proj-thumb">${thumb}</span>
       <span class="proj-meta"><b>${esc(p.name)}</b>
         <span class="muted small">Saved ${esc(when(p.saved_at))} · ${p.approved} of ${p.shots} shots approved</span>
+        ${p.slug !== P().slug && tabWith(p.slug) ? '<span class="missing-tag" title="Open in another Studio tab: switch to that tab to work on it.">open in another tab</span>' : ""}
         ${p.files_missing ? '<span class="missing-tag" title="Its input or output folder was deleted. Delete the project, or put the folder back.">files missing</span>' : ""}</span></button>`;
   }).join("") || '<div class="muted">No saved projects yet.</div>';
   showModal("Open project", null, rows);
@@ -5596,7 +7194,7 @@ async function relinkFromSelect(el) {
     else { item.image = ""; }
     S.refState[key] = undefined;
     if (!isAudio && !item.bypassed) applyRefChange(mode, "Cast & Scenes");
-    if (isAudio && (p.audio.lip_sync || p.audio.voice_ref)) sharedChanged("Audio");
+    if (isAudio && p.audio.voice_ref) sharedChanged("Audio");
     return commit();
   }
   const [sub, name] = splitChoice(el.value);
@@ -5609,14 +7207,18 @@ async function relinkFromSelect(el) {
     mode = await askRefChange(`Use ${name} for ${item.label || "this reference"}?`);
     if (!mode) { render(); return; }
   }
-  if (isAudio) Object.assign(item, { file: name });
+  if (isAudio) {
+    if (!item.file) item.song_ref = true;
+    if (item.file !== name) item.phrases = [];             // markers belong to the song they were made on
+    Object.assign(item, { file: name }); SCRUB.pos = null;
+  }
   else Object.assign(item, { image: name });
   Object.assign(item, { subfolder: sub, original_name: name, sha256: info.sha256 || null,
     size_bytes: info.size_bytes ?? null });
   S.refState[key] = info.state === "missing" || info.state === "invalid" ? info.state : "ok";
   S.refInfo[key] = info;
   if (same) toast("Relinked — it's the same file, so nothing re-renders.");
-  else if (isAudio) { if (p.audio.lip_sync || p.audio.voice_ref) sharedChanged("Audio"); }
+  else if (isAudio) { if (p.audio.voice_ref) sharedChanged("Audio"); }
   else if (!item.bypassed) applyRefChange(mode, "Cast & Scenes");
   commit();
 }
@@ -5759,12 +7361,15 @@ async function addAudio(fileList) {
   catch (e) { toast(`Couldn't upload ${f.name}: ${e.message}`); return; }
   finally { delete S.uploading.audio; }
   const same = !!p.audio.sha256 && info.sha256 === p.audio.sha256;
+  if (!p.audio.file) p.audio.song_ref = true;
+  if (p.audio.file !== info.name) p.audio.phrases = [];
+  SCRUB.pos = null;
   Object.assign(p.audio, { file: info.name, subfolder: info.subfolder, original_name: info.name,
     sha256: info.sha256, size_bytes: info.size_bytes });
   S.refState.audio = "ok";
   S.refInfo.audio = Object.assign({ state: "ok" }, info);
   await loadInputs();
-  if (!same && (p.audio.lip_sync || p.audio.voice_ref)) sharedChanged("Audio");
+  if (!same && p.audio.voice_ref) sharedChanged("Audio");
   commit();
   toast(same ? "Same song as before — nothing re-renders." : `${info.name} is the project's audio now.`);
 }
@@ -5800,7 +7405,7 @@ const DROP_PANELS = ["#cast-panel", "#audio-panel", "#shots-panel"];
  *  the Audio panel (the song), or the Shots list (a video clip). */
 function dropTargetOf(e) {
   if (!P() || !e.target.closest) return null;
-  if (editing && !$("editor").hidden) {
+  if (editing && editing.kind === "cast" && !$("editor").hidden) {
     // Item 8: anywhere on the open editor replaces its image; nothing behind it
     return e.target.closest("#editor") ? { zone: "cast", el: $("editor").querySelector(".editor"), id: editing.id } : null;
   }
@@ -6019,6 +7624,24 @@ document.addEventListener("pointerdown", (e) => {
   window.addEventListener("pointercancel", up);
 });
 
+/** ▲ ▼ next to a seed: one up or down (0.9.2). */
+function seedStepHTML(action, disabled, note) {
+  const dis = disabled ? " disabled" : "";
+  const tip = (d) => `Seed ${d > 0 ? "+1" : "−1"}${note ? ` (${note})` : ""}`;
+  return `<span class="seed-step"><button type="button" class="ghost xs" data-action="${action}" data-d="1"${dis} title="${esc(tip(1))}" aria-label="${esc(tip(1))}">▲</button>` +
+    `<button type="button" class="ghost xs" data-action="${action}" data-d="-1"${dis} title="${esc(tip(-1))}" aria-label="${esc(tip(-1))}">▼</button></span>`;
+}
+
+/** A Shot's seed ±1. On auto, it takes its own seed from the one its last take used
+ *  (or the next it would get) and stops following Settings. */
+function stepShotSeed(s, d) {
+  if (!s || s.kind === "clip") return;
+  let cur = Number(s.shot_seed);
+  if (!(cur >= 0)) cur = hasSeed(s.seed_used) ? Number(s.seed_used)
+    : hasSeed(s.seed_pending) ? Number(s.seed_pending) : Number(P().settings.seed) || 0;
+  useSeed(s, Math.max(0, Math.min(SEED_MAX, cur + d)));
+}
+
 async function changeBaseSeed(el) {
   const s = P().settings;
   const v = el.value.trim();
@@ -6048,7 +7671,9 @@ function picOf(c) {
 
 function openEditor(c) {
   if (!c) return;
-  editing = { id: c.id };
+  editing = { kind: "cast", id: c.id };
+  $("editor-cast").hidden = false;
+  $("editor-alt").hidden = true;
   $("editor-title").textContent = "Edit reference";
   $("editor-pic").textContent = picOf(c);
   $("editor-label").value = c.label;
@@ -6060,6 +7685,158 @@ function openEditor(c) {
   const d = $("editor-desc");
   d.focus();
   d.selectionStart = d.selectionEnd = d.value.length;
+}
+
+/** 0.12.0: the same pop-out editor for an audio reference or a RefMod. */
+function voiceOptions(current, skip) {
+  const ch = voiceChoices().filter((x) => x.key !== skip);
+  return `<option value="">None</option>` + ch.map((x) =>
+    `<option value="${esc(x.key)}"${x.key === current ? " selected" : ""}>${esc(x.label || "(off)")} ${esc(x.name)}</option>`).join("")
+    + (current && !ch.some((x) => x.key === current) ? `<option value="${esc(current)}" selected>(removed)</option>` : "");
+}
+function openAltEditor(kind, id, html, title) {
+  editing = { kind, id };
+  $("editor-cast").hidden = true;
+  const alt = $("editor-alt");
+  alt.hidden = false;
+  alt.innerHTML = html;
+  $("editor-title").textContent = title;
+  $("editor").hidden = false;
+  const f = alt.querySelector("[data-ed=label]");
+  if (f) { f.focus(); f.selectionStart = f.selectionEnd = f.value.length; }
+  editorAltSync();
+}
+function openVoiceEditor(v) {
+  if (!v) return;
+  const a = audioLabelOf(v), state = S.refState["voice:" + v.id];
+  const missing = !!v.file && (state === "missing" || state === "invalid");
+  const src = v.file && !missing ? viewURL({ filename: v.file, subfolder: v.subfolder, type: "input" }) : "";
+  const role = v.role || "voice";
+  const pics = [...P().cast.map((c) => ({ key: "cast:" + c.id, name: (c.bypassed ? "(off) " : picOf(c) + " ") + (c.label || ""), on: c.voice === v.id })),
+    ...(P().refmods || []).filter((m) => m.kind !== "audio").map((m) => ({ key: "refmod:" + m.id, name: (refmodLabelOf(m) || "(off)") + " " + (m.label || m.name) + " · RefMod", on: m.voice === v.id }))];
+  openAltEditor("voice", v.id, `
+    <div class="ed-form">
+      <div><span class="pic">${esc(v.bypassed ? "bypassed" : a || "—")}</span> <span class="muted small">set automatically from the order of active audio</span></div>
+      <label class="lbl">Label <input class="field" data-ed="label" value="${esc(v.label)}" placeholder="<sfx>" spellcheck="false"></label>
+      <div class="ed-row">
+        <label class="lbl">What it is
+          <select class="field" data-ed="role">${AUDIO_ROLES.map(([k, t]) => `<option value="${k}"${k === role ? " selected" : ""}>${esc(t)}</option>`).join("")}</select></label>
+        <label class="lbl ed-other">Its role, in your words <input class="field" data-ed="role_text" value="${esc(v.role_text)}" placeholder="sound" spellcheck="false"></label>
+        <label class="lbl ed-sound">Use
+          <select class="field" data-ed="use"><option value="reference"${v.use !== "copy" ? " selected" : ""}>Reference (the character of the sound)</option>
+            <option value="copy"${v.use === "copy" ? " selected" : ""}>Copy (reuse the audio as it is)</option></select></label>
+      </div>
+      <label class="lbl ed-sound">Description <textarea class="field" data-ed="desc" rows="3" placeholder="cars driving by">${esc(v.desc)}</textarea></label>
+      <div class="muted small ed-sound ed-preview"></div>
+      ${missing ? `<div class="missing">Missing: ${esc(v.original_name || v.file)}</div>`
+        : src ? `<audio class="ed-player" id="ed-player" controls preload="metadata" src="${esc(src)}"></audio>` : ""}
+      <div class="ed-row">
+        <label class="lbl-row">Start <input type="number" min="0" step="0.01" data-ed="start" value="${esc(v.start || 0)}" style="width:78px"> s</label>
+        <button class="ghost sm" data-action="ed-set-start" title="Start where the player is">Set start</button>
+        <label class="lbl-row">Length <input type="number" min="0" step="0.01" data-ed="length" value="${v.length ? esc(v.length) : ""}" placeholder="all" style="width:78px"> s</label>
+        <button class="ghost sm" data-action="ed-set-end" title="End where the player is">Set end</button>
+      </div>
+      <div class="muted small">${esc(v.original_name || v.file || "No file")} <button class="ghost sm" data-action="voice-replace" data-voice="${esc(v.id)}">Replace file…</button></div>
+      <div class="ed-voice">
+        <div class="lbl">Voice timbre of</div>
+        ${pics.length ? `<div class="ed-links">${pics.map((x) => `<label class="lbl-row"><input type="checkbox" data-ed-link="${esc(x.key)}"${x.on ? " checked" : ""}> ${esc(x.name)}</label>`).join("")}</div>`
+          : '<div class="muted small">No pictures or RefMods yet.</div>'}
+      </div>
+    </div>`, "Edit audio reference");
+}
+function openRefmodEditor(m) {
+  if (!m) return;
+  openAltEditor("refmod", m.id, `
+    <div class="ed-form">
+      <div><span class="pic">${esc(m.bypassed ? "bypassed" : refmodLabelOf(m) || "—")}</span> <span class="muted small">RefMod · ${esc(m.kind)}</span></div>
+      <label class="lbl">Label <input class="field" data-ed="label" value="${esc(m.label)}" placeholder="<name>" spellcheck="false"></label>
+      <label class="lbl">Description <textarea class="field" data-ed="desc" rows="5" placeholder="Add a description…">${esc(m.desc)}</textarea></label>
+      <div class="ed-row">
+        <label class="lbl">RefMod <select class="field" data-ed="name"><option value="${esc(m.name)}" data-kind="${esc(m.kind)}">${esc(m.name)}</option></select></label>
+        <label class="lbl">Kind <input class="field" data-ed="kind" value="${esc(m.kind)}" readonly tabindex="-1" style="width:90px"></label>
+        <label class="lbl">Strength <input class="field" type="number" min="0" max="1" step="0.05" data-ed="strength" value="${esc(m.strength)}" style="width:90px"></label>
+      </div>
+      <label class="lbl ed-mrole">Definition: whose … comes from ${esc(refmodLabelOf(m) || "it")}
+        <select class="field" data-ed="role">${REFMOD_ROLES.map((r) => `<option value="${r}"${r === refmodRole(m) ? " selected" : ""}>${r}</option>`).join("")}</select></label>
+      <div class="editor-voice ed-mvoice">
+        <label class="lbl-row" for="ed-mvoice">gets its voice timbre from</label>
+        <select id="ed-mvoice" data-ed="voice">${voiceOptions(m.voice || "", "refmod:" + m.id)}</select>
+      </div>
+    </div>`, "Edit RefMod");
+  api("/refmods/library").then((lib) => {      // the names to swap to, same as Add RefMod lists
+    const sel = $("editor-alt").querySelector("[data-ed=name]");
+    if (!sel || !editing || editing.id !== m.id) return;
+    const rows = (lib || []).filter((x) => x.kind !== "bundle");
+    if (!rows.some((x) => x.name === m.name)) rows.unshift({ name: m.name, kind: m.kind });
+    const cur = sel.value;
+    sel.innerHTML = rows.map((x) => `<option value="${esc(x.name)}" data-kind="${esc(x.kind)}">${esc(x.name)} (${esc(x.kind)})</option>`).join("");
+    sel.value = cur;
+  }).catch(() => {});
+}
+/** Show or hide the parts that depend on what's picked. */
+function editorAltSync() {
+  const alt = $("editor-alt");
+  if (!editing || editing.kind === "cast") return;
+  const g = (k) => alt.querySelector(`[data-ed=${k}]`);
+  if (editing.kind === "voice") {
+    const role = g("role").value;
+    alt.querySelectorAll(".ed-sound").forEach((x) => { x.hidden = role === "voice"; });
+    alt.querySelectorAll(".ed-other").forEach((x) => { x.hidden = role !== "other"; });
+    alt.querySelectorAll(".ed-voice").forEach((x) => { x.hidden = role !== "voice"; });
+    const v = voiceById(editing.id), pv = alt.querySelector(".ed-preview");
+    if (pv && v) pv.textContent = role === "voice" ? "" : "In the prompt: " + soundLine({ label: g("label").value, desc: g("desc").value,
+      role, role_text: g("role_text").value }, audioLabelOf(v) || "<Audio N>");
+  } else {
+    const opt = g("name").selectedOptions[0];
+    const kind = (opt && opt.dataset.kind) || g("kind").value;
+    g("kind").value = kind;
+    alt.querySelector(".ed-mvoice").hidden = kind === "audio";
+    alt.querySelector(".ed-mrole").hidden = kind === "audio";
+  }
+}
+/** "<sfx> is cars driving by, whose sound comes from <Audio 2>." — same as the prompt writes. */
+function soundLine(v, a) {
+  const word = { sfx: "sound", ambience: "ambience", music: "music" }[v.role] || (v.role_text || "sound").trim() || "sound";
+  return `${(v.label || "").trim() || a} is ${(v.desc || "").trim() || "this audio"}, whose ${word} comes from ${a}.`;
+}
+function editorAltValues() {
+  const out = {};
+  $("editor-alt").querySelectorAll("[data-ed]").forEach((el) => { out[el.dataset.ed] = el.value; });
+  out.links = {};
+  $("editor-alt").querySelectorAll("[data-ed-link]").forEach((el) => { out.links[el.dataset.edLink] = el.checked; });
+  return out;
+}
+/** The edits as changes: [[object, key, value]] where the value differs. */
+function editorAltChanges() {
+  const val = editorAltValues(), ch = [];
+  if (editing.kind === "voice") {
+    const v = voiceById(editing.id);
+    if (!v) return [];
+    for (const k of ["label", "role", "role_text", "desc", "use"]) if ((val[k] ?? "") !== (v[k] ?? "")) ch.push([v, k, val[k]]);
+    for (const k of ["start", "length"]) {
+      const n = Math.max(0, Number(val[k]) || 0);
+      if (n !== Number(v[k] || 0)) ch.push([v, k, n]);
+    }
+    if (val.role === "voice") {
+      for (const [key, on] of Object.entries(val.links)) {
+        const [kind, id] = key.split(/:(.*)/s);
+        const o = kind === "cast" ? P().cast.find((x) => x.id === id) : (P().refmods || []).find((x) => x.id === id);
+        if (!o) continue;
+        if (on && o.voice !== v.id) ch.push([o, "voice", v.id]);
+        if (!on && o.voice === v.id) ch.push([o, "voice", null]);
+      }
+    }
+  } else {
+    const m = (P().refmods || []).find((x) => x.id === editing.id);
+    if (!m) return [];
+    for (const k of ["label", "desc", "name", "kind"]) if ((val[k] ?? "") !== (m[k] ?? "")) ch.push([m, k, val[k]]);
+    const st = Math.max(0, Math.min(1, Number(val.strength) || 0));
+    if (st !== m.strength) ch.push([m, "strength", st]);
+    if (val.kind !== "audio" && val.role !== refmodRole(m)) ch.push([m, "role", val.role]);
+    const vo = val.kind === "audio" ? null : (val.voice || null);
+    if (vo !== (m.voice || null)) ch.push([m, "voice", vo]);
+  }
+  return ch;
 }
 
 /** The editor's picture (and file name), e.g. after an image is dropped on it. */
@@ -6076,25 +7853,31 @@ function showEditorImage(c) {
 /** "gets its voice timbre from": None, or one of the voice references. */
 function fillEditorVoice(c) {
   const sel = $("editor-voice");
-  const vs = P().voices || [];
-  sel.innerHTML = `<option value="">None</option>` + vs.map((v) => {
-    const a = audioLabelOf(v);
-    return `<option value="${esc(v.id)}">${esc(a || "(off)")} ${esc(v.label || v.original_name || "")}</option>`;
-  }).join("") + (c.voice && !voiceById(c.voice) ? `<option value="${esc(c.voice)}">(removed)</option>` : "");
+  const n = voiceChoices().length;
+  sel.innerHTML = voiceOptions(c.voice || "");
   sel.value = c.voice || "";
-  $("editor-voice-row").classList.toggle("empty", !vs.length);
-  $("editor-voice-hint").textContent = vs.length ? "" : "Add an audio reference in Cast & Scenes first.";
+  $("editor-voice-row").classList.toggle("empty", !n);
+  $("editor-voice-hint").textContent = n ? "" : "Add an audio reference (voice timbre) or an audio RefMod first.";
 }
 
 function editorDirty() {
-  const c = editing && P().cast.find((x) => x.id === editing.id);
+  if (!editing) return false;
+  if (editing.kind !== "cast") return editorAltChanges().length > 0;
+  const c = P().cast.find((x) => x.id === editing.id);
   return !!c && ($("editor-label").value !== c.label || $("editor-desc").value !== c.desc ||
     ($("editor-voice").value || null) !== (c.voice || null));
 }
 
-function closeEditor() { $("editor").hidden = true; editing = null; }
+function closeEditor() {
+  const pl = $("ed-player");
+  if (pl) pl.pause();
+  $("editor").hidden = true;
+  $("editor-alt").innerHTML = "";
+  editing = null;
+}
 
 async function editorSave() {
+  if (editing && editing.kind !== "cast") return editorAltSave();
   const c = editing && P().cast.find((x) => x.id === editing.id);
   if (!c) return closeEditor();
   if (!editorDirty()) return closeEditor();
@@ -6108,6 +7891,23 @@ async function editorSave() {
   commit();
 }
 
+async function editorAltSave() {
+  const ch = editorAltChanges();
+  if (!ch.length) return closeEditor();
+  if (setupGuard()) return;
+  const own = editing.kind === "voice" ? voiceById(editing.id) : (P().refmods || []).find((x) => x.id === editing.id);
+  // a voice reference's label isn't in the prompt (its pictures' labels are); everything else is
+  const quiet = ch.every(([o, k]) => o === own && k === "label" && editing.kind === "voice" && (own.role || "voice") === "voice");
+  const live = own && !own.bypassed;
+  const mode = !quiet && live ? await askRefChange() : "keep";
+  for (const [o, k, val] of ch) o[k] = val;
+  if (!quiet && live) applyRefChange(mode || "keep", editing.kind === "voice" ? "Audio references" : "RefMods");
+  closeEditor();
+  commit();
+}
+
+$("editor-alt").addEventListener("input", () => editorAltSync());
+$("editor-alt").addEventListener("change", () => editorAltSync());
 $("editor").addEventListener("click", async (e) => {
   if (e.target !== $("editor")) return;
   if (editorDirty() && !(await confirmBox({ title: "Discard your edits?",
@@ -6268,7 +8068,10 @@ video.addEventListener("loadedmetadata", () => layoutStage());
 function layoutStage() {
   const st = $("stage");
   const lo = P() && last();
-  const ar = video.videoWidth ? video.videoWidth / video.videoHeight
+  // 0.12.7: the screen keeps the Settings aspect; a clip of another size is scaled to fit
+  // inside it (black bars when its aspect differs)
+  const cur = P() && sizeOf(P().settings);
+  const ar = cur ? cur[0] / cur[1] : video.videoWidth ? video.videoWidth / video.videoHeight
     : lo && lo.size ? lo.size[0] / lo.size[1] : 16 / 9;
   st.style.setProperty("--ar", ar);
   if (document.fullscreenElement !== st) return;
@@ -6460,6 +8263,7 @@ function currentFor(target) {
   const p = P(), s = p.settings;
   if (target === "turbo") return s.turbo.lora;
   if (target === "melband") return p.audio.melband_model;
+  if (target === "refine_model") return s.refine.model;
   if (target.startsWith("lora:")) return s.loras[+target.slice(5)].name;
   return s[target];
 }
@@ -6531,6 +8335,7 @@ async function mbPick(name) {
   MB = null;
   if (before === name) return;
   if (t === "melband") { p.audio.melband_model = name; if (p.audio.voice_ref) sharedChanged("Audio"); return commit(); }
+  if (t === "refine_model") { s.refine.model = name; S.dry = null; return commit(); }
   const matters = t === "turbo" ? s.turbo.on : t.startsWith("lora:") ? s.loras[+t.slice(5)].on : true;
   const what = t === "turbo" ? "the Turbo LoRA" : t.startsWith("lora:") ? `LoRA ${+t.slice(5) + 1}` : KEEPABLE[t] || "the model";
   let mode = "all";
@@ -6961,6 +8766,7 @@ function finalState() {
 
 function upscaleFinal() {
   if (!active().length) return;
+  if (mixedSizeGuard("The final video")) return;
   if (Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "final")) { toast("Upscale final video is already in the queue."); return; }
   scheduleSave();
   enqueue({ type: "final" });
@@ -7084,7 +8890,10 @@ async function start() {
   if (/Mac|iPhone|iPad/.test(navigator.platform || "")) $("save-key").textContent = "⌘S";
   await refreshProjects();
   const want = store("h3studio.project");
-  const pick = S.projects.find((p) => p.slug === want) || S.projects[0];
+  // 0.13.0: not a project another tab has open
+  const free = S.projects.filter((p) => !tabWith(p.slug));
+  const pick = free.find((p) => p.slug === want) || free[0];
+  if (!pick && S.projects.length) setTimeout(() => toast("Every project is open in another Studio tab, so this tab starts a new one."), 800);
   if (pick) {
     try { await loadProject(pick.slug); return; } catch (e) { toast("Couldn't open " + pick.name + ": " + e.message); }
   }
@@ -7099,4 +8908,4 @@ async function start() {
 init();
 applyFolds();
 applyViewerHidden();
-$("viewer-mini").addEventListener("click", (e) => { if (!e.target.closest("button")) setViewerHidden(false); });
+$("viewer-mini").addEventListener("click", () => setViewerHidden(false));
