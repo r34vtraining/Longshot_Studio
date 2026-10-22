@@ -32,7 +32,7 @@ thrown away.
 - Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
 
-## What's new in 0.15.4
+## What's new in 0.15.5
 
 **Several Studio tabs at once**, each on its own project.
 
