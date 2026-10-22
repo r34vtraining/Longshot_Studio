@@ -13,9 +13,16 @@ A Shot with an empty prompt that isn't rendered (0.11.0) is a placeholder: it ne
 renders and holds its exact length on the film (to the frame, nothing snapped), as a
 run of its own.
 
+0.17.0: a Cut or Context Shot can start inside the Shot before it (two tracks): its
+`pin` is where it starts on the film, in frames. It never starts before the Shot
+before it starts, never over two Shots, and never after the Shot before ends (no
+gaps). Everything after it lays out from its end. (The film's edit point in an
+overlap keeps each Shot showing MIN_SHOWN frames.)
+
 Positions are in frames at 24 fps. `planner` is H3 Long Shot's planner module."""
 
 FPS = 24
+MIN_SHOWN = 6                                         # frames a Shot shows at least
 
 
 def is_empty(shot):
@@ -107,10 +114,30 @@ def film_layout(pieces, overlap, planner):
     out, base = [], 0
     for k, run in enumerate(runs):
         spans = _plan_run(run, overlap, planner)
+        length = spans[-1][2] if spans else 0
+        start = _pinned_start(run[0].get("pin"), base, length, out) if k and out else base
         for p, (ws, vs, we) in zip(run, spans):
-            out.append({"id": p.get("id"), "ws": base + ws, "vs": base + vs, "we": base + we, "run": k})
-        base += spans[-1][2] if spans else 0
-    return {"fps": FPS, "total": base, "pieces": out}
+            out.append({"id": p.get("id"), "ws": start + ws, "vs": start + vs, "we": start + we, "run": k})
+        base = start + length
+    total = max([base] + [p["we"] for p in out])
+    return {"fps": FPS, "total": total, "pieces": out}
+
+
+def _pinned_start(pin, base, length, placed):
+    """0.17.0: where a run that starts with a Cut / Context Shot starts: its pin, kept
+    between the start of the Shot before and that Shot's end; never
+    over the Shot two back, and never ending before the Shot before ends."""
+    try:
+        pin = int(round(float(pin)))
+    except (TypeError, ValueError):
+        return base
+    prev = placed[-1]
+    lo = max(prev["vs"], prev["we"] - length)
+    if len(placed) >= 2:
+        lo = max(lo, placed[-2]["we"])
+    if lo >= base:
+        return base
+    return max(lo, min(base, pin))
 
 
 def run_shifts(shots):
@@ -131,8 +158,21 @@ def film_pieces(shots, windows=None):
     windows = windows or {}
     return [{"id": str(sh.get("id")), "seconds": shot_seconds(sh),
              "window": windows.get(str(sh.get("id")), planned_window(sh)), "cut": is_cut(shots, i),
-             "hold": hold_frames(sh) if is_empty(sh) else 0}
+             "hold": hold_frames(sh) if is_empty(sh) else 0,
+             "pin": shot_pin(shots, i)}
             for i, sh in enumerate(shots)]
+
+
+def shot_pin(shots, i):
+    """0.17.0: a Cut / Context Shot's start on the film (frames), or None (right after the
+    Shot before)."""
+    sh = shots[i]
+    if i <= 0 or not is_cut(shots, i) or sh.get("pin") is None:
+        return None
+    try:
+        return int(round(float(sh.get("pin"))))
+    except (TypeError, ValueError):
+        return None
 
 
 def hold_frames(shot):

@@ -182,6 +182,11 @@ function normalize(p) {
     place: s.place && typeof s.place === "object" && (s.place.in || s.place.out || s.place.shift)
       ? { in: Math.max(0, Math.round(Number(s.place.in) || 0)), out: Math.max(0, Math.round(Number(s.place.out) || 0)),
         shift: Math.round(Number(s.place.shift) || 0) } : null,
+    // 0.17.0: two tracks. pin: where a Cut / Context Shot starts on the film (frames; it may
+    // start inside the Shot before). ov_cut: the edit point in that overlap, frames from its
+    // start (null: the top track shows)
+    pin: s.pin !== null && s.pin !== undefined && Number.isFinite(Number(s.pin)) ? Math.max(0, Math.round(Number(s.pin))) : null,
+    ov_cut: s.ov_cut !== null && s.ov_cut !== undefined && Number.isFinite(Number(s.ov_cut)) ? Math.max(0, Math.round(Number(s.ov_cut))) : null,
     standalone: !!s.standalone && s.kind !== "clip",   // its take was rendered on its own (no pins)
     render_model: s.render_model || null,              // 0.10.0: the model its take was made with
     // 0.11.0: its take's singing against the song: {take, at, offset, conf}
@@ -373,6 +378,16 @@ function effEdit(s) {
 
 const fmtSec = (frames) => `${(frames / FPS).toFixed(2)} s`;
 
+/** 0.17.0, on a Shot card: "⧉ over Shot 5 by 0.25 s" (it starts inside the Shot before). */
+function overlapTag(s) {
+  const o = LAYOUT.byId[s.id] && overlaps()[s.id];
+  if (!o || !o.cut) return "";
+  const pv = shotById(o.cut.prev), edit = s.ov_cut !== null && s.ov_cut !== undefined;
+  const off = isRendered(s) ? "" : ` <span class="linkbtn" role="button" tabindex="0" data-action="clear-overlap" title="Start right where ${esc(titleOf(pv))} ends (the Shots after it keep their place)">remove overlap</span>`;
+  return ` · <span class="ov-tag" title="Starts inside ${esc(titleOf(pv))}: on the ${o.track ? "bottom" : "top"} track. The film switches at the edit point${edit ? " you set" : " (the top track shows)"}; drag it on the timeline.">⧉ over ${esc(titleOf(pv))} by ${fmtSec(o.cut.ov)}</span>` +
+    (edit ? ` <span class="linkbtn" role="button" tabindex="0" data-action="reset-cut" title="The edit point back to where the top track shows">reset cut</span>` : "") + off;
+}
+
 /** On a Shot card: "✂ 0.40–4.10 s · moved +2 f" and a reset. */
 function editTag(s) {
   if (!hasEdit(s)) return "";
@@ -399,7 +414,8 @@ function layoutPieces() {
   const act = active();
   return act.map((s, i) => ({ id: s.id, seconds: s.kind === "clip" ? (Number(s.clip && s.clip.frames) || 0) / FPS
     : Number(s.seconds) || 0, window: plannedWindow(s), cut: i > 0 && runStartAt(act, i),
-    hold: isEmptyShot(s) ? Math.max(1, Math.round((Number(s.seconds) || 0) * FPS)) : 0 }));
+    hold: isEmptyShot(s) ? Math.max(1, Math.round((Number(s.seconds) || 0) * FPS)) : 0,
+    pin: i > 0 && runStartAt(act, i) && s.pin !== null && s.pin !== undefined ? s.pin : null }));
 }
 
 /** Ask for the layout when the Shots changed (debounced); render again when it comes. */
@@ -452,12 +468,81 @@ async function layoutReady() {
   LAYOUT.pending = null;
 }
 
-/** A Shot's span on the film in frames, with its trims and move (0.9.0), or null. */
+/** A Shot's span on the film in frames, with its trims and move (0.9.0), or null. Its
+ *  whole span: where it overlaps a neighbour (0.17.0), both are counted. */
 function filmSpan(s) {
   const L = LAYOUT.byId[s.id];
   if (!L) return null;
   const e = effEdit(s);
   return { a: L.vs + e.shift + e.in, b: L.we + e.shift - e.out, ws: L.ws, vs: L.vs, we: L.we };
+}
+
+/** 0.17.0: frames between where a Context Shot starts and where the take before it ends
+ *  (they overlap), so its context frame is the one right before its start; 0: no overlap. */
+function contextBack(x) {
+  if (!x || x.join !== "context" || x.kind === "clip") return 0;
+  const act = active(), i = act.findIndex((y) => y.id === x.id), pv = i > 0 ? act[i - 1] : null;
+  const L = LAYOUT.byId[x.id], Lp = pv && LAYOUT.byId[pv.id];
+  if (!L || !Lp) return 0;
+  return Math.max(0, (Lp.we + effEdit(pv).shift) - (L.ws + effEdit(x).shift));
+}
+
+// ---------------------------------------------------------------------------
+// Two tracks (0.17.0). A Cut or Context Shot can start inside the Shot before it
+// (its pin): they overlap. The Shot that overlaps the one before goes on the other
+// track, and the top track is what the film shows there, up to the edit point,
+// which can be slid anywhere in the overlap (non-destructive, like a trim). Each
+// Shot still renders its whole length; the film just switches at the edit point.
+// ---------------------------------------------------------------------------
+
+const OV = { key: null, by: {}, any: false };
+
+/** {id: {a, b, in, out, track, cut}} for the Shots on the film: a..b its whole span,
+ *  in / out the frames the overlaps hide at its start / end, track 0 (top) or 1, and
+ *  cut {at, lo, hi, prev, ov} where it overlaps the Shot before. */
+function overlaps() {
+  if (!P()) return {};
+  const act = active();
+  const key = LAYOUT.sig + "|" + act.map((s) => `${s.id},${s.join},${s.kind},${s.ov_cut},${s.place ? JSON.stringify(s.place) : ""}`).join(";");
+  if (key === OV.key) return OV.by;
+  const by = {};
+  let pv = null, any = false;
+  act.forEach((s, i) => {
+    const sp = filmSpan(s);
+    if (!sp) { pv = null; return; }
+    const o = { a: sp.a, b: sp.b, in: 0, out: 0, track: 0, cut: null };
+    by[s.id] = o;
+    if (pv && runStartAt(act, i) && sp.a < pv.o.b) {
+      any = true;
+      const ov = pv.o.b - sp.a;
+      o.track = 1 - pv.o.track;
+      // the top track shows: a Shot on top shows from its start, else the one before to its end
+      const want = s.ov_cut === null || s.ov_cut === undefined ? (o.track === 0 ? 0 : ov) : Math.min(ov, s.ov_cut);
+      const lo = Math.max(sp.a, pv.o.a + pv.o.in + MIN_SHOWN), hi = Math.min(pv.o.b, sp.b - MIN_SHOWN);
+      const at = lo <= hi ? Math.max(lo, Math.min(hi, sp.a + want)) : sp.a + Math.round(ov / 2);
+      pv.o.out = Math.max(pv.o.out, pv.o.b - at);
+      o.in = at - sp.a;
+      o.cut = { at, lo: Math.min(lo, hi), hi: Math.max(lo, hi), prev: pv.s.id, ov };
+    }
+    pv = { s, o };
+  });
+  OV.key = key;
+  OV.by = by;
+  OV.any = any;
+  return by;
+}
+const anyOverlap = () => { overlaps(); return OV.any; };
+
+/** The edit as the film shows it: the trims and move, plus what the overlaps hide. */
+function filmEdit(s) {
+  const e = effEdit(s), o = overlaps()[s.id];
+  return o ? { in: e.in + o.in, out: e.out + o.out, shift: e.shift } : e;
+}
+
+/** The frames of a Shot the film shows (its overlaps cut at the edit points). */
+function shownSpan(s) {
+  const sp = filmSpan(s), o = overlaps()[s.id];
+  return sp && o ? { a: sp.a + o.in, b: sp.b - o.out } : sp;
 }
 
 const songOn = () => !!(P() && P().audio && P().audio.file && (P().audio.song_ref || P().audio.lip_sync || P().audio.final_override));
@@ -1231,7 +1316,7 @@ function filmRuns(runs) {
     if (!Lf || !Ll) return null;
     const w = plannedWindow(f);
     const zone = w && isRendered(f) ? Math.max(0, w - (Lf.we - Lf.vs)) : 0;
-    const ef = effEdit(f), el = effEdit(l);
+    const ef = filmEdit(f), el = filmEdit(l);           // 0.17.0: overlaps cut at their edit points
     const used = (Ll.we - Lf.vs) - ef.in - el.out;
     if (used <= 0) return null;
     out.push({ ids, head: zone + ef.in, used, at: Lf.vs + ef.shift + ef.in });
@@ -1845,6 +1930,7 @@ function renderQueue() {
   $("queue-pause").textContent = Q.paused ? "Resume" : "Pause";
   $("queue-pause").setAttribute("aria-pressed", Q.paused);
   $("queue-clear").hidden = !Q.jobs.some((j) => !liveJob(j));
+  $("queue-stop-all").disabled = !live;                // 0.16.0
   // 0.13.0: what the other Studio tabs have queued (they run their own; ComfyUI takes the
   // runs one at a time, in the order they arrive)
   const others = othersJobs();
@@ -1897,6 +1983,27 @@ async function queueAction(action, el) {
   const job = row && Q.jobs.find((j) => j.id === row.dataset.job);
   if (action === "queue-pause") { Q.paused = !Q.paused; saveQueue(); renderQueue(); if (!Q.paused) queueNext(); return; }
   if (action === "queue-flip") { store("h3studio.queueNewest", store("h3studio.queueNewest") === "1" ? "0" : "1"); renderQueue(); return; }
+  if (action === "queue-stop-all") {
+    // 0.16.0: stop the running job and every waiting one; they stay listed, stopped, to retry
+    const waiting = Q.jobs.filter((j) => j.state === "waiting");
+    const running = Q.jobs.find((j) => j.state === "running");
+    const n = waiting.length + (running ? 1 : 0);
+    if (!n) return;
+    if (n > 1) {
+      const ok = await confirmBox({ title: `Stop all ${n} jobs?`,
+        body: (running ? `The job that's running stops (finished pieces stay in Long Shot's memory) and the ${waiting.length} waiting ` :
+          `The ${waiting.length} waiting `) + `job${waiting.length === 1 ? "" : "s"} won't start. They stay in the list as stopped, so you can retry them.`,
+        yes: "Stop all", no: "Cancel" });
+      if (!ok) return;
+    }
+    for (const j of waiting) if (j.state === "waiting") endJob(j, "stopped");
+    if (running) {
+      if ((S.busy && S.busy.jobId === running.id) || (S.chunking && S.chunking.jobId === running.id)) stop();
+      else endJob(running, "stopped");     // (still starting: it won't go on)
+    }
+    renderQueue();
+    return;
+  }
   if (action === "queue-clear") {
     const gone = Q.jobs.filter((j) => !liveJob(j)).map((j) => j.group);
     Q.jobs = Q.jobs.filter(liveJob);
@@ -2185,6 +2292,8 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
   let project = sendable(P(), claimed);          // seeds are settled on the whole timeline first
   // 0.9.2: the film's own joins, for where each Shot sits on the film (a render may override them)
   project.shots.forEach((x) => { x.film_join = x.join || "bridge"; });
+  // 0.17.0: a Context Shot that starts inside the Shot before takes the frame before its start
+  project.shots.forEach((x) => { const b = contextBack(x); if (b) x.context_back = b; });
   // the join chip: the joins this render uses (the project keeps its own)
   if (joins) project.shots.forEach((x) => { if (joins[x.id]) x.join = joins[x.id]; });
   // Shots left out of this render (sent bypassed; the project itself is untouched):
@@ -2990,7 +3099,8 @@ const REF_KINDS = [["cast", "picture", "pictures"], ["voices", "voice", "voices"
 
 function refSnapshot(p = P()) {
   const live = (xs) => JSON.parse(JSON.stringify((xs || []).filter((x) => !x.bypassed)));
-  return { cast: live(p.cast), voices: live(p.voices), refmods: live(p.refmods) };
+  // 0.16.0: and the Style & Sound text, so Restore all can put it back
+  return { cast: live(p.cast), voices: live(p.voices), refmods: live(p.refmods), style: JSON.parse(JSON.stringify(p.style || {})) };
 }
 
 function refSetKey(set) {
@@ -3025,45 +3135,77 @@ function refSetFor(s) {
 const restoreName = (kind, x) => kind === "refmods" ? (x.label || x.name || "RefMod")
   : (x.label && x.label !== "<new>" ? x.label : (x.original_name || x.image || x.file || "untitled"));
 
-/** Put back the references a Shot's take was made with: removed ones are added again
- *  (where they were), bypassed ones turned on. Nothing else changes. */
+const STYLE_NAMES = { summary: "Summary", task_types: "Task types", retention: "Retention", style_line: "Style line",
+  soundscape: "Soundscape", music: "Music" };
+
+/** 0.16.0, Restore all: the project as it was when a Shot's take was made. Cast & Scenes
+ *  become exactly that take's references (in its order, edits undone; the others are
+ *  bypassed, which takes no reference slot), and Style & Sound its text (takes made from
+ *  0.16.0 on remember it). The Shots' prompts, Audio and Settings aren't touched. */
 async function restoreRefs(s) {
   if (!s || setupGuard()) return;
   const set = refSetFor(s);
-  if (!set) { toast(`${titleOf(s)}'s take was made before 0.8.13, so the references it used weren't recorded.`); return; }
-  const p = P(), changes = [];
+  if (!set) { toast(`${titleOf(s)}'s take was made before 0.8.13, so what it was made with wasn't recorded.`); return; }
+  const p = P(), changes = [], plan = {};
+  for (const [kind] of REF_KINDS) {
+    const want = (set[kind] || []).map((x) => Object.assign(JSON.parse(JSON.stringify(x)), { bypassed: false }));
+    const ids = new Set(want.map((x) => x.id));
+    // the take's references in its order (so the <Picture N> labels match); the others
+    // keep their place after the reference that came before them, bypassed
+    const groups = new Map([[null, []]]);
+    let anchor = null;
+    for (const x of p[kind] || []) {
+      if (ids.has(x.id)) { anchor = x.id; continue; }
+      if (!groups.has(anchor)) groups.set(anchor, []);
+      groups.get(anchor).push(Object.assign({}, x, { bypassed: true }));
+    }
+    const out = [...groups.get(null)];
+    for (const item of want) out.push(item, ...(groups.get(item.id) || []));
+    plan[kind] = out;
+  }
+  // compare with the cards as they'll be once loaded (defaults filled in), so only real
+  // differences are listed
+  const after = JSON.parse(JSON.stringify(p));
+  for (const [kind] of REF_KINDS) after[kind] = JSON.parse(JSON.stringify(plan[kind]));
+  normalize(after);
+  const same = (a, b) => JSON.stringify(Object.assign({}, a, { bypassed: false })) === JSON.stringify(Object.assign({}, b, { bypassed: false }));
   for (const [kind, one] of REF_KINDS) {
-    for (const item of set[kind] || []) {
-      const ex = (p[kind] || []).find((x) => x.id === item.id);
-      if (ex && ex.bypassed) changes.push({ how: "on", kind, one, ex, name: restoreName(kind, ex) });
-      else if (!ex) changes.push({ how: "add", kind, one, item, name: restoreName(kind, item) });
+    const cur = p[kind] || [], ids = new Set((set[kind] || []).map((x) => x.id));
+    for (const item of after[kind].filter((x) => ids.has(x.id))) {
+      const ex = cur.find((x) => x.id === item.id);
+      if (!ex) changes.push(`${one} <b>${esc(restoreName(kind, item))}</b> · added again`);
+      else if (!same(ex, item)) changes.push(`${one} <b>${esc(restoreName(kind, item))}</b> · changed back${ex.bypassed ? " and turned on" : ""}`);
+      else if (ex.bypassed) changes.push(`${one} <b>${esc(restoreName(kind, item))}</b> · turned back on`);
+    }
+    for (const x of cur) if (!ids.has(x.id) && !x.bypassed) changes.push(`${one} <b>${esc(restoreName(kind, x))}</b> · bypassed (not in this take)`);
+  }
+  let style = null;
+  if (set.style && typeof set.style === "object") {
+    style = Object.assign({}, p.style, JSON.parse(JSON.stringify(set.style)));
+    for (const [k, name] of Object.entries(STYLE_NAMES)) {
+      if (JSON.stringify(p.style[k] ?? null) !== JSON.stringify(style[k] ?? null)) changes.push(`${name} · changed back`);
     }
   }
-  if (!changes.length) { toast(`All of ${titleOf(s)}'s references are already in Cast & Scenes.`); return; }
+  if (!changes.length) {
+    toast(`Everything is already as it was for ${titleOf(s)}'s take${style ? "" : " (its Style & Sound text wasn't recorded)"}.`);
+    return;
+  }
   const redo = active().filter((x) => x.kind !== "clip" && x.status === "review");
   const nApproved = approvedShots().length;
-  const body = `<p>Puts back what ${esc(titleOf(s))}'s take was made with:</p><ul class="restore-refs-list">` +
-    changes.map((c) => `<li>${esc(c.one)} <b>${esc(c.name)}</b> · ${c.how === "on" ? "turned back on" : "added again"}</li>`).join("") +
-    `</ul><p class="muted small" style="margin-top:10px">The labels after them renumber (<code>&lt;Picture N&gt;</code>), so every Shot's prompt changes. ` +
+  const body = `<p>Puts the project back the way it was when ${esc(titleOf(s))}'s take was made:</p><ul class="restore-refs-list">` +
+    changes.map((c) => `<li>${c}</li>`).join("") + `</ul>` +
+    (style ? "" : `<p class="muted small" style="margin-top:8px">This take was made before 0.16.0, so its Style &amp; Sound text wasn't recorded: that stays as it is.</p>`) +
+    `<p class="muted small" style="margin-top:10px">Bypassed cards stay in Cast &amp; Scenes, so you can turn them back on. Every Shot's prompt changes. ` +
     (nApproved ? `${nApproved} approved Shot${nApproved > 1 ? "s keep their takes" : " keeps its take"}. ` : "") +
     (redo.length ? `${redo.map(titleOf).join(", ")} will render again.` : "No Shot under review renders again.") + "</p>";
-  const ok = await confirmBox({ title: "Restore references?", body, html: true, yes: "Restore", no: "Cancel" });
+  const ok = await confirmBox({ title: "Restore all?", body, html: true, yes: "Restore all", no: "Cancel" });
   if (!ok) return;
-  for (const c of changes) {
-    if (c.how === "on") { c.ex.bypassed = false; continue; }
-    const list = p[c.kind], order = set[c.kind].map((x) => x.id);
-    // after the nearest reference that came before it in the take's set
-    let at = 0;
-    for (let i = order.indexOf(c.item.id) - 1; i >= 0; i--) {
-      const j = list.findIndex((x) => x.id === order[i]);
-      if (j >= 0) { at = j + 1; break; }
-    }
-    list.splice(at, 0, Object.assign(JSON.parse(JSON.stringify(c.item)), { bypassed: false }));
-  }
+  for (const [kind] of REF_KINDS) p[kind] = plan[kind];
+  if (style) p.style = style;
   normalize(p);
-  applyRefChange(await askRefChange(), "References restored");
+  applyRefChange(await askRefChange(), "Restore all");
   commit();
-  toast(`Restored ${changes.length} reference${changes.length > 1 ? "s" : ""} from ${titleOf(s)}'s take.`);
+  toast(`Restored ${titleOf(s)}'s references${style ? " and Style & Sound" : ""}.`);
 }
 
 function setViewerHidden(on) {
@@ -3110,6 +3252,7 @@ function renderMini() {
     cls = "done";
   } else text = "No Shot queued";
   $("vm-text").textContent = text;
+  $("vm-text").title = text;                           // 0.16.0: the whole line, when it ends in "…"
   dot.className = "vm-dot" + (cls ? " " + cls : "");
   bar.hidden = pct === null;
   if (pct !== null) $("vm-fill").style.width = Math.max(0, Math.min(100, pct)) + "%";
@@ -3255,7 +3398,7 @@ function layoutTL() {
   TLV.w = w;
   const px = tlPx(), L = tlView.scrollLeft, R = L + w;
   // narrow blocks pop out to full size on hover, centred on their spot, inside the view
-  const byId = new Map(TL.entries.map((e) => [e.id, e]));
+  const byId = new Map((TL.blocks || TL.entries).map((e) => [e.id, e]));
   for (const b of $("tl-strip").children) {
     const e = byId.get(b.dataset.tl);
     if (!e) continue;
@@ -3329,7 +3472,7 @@ if (window.ResizeObserver) {
 const TL_H_MIN = 64, TL_H_MAX = 240;
 function tlSetHeight(h) {
   TLV.h = Math.round(Math.min(TL_H_MAX, Math.max(TL_H_MIN, h)));
-  $("tl-strip").style.height = TLV.h + "px";
+  $("tl-strip").style.height = (TL.two ? Math.round(TLV.h * 1.6) : TLV.h) + "px";   // 0.17.0: two tracks
   store("h3studio.tlHeight", String(TLV.h));
 }
 tlSetHeight(Number(store("h3studio.tlHeight")) || TL_H_MIN);
@@ -3405,7 +3548,7 @@ function tlOpenPrompt(id) {
   }, true);
   tlView.addEventListener("pointerdown", (e) => {
     if (e.button !== 0 && e.button !== 1) return;
-    if (e.target.closest("#scrub, .tl-arrow, .tl-trim")) return;
+    if (e.target.closest("#scrub, .tl-arrow, .tl-trim, .tl-cut") || BLOCK.drag) return;
     d = { x: e.clientX, s: tlView.scrollLeft, id: e.pointerId, moved: false, ruler: !!e.target.closest("#tl-ruler") };
     if (e.button === 1) e.preventDefault();
   });
@@ -3781,7 +3924,30 @@ function buildTL() {
   const sig = JSON.stringify(entries.map((e) => [e.id, e.src, e.off, e.dur, e.start]));
   const changed = sig !== TL.sig;
   TL = { exact, entries, total: t, sig };
+  tlBlocks(act);
   return changed;
+}
+
+/** 0.17.0: what the timeline draws. One track: a block per piece the film shows (as
+ *  before). Two tracks (something overlaps): each Shot's whole span on its track, the
+ *  part the film doesn't show shaded, and an edit point in each overlap. */
+function tlBlocks(act) {
+  const fps = LAYOUT.fps || FPS;
+  TL.two = !TL.exact && act.length > 0 && act.every((s) => LAYOUT.byId[s.id]) && anyOverlap();
+  TL.cuts = [];
+  if (!TL.two) {
+    TL.blocks = TL.entries.filter((e) => e.id).map((e) => ({ id: e.id, start: e.start, dur: e.dur, track: 0, hl: 0, hr: 0, e }));
+    return;
+  }
+  const by = overlaps(), byE = new Map(TL.entries.filter((e) => e.id).map((e) => [e.id, e]));
+  TL.blocks = act.map((s) => {
+    const o = by[s.id];
+    if (!o) return null;
+    const e = byE.get(s.id) || { id: s.id, src: null, kind: "gap", rendered: isRendered(s) };
+    if (o.cut) TL.cuts.push({ id: s.id, prev: o.cut.prev, at: o.cut.at / fps, lo: o.cut.lo, hi: o.cut.hi });
+    return { id: s.id, start: o.a / fps, dur: (o.b - o.a) / fps, track: o.track, hl: o.in / fps, hr: o.out / fps, e };
+  }).filter(Boolean);
+  TL.total = Math.max(TL.total, ...TL.blocks.map((b) => b.start + b.dur));
 }
 
 /** 0.9.0: put each Shot where it sits on the film (Long Shot's layout), with its trims
@@ -3807,7 +3973,7 @@ function placeOnFilm(act, entries) {
       fa -= half;
       off -= half / fps;
     }
-    const ed = effEdit(s);
+    const ed = filmEdit(s);                         // 0.17.0: overlaps cut at their edit points
     fa += ed.in + ed.shift;
     off += ed.in / fps;
     fb += ed.shift - ed.out;
@@ -3864,6 +4030,223 @@ function shownFrames(s) {
 
 const TRIM = { drag: null, swallow: 0 };
 
+// ---------------------------------------------------------------------------
+// 0.17.0: a Cut / Context Shot between its neighbours. Making it longer doesn't push
+// the Shots after it: it overlaps the next one (then the one before), up to both
+// neighbours' length together. Shorter: it gives the overlap back; past that the
+// Shots after it close up, unless one of them is rendered (it stays put). A Shot not
+// rendered yet can be dragged anywhere from the start of the Shot before to the end
+// of the Shot after.
+// ---------------------------------------------------------------------------
+
+const validNear = (f) => 17 * Math.max(0, Math.round((f - 5) / 17)) + 5;
+/** The frames a Shot of `sec` seconds gets on its own (Long Shot's 17k + 5; a placeholder: exact). */
+const windowFor = (s, sec) => isEmptyShot(s) ? Math.max(1, Math.round(sec * FPS)) : validNear(sec * FPS);
+const stepFor = (s) => (isEmptyShot(s) ? 1 : 17);
+
+/** A Shot and its neighbours on the film, from `by` (a layout), or null. */
+function slotOf(s, by = LAYOUT.byId) {
+  const act = active(), i = act.indexOf(s);
+  if (i < 0 || !by[s.id]) return null;
+  const at = (k) => (k >= 0 && k < act.length ? act[k] : null);
+  const P0 = at(i - 1), PP = at(i - 2), N = at(i + 1), NN = at(i + 2);
+  if ([P0, PP, N, NN].some((x) => x && !by[x.id])) return null;
+  const sh = (x) => (x ? effEdit(x).shift : 0);
+  const Lx = (x) => x && { vs: by[x.id].vs + sh(x), we: by[x.id].we + sh(x) };
+  return { i, L: Lx(s), P: P0, N, Lp: Lx(P0), Lpp: Lx(PP), Ln: Lx(N), Lnn: Lx(NN), shift: sh(s),
+    left: i > 0 && runStartAt(act, i), right: !!N && runStartAt(act, i + 1) };
+}
+
+/** Where a Shot of w frames may start in its slot: [lo, hi] (lo > hi: it doesn't fit).
+ *  follow: nothing after it is rendered, so the Shots after it may close up behind it. */
+function slotRange(sl, w, follow = false) {
+  let lo = -Infinity, hi = Infinity;
+  if (!sl.left) lo = hi = sl.L.vs;
+  else {
+    lo = Math.max(sl.Lp.vs, sl.Lp.we - w);               // from the start of the Shot before; no Shot inside another
+    if (sl.Lpp) lo = Math.max(lo, sl.Lpp.we);            // never over two Shots
+    hi = sl.Lp.we;                                        // no gap after the Shot before
+  }
+  if (sl.N && sl.right) {
+    if (!follow) lo = Math.max(lo, sl.Ln.vs - w);         // reaches the next Shot (no gap; it stays put)
+    hi = Math.min(hi, sl.Ln.we - w);                      // to the end of the Shot after
+    if (sl.Lnn) hi = Math.min(hi, sl.Lnn.vs - w);
+  }
+  return [lo, hi];
+}
+
+const renderedFrom = (s) => { const act = active(); return act.slice(act.indexOf(s) + 1).some((x) => x.kind === "clip" || isRendered(x)); };
+
+/** Before a length change: the Shot after it keeps its place (a pin). `by`: the layout before. */
+function pinNext(s, by) {
+  const sl = slotOf(s, by);
+  if (!sl || !sl.N || !sl.right) return;
+  sl.N.pin = by[sl.N.id].vs;
+}
+
+/** After a length change: fit the Shot in its slot (it may start earlier, or get capped).
+ *  Returns a note for the user, or "". `by`: the layout from before the change. */
+function fitLength(s, by) {
+  const sl = slotOf(s, by);
+  if (!sl || !sl.N || !sl.right) return "";
+  const len = (L) => (L ? L.we - L.vs : 0);
+  const cap = len(sl.Lp) + len(sl.Ln);
+  let w = windowFor(s, Number(s.seconds) || 0), note = "";
+  const fits = (x) => { const [lo, hi] = slotRange(sl, x); return lo <= hi; };
+  if (w > cap || (!fits(w) && w > len(sl.L))) {
+    // too long: the longest that fits, and never longer than its neighbours together
+    let x = Math.min(w, cap);
+    if (!isEmptyShot(s)) x = 17 * Math.max(0, Math.floor((x - 5) / 17)) + 5;     // on the 17k + 5 grid
+    while (x > stepFor(s) && !fits(x)) x -= stepFor(s);
+    note = `${titleOf(s)} can be at most ${(x / FPS).toFixed(2)} s here: ` +
+      (w > cap ? `${sl.P ? `${titleOf(sl.P)} and ${titleOf(sl.N)} together` : `${titleOf(sl.N)}'s length`}.` :
+        "it would cover more than its neighbours can give.");
+    w = x;
+    s.seconds = +(w / FPS).toFixed(isEmptyShot(s) ? 6 : 2);
+  } else if (!fits(w)) {
+    // too short to reach the next Shot
+    if (renderedFrom(s)) {
+      let x = w;
+      while (!fits(x) && x < cap) x += stepFor(s);
+      w = x;
+      s.seconds = +(w / FPS).toFixed(isEmptyShot(s) ? 6 : 2);
+      note = `${titleOf(s)} can't be shorter than ${(w / FPS).toFixed(2)} s: the Shots after it are rendered and keep their place.`;
+    } else {
+      sl.N.pin = null;                               // nothing rendered after it: they close up
+      if (sl.left) s.pin = null;
+      return "";
+    }
+  }
+  const [lo, hi] = slotRange(sl, w);
+  let at = sl.L.vs;
+  if (sl.left) {
+    at = Math.max(lo, Math.min(hi, sl.L.vs));
+    s.pin = at < sl.Lp.we ? at - sl.shift : null;
+  }
+  sl.N.pin = at + w >= sl.Ln.vs ? sl.Ln.vs - effEdit(sl.N).shift : null;
+  return note;
+}
+
+/** Can this Shot's block be dragged along the film? null, or why not. */
+function dragBlocked(s) {
+  if (!s || s.kind === "clip" || isRendered(s)) return "rendered";
+  const sl = slotOf(s);
+  if (!sl) return "layout";
+  if (!sl.left) return sl.i === 0 ? `${titleOf(s)} is the first Shot.` : `${titleOf(s)} continues from the Shot before (Continuous): set its join to Cut or Context to move it.`;
+  if (sl.N && !sl.right) return `${titleOf(sl.N)} continues from ${titleOf(s)} (Continuous): set its join to Cut or Context to move ${titleOf(s)} on its own.`;
+  return null;
+}
+
+const BLOCK = { drag: null };
+
+/** Start dragging a Shot's block (it isn't rendered yet). */
+function blockDragStart(e, s) {
+  const why = dragBlocked(s);
+  if (why) return false;
+  const sl = slotOf(s), w = sl.L.we - sl.L.vs, follow = !renderedFrom(s);
+  const [lo, hi] = slotRange(sl, w, follow);
+  BLOCK.drag = { s, x: e.clientX, y: e.clientY, sl, w, lo, hi, follow, at0: sl.L.vs, at: sl.L.vs, moved: false,
+    base: JSON.parse(JSON.stringify(LAYOUT.byId)) };
+  return true;
+}
+
+document.addEventListener("pointermove", (e) => {
+  const d = BLOCK.drag;
+  if (!d) return;
+  if (!d.moved && Math.abs(e.clientX - d.x) < 4) return;
+  if (!d.moved) { d.moved = true; document.body.classList.add("moving-block"); }
+  const df = Math.round((e.clientX - d.x) / (tlPx() / FPS));
+  const at = d.lo > d.hi ? d.at0 : Math.max(d.lo, Math.min(d.hi, d.at0 + df));
+  if (at !== d.at) {
+    d.at = at;
+    // shown at once: this Shot's place moves; the Shots after it keep theirs (or close up
+    // behind it, when none of them is rendered)
+    const k = at - d.at0, act = active(), i = act.indexOf(d.s);
+    const mv = (x, by) => { const B = d.base[x.id], L = LAYOUT.byId[x.id]; if (B && L) Object.assign(L, { ws: B.ws + by, vs: B.vs + by, we: B.we + by }); };
+    mv(d.s, k);
+    const gap = d.sl.N ? Math.min(0, d.base[d.s.id].we + k - d.base[d.sl.N.id].vs) : 0;
+    act.slice(i + 1).forEach((x) => mv(x, d.follow ? gap : 0));
+    d.s.ov_cut = null;
+    if (d.sl.N) d.sl.N.ov_cut = null;
+    OV.key = null;
+    renderViewer();
+  }
+  const sp = filmSpan(d.s);
+  trimReadout(e.clientX, e.clientY, d.lo >= d.hi ? (d.follow ? "It can't move here" : "No room: it would leave a gap before a rendered Shot. Make it longer first.") :
+    `${fmt(sp.a / FPS)} → ${fmt(sp.b / FPS)}` + (at === d.lo || at === d.hi ? " · stop" : ""));
+});
+
+document.addEventListener("pointerup", () => {
+  const d = BLOCK.drag;
+  if (!d) return;
+  BLOCK.drag = null;
+  document.body.classList.remove("moving-block");
+  $("tl-readout").hidden = true;
+  if (!d.moved) return;
+  TRIM.swallow = performance.now() + 120;
+  if (d.at === d.at0) return;
+  const sl = d.sl;
+  d.s.pin = d.at < sl.Lp.we ? d.at - sl.shift : null;
+  if (sl.N && sl.right) sl.N.pin = d.at + d.w >= sl.Ln.vs ? sl.Ln.vs - effEdit(sl.N).shift : null;   // stays, or closes up
+  if (songOn()) toast(`${titleOf(d.s)} gets the song from its new place when it renders.`);
+  commit();
+});
+
+// The edit point in an overlap: drag it anywhere in the overlap (nothing re-renders).
+const CUTD = { drag: null };
+$("tl-strip").addEventListener("pointerdown", (e) => {
+  if (e.button !== 0) return;
+  const c = e.target.closest(".tl-cut");
+  if (c) {
+    const s = shotById(c.dataset.cut), o = s && overlaps()[s.id];
+    if (!o || !o.cut || setupGuard()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    CUTD.drag = { s, x: e.clientX, at0: o.cut.at, at: o.cut.at, lo: o.cut.lo, hi: o.cut.hi, a: o.a, moved: false };
+    document.body.classList.add("trimming");
+    return;
+  }
+  // a Shot not rendered yet: drag its block along the film (between its neighbours)
+  const b = e.target.closest(".tl-block.movable");
+  if (!b || e.target.closest(".tl-arrow, .tl-trim")) return;
+  const s = shotById(b.dataset.tl);
+  if (!s || busyHere() || setupGuard()) return;
+  if (blockDragStart(e, s)) e.stopPropagation();       // not a pan of the view
+});
+document.addEventListener("pointermove", (e) => {
+  const d = CUTD.drag;
+  if (!d) return;
+  if (!d.moved && Math.abs(e.clientX - d.x) < 3) return;
+  d.moved = true;
+  const at = Math.max(d.lo, Math.min(d.hi, d.at0 + Math.round((e.clientX - d.x) / (tlPx() / FPS))));
+  if (at !== d.at) { d.at = at; d.s.ov_cut = at - d.a; OV.key = null; renderViewer(); }
+  trimReadout(e.clientX, e.clientY, `cut at ${fmt(at / FPS)}` + (at === d.lo || at === d.hi ? " · end of the overlap" : ""));
+});
+document.addEventListener("pointerup", () => {
+  const d = CUTD.drag;
+  if (!d) return;
+  CUTD.drag = null;
+  document.body.classList.remove("trimming");
+  $("tl-readout").hidden = true;
+  if (!d.moved) return;
+  TRIM.swallow = performance.now() + 120;
+  commit();
+});
+
+/** Back to no overlap: the Shot starts where the one before ends (the Shot after it keeps its place). */
+function clearOverlap(s) {
+  if (!s || isRendered(s)) return;
+  const sl = slotOf(s);
+  if (sl && sl.left && sl.N && sl.right) {
+    const [, hi] = slotRange(sl, sl.L.we - sl.L.vs);
+    if (hi < sl.Lp.we) { toast(`${titleOf(s)} would cover too much of ${titleOf(sl.N)}. Make it shorter first.`); return; }
+    sl.N.pin = sl.Ln.vs - effEdit(sl.N).shift;
+  }
+  s.pin = null;
+  s.ov_cut = null;
+  commit();
+}
+
 function trimReadout(x, y, text) {
   const r = $("tl-readout");
   r.hidden = false;
@@ -3882,7 +4265,7 @@ $("tl-strip").addEventListener("pointerdown", (e) => {
   e.stopPropagation();
   const ed = editOf(s);
   TRIM.drag = { s, kind: h.dataset.trim, x: e.clientX, in: ed.in, out: ed.out, seconds: Number(s.seconds) || 0,
-    moved: false };
+    moved: false, by: JSON.parse(JSON.stringify(LAYOUT.byId)) };
   document.body.classList.add("trimming");
 });
 
@@ -3918,8 +4301,13 @@ document.addEventListener("pointerup", () => {
   TRIM.swallow = performance.now() + 120;         // the click after a drag isn't a pick
   if (d.kind === "seconds") {
     if (Number(d.s.seconds) !== d.seconds) {
+      // 0.17.0: the Shot after it keeps its place; this one fits between its neighbours
+      pinNext(d.s, d.by);
+      const note = fitLength(d.s, d.by);
+      if (note) toast(note);
       shotEdited(d.s, "seconds");
-      if (songOn() && active().slice(active().indexOf(d.s) + 1).some(isRendered)) {
+      const sl = slotOf(d.s, d.by);
+      if (!(sl && sl.N && sl.right) && songOn() && active().slice(active().indexOf(d.s) + 1).some(isRendered)) {
         toast("The Shots after it move along the song: re-render them to keep their lip sync.");
       }
     }
@@ -3987,7 +4375,9 @@ function moveShot(s, d) {
   const nb = d > 0 ? act[act.indexOf(last) + 1] : act[act.indexOf(first) - 1];
   const q = nb && filmSpan(nb);
   if (q) {
-    const over = d > 0 ? sb.b + d - q.a : q.b - (sa.a + d);
+    // 0.17.0: only what the move adds (a Shot may already overlap it on the other track)
+    const over = d > 0 ? Math.max(0, sb.b + d - q.a) - Math.max(0, sb.b - q.a)
+      : Math.max(0, q.b - (sa.a + d)) - Math.max(0, q.b - sa.a);
     if (over > 0) {
       const side = d > 0 ? "in" : "out";
       const pl = Object.assign({ in: 0, out: 0, shift: 0 }, nb.place || {});
@@ -4161,6 +4551,40 @@ function updateTime() {
 }
 
 /** Pick a Shot on the timeline: jump there; it's the one Approve, Reroll and Loop act on. */
+/** 0.16.0: the Shot list is at most SHOT_ROWS collapsed Shots tall; past that it scrolls. */
+const SHOT_ROWS = 15;
+function fitShotList() {
+  const box = $("shot-scroll"), list = $("shots");
+  if (!box || !list) return;
+  const cards = [...list.children].filter((e) => e.classList.contains("shot") && e.offsetParent);
+  if (cards.length <= SHOT_ROWS) {
+    box.classList.remove("scrolls");
+    box.style.maxHeight = "";
+    return;
+  }
+  const top0 = box.getBoundingClientRect().top - box.scrollTop;
+  const at = (e) => e.getBoundingClientRect().top - top0;
+  const order = cards.slice().sort((a, b) => at(a) - at(b));     // (flipped: newest on top)
+  let h = at(order[SHOT_ROWS]) - 4;
+  for (const c of order.slice(0, SHOT_ROWS)) {                  // an open Shot counts as its collapsed row
+    const body = c.querySelector(":scope > .shot-body");
+    if (body) h -= body.offsetHeight;
+  }
+  box.style.maxHeight = Math.max(200, Math.round(h)) + "px";
+  box.classList.add("scrolls");
+}
+/** Scroll the Shot list (not the page) so a Shot's card is in view. */
+function revealShotCard(id) {
+  const box = $("shot-scroll");
+  if (!box || !box.classList.contains("scrolls")) return;
+  const card = $("shots").querySelector(`.shot[data-shot="${CSS.escape(id)}"]`);
+  if (!card) return;
+  const b = box.getBoundingClientRect(), c = card.getBoundingClientRect(), pad = 24;
+  if (c.top < b.top + pad) box.scrollTop -= b.top + pad - c.top;
+  else if (c.bottom > b.bottom - pad) box.scrollTop += Math.min(c.bottom - (b.bottom - pad), c.top - (b.top + pad));
+}
+window.addEventListener("resize", () => { clearTimeout(fitShotList.t); fitShotList.t = setTimeout(fitShotList, 120); });
+
 function focusShot(id) {
   const e = TL.entries.find((x) => x.id === id);
   S.focus = id;
@@ -4170,6 +4594,7 @@ function focusShot(id) {
   renderDecision();
   renderViewer();
   renderFace();                                    // 0.14.1: the Face refine panel follows the selection
+  revealShotCard(id);                              // 0.16.0: the Shot list scrolls to it
   tlReveal(id);
 }
 
@@ -4950,7 +5375,7 @@ function shotRowHTML(s) {
           ${play ? "" : `<span class="sdot" style="background:${L.dot};color:${L.fg}">${L.icon}</span>`}
           <span class="sleft"><span class="sline"><span class="stitle">${title}</span>
           <span class="smeta">${isEmptyShot(s) ? `${(Number(s.seconds) || 0).toFixed(2)}s · <span class="hold-tag" title="No prompt: it holds its time on the film and never renders. Moving the Shot next to it makes it longer or shorter.">holds time</span>`
-            : `${esc(s.seconds)}s · seed ${esc(seed)}`}${songSpanHTML(s)}${editTag(s)}${phraseTag(s)}${alignedTag(s)}${sizeTag(s)}</span></span>
+            : `${esc(s.seconds)}s · seed ${esc(seed)}`}${songSpanHTML(s)}${editTag(s)}${overlapTag(s)}${phraseTag(s)}${alignedTag(s)}${sizeTag(s)}</span></span>
           <span class="sprev">${esc(s.text) || '<i class="muted">empty</i>'}</span></span>
           <span class="snotes">${flag}${cut}${standaloneTag}${ctxFlag}
           <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span></span>
@@ -5136,8 +5561,9 @@ function renderShots() {
           ${!s.bypassed && s.status !== "queued" ? `<button class="ghost sm" data-action="clear-render"${inRender(s) ? " disabled" : ""}
             title="Back to not rendered: keeps the prompt, length and seed. The take stays in Take history.">Clear render</button>` : ""}
           ${s.kind !== "clip" && s.take ? `<button class="ghost sm" data-action="restore-refs"
-            title="${refSetFor(s) ? "Put back the references this take was made with: removed ones are added again, bypassed ones turned on. Others stay as they are."
-              : "This take was made before 0.8.13, so the references it used weren't recorded."}">Restore references</button>` : ""}
+            title="${refSetFor(s) ? (refSetFor(s).style ? "Put the project back the way it was for this take: Cast & Scenes become its references (others bypassed) and Style & Sound its text."
+                : "Put back the references this take was made with (others bypassed). Its Style & Sound text wasn't recorded (made before 0.16.0).")
+              : "This take was made before 0.8.13, so what it was made with wasn't recorded."}">Restore all</button>` : ""}
           <button class="ghost sm" data-action="insert-before" title="Insert a new Shot before this one">⊕ Shot before</button>
           <button class="ghost sm" data-action="insert-after" title="Insert a new Shot after this one">⊕ Shot after</button>
           <button class="ghost sm" data-action="insert-clip-after" title="Insert a video clip after this Shot">⊕ Clip after</button>
@@ -5160,6 +5586,9 @@ function renderShots() {
   first.innerHTML = `${PLUS} Add shot before Shot 1`;
   $("add-first-clip").hidden = !P().shots.length;
   fitAll($("shots"));
+  fitShotList();                                   // 0.16.0: 15 Shots tall, then it scrolls
+  if (S.open && S.open !== fitShotList.opened) revealShotCard(S.open);
+  fitShotList.opened = S.open;
 }
 
 function clipCard(s) {
@@ -5201,8 +5630,11 @@ function renderViewer() {
   scrub.disabled = !TL.entries.length || !has;
   $("ticks").innerHTML = "";
   // the timeline: one block per Shot, its thumbnail, ◀ take ▶ under it
-  $("tl-strip").innerHTML = total ? TL.entries.map((e) => {
-    const sh = shotById(e.id);
+  const strip = $("tl-strip");
+  strip.classList.toggle("two", !!TL.two);
+  tlSetHeight(TLV.h);
+  strip.innerHTML = total ? (TL.blocks || []).map((bl) => {
+    const e = bl.e, sh = shotById(bl.id);
     if (!sh) return "";
     const off = takesLocked(sh);
     const st = sh.kind === "clip" ? "clip" : sh.status;
@@ -5213,12 +5645,17 @@ function renderViewer() {
         <span>${i + 1}/${list.length}</span>
         <button class="tl-arrow" data-action="tl-take" data-dir="1"${i < 0 || i >= list.length - 1 || off ? " disabled" : ""} aria-label="Next take of ${esc(titleOf(sh))}">▶</button></div>` : "";
     const why = !e.rendered ? "not rendered yet" : e.noclip ? "its clip is being made" : st;
-    return `<div class="tl-block st-${st}${S.focus === e.id ? " focus" : ""}${e.src ? "" : " gap"}" data-tl="${esc(e.id)}"
-        style="left:${(e.start / total) * 100}%;width:${(e.dur / total) * 100}%">
-      <button class="tl-pick" data-action="tl-pick" title="${esc(titleOf(sh))} · ${esc(why)} · click to go there"
+    const movable = !dragBlocked(sh);
+    const pct = (x) => (bl.dur > 0 ? Math.max(0, Math.min(100, (x / bl.dur) * 100)) : 0);
+    const hide = (bl.hl ? `<span class="tl-hide l" style="width:${pct(bl.hl)}%" aria-hidden="true"></span>` : "") +
+      (bl.hr ? `<span class="tl-hide r" style="width:${pct(bl.hr)}%" aria-hidden="true"></span>` : "");
+    return `<div class="tl-block st-${st}${S.focus === e.id ? " focus" : ""}${e.src ? "" : " gap"}${bl.track ? " t1" : ""}${movable ? " movable" : ""}" data-tl="${esc(e.id)}"
+        style="left:${(bl.start / total) * 100}%;width:${(bl.dur / total) * 100}%">
+      <button class="tl-pick" data-action="tl-pick" title="${esc(titleOf(sh))} · ${esc(why)}${movable ? " · drag to move it between its neighbours" : ""} · click to go there"
         ${e.thumb ? `style="background-image:url('${esc(e.thumb)}')"` : ""}><span class="tl-num">${sh.kind === "clip" ? "▶" : "S"}${numOf(sh.id)}${isAligned(sh) ? ' <span class="tl-aligned" title="Aligned">✓</span>' : ""}</span></button>
-      ${nav}${trimHandles(sh)}</div>`;
-  }).join("") : "";
+      ${hide}${nav}${trimHandles(sh)}</div>`;
+  }).join("") + (TL.cuts || []).map((c) => `<div class="tl-cut" data-cut="${esc(c.id)}" style="left:${(c.at / total) * 100}%"
+      title="Edit point: the film switches from ${esc(titleOf(shotById(c.prev)))} to ${esc(titleOf(shotById(c.id)))} here. Drag it anywhere in the overlap (nothing re-renders)."></div>`).join("") : "";
   const approx = !TL.exact && TL.entries.some((e) => e.rendered);
   $("tl-approx").hidden = !approx;
   const off = busyHere();
@@ -5885,7 +6322,12 @@ function renderAudio() {
   $("audio-chev").textContent = S.audioOpen ? "Hide ▴" : "Show ▾";
   $("audio").hidden = !S.audioOpen;
   if (!S.audioOpen) { stopPreview(); return; }
-  $("audio").innerHTML = `<div class="note-ref2v" role="note"><b>Lip sync:</b> the ref2va model finds where the singing starts by itself. With fl2va, start each singing Shot on a sung word: it sings from the Shot's first frame. Phrase markers and “Start on the next phrase” help with that; “Align to song” lines up a take afterwards.</div>
+  $("audio").innerHTML = `<div class="audio-routes" style="display:flex;flex-direction:column;gap:2px;margin-bottom:12px">
+      ${ROUTES.map(([k, t, r, badge]) => `<div class="route">${switchHTML(a[k], `data-action="audio-route" data-key="${k}" aria-label="${esc(t)}"`)}
+        <span class="route-text"><b>${esc(t)}</b><i>${esc(r)}</i></span><span class="badge">${badge}</span></div>`).join("")}
+      ${a.song_ref ? `<div class="muted small" style="margin-top:4px">The Studio adds “audio reuse” to the summary and this retention line: <span class="mono">&lt;Audio 1&gt; (the song): fully_copy</span>. Each Shot's card shows ♪ where it sits in the song.</div>` : ""}
+    </div>
+    <div class="note-ref2v" role="note"><b>Lip sync:</b> the ref2va model finds where the singing starts by itself. With fl2va, start each singing Shot on a sung word: it sings from the Shot's first frame. Phrase markers and “Start on the next phrase” help with that; “Align to song” lines up a take afterwards.</div>
     <div style="margin-top:12px">
       <div class="lbl">Audio file <span class="muted small">· drop a song anywhere on this panel</span>
         <div class="pick"><select class="field" data-relink="audio" aria-label="Audio file">${inputOptions("audio", a.subfolder, a.file, "No audio")}</select>
@@ -5903,9 +6345,6 @@ function renderAudio() {
       ${scrubHTML(a)}
       ${phraseHTML(a)}
       <div style="display:flex;flex-direction:column;gap:2px;margin-top:14px">
-      ${ROUTES.map(([k, t, r, badge]) => `<div class="route">${switchHTML(a[k], `data-action="audio-route" data-key="${k}" aria-label="${esc(t)}"`)}
-        <span class="route-text"><b>${esc(t)}</b><i>${esc(r)}</i></span><span class="badge">${badge}</span></div>`).join("")}
-      ${a.song_ref ? `<div class="muted small" style="margin-top:4px">The Studio adds “audio reuse” to the summary and this retention line: <span class="mono">&lt;Audio 1&gt; (the song): fully_copy</span>. Each Shot's card shows ♪ where it sits in the song.</div>` : ""}
       <div class="shot-opts" style="margin-top:10px">
         <label class="lbl-row" title="H3 sings a little late? Each Shot's song slice starts this many frames later in the song, so the singing lands on time. Negative: earlier. For Shots rendered from now on.">Sync nudge <input class="field" type="number" step="1" min="-240" max="240" data-audio="sync_nudge" value="${esc(Number(a.sync_nudge) || 0)}" style="width:72px"> frames</label>
       </div>
@@ -6970,6 +7409,8 @@ document.addEventListener("click", async (e) => {
     case "viewer-fold": setViewerHidden(!VIEW.hidden); break;
     case "viewer-show": setViewerHidden(false); break;
     case "restore-refs": restoreRefs(shotOf(el)); break;
+    case "clear-overlap": clearOverlap(shotOf(el)); break;
+    case "reset-cut": { const sh = shotOf(el); if (sh) { sh.ov_cut = null; commit(); } break; }
     case "reset-edit": {
       const sh = shotOf(el);
       if (!sh) break;
@@ -7162,7 +7603,7 @@ document.addEventListener("click", async (e) => {
     case "clear-all": clearAll(); break;
     case "open-folder": openFolder(el.dataset.which); break;
     case "export-approved": exportApproved(); break;
-    case "queue-pause": case "queue-clear": case "queue-open": case "queue-stop": case "queue-retry":
+    case "queue-pause": case "queue-clear": case "queue-stop-all": case "queue-open": case "queue-stop": case "queue-retry":
     case "queue-remove": case "queue-up": case "queue-down": case "queue-flip": queueAction(a, el); break;
     case "anchor-pick": { const k = el.closest("[data-anchor]"); if (k) anchorPick(k.dataset.anchor); break; }
     case "anchor-clear": { const k = el.closest("[data-anchor]"); if (k && !setupGuard()) setAnchor(k.dataset.anchor, null); break; }
@@ -7355,6 +7796,14 @@ document.addEventListener("change", async (e) => {
       else if (k === "shot_seed") { el.value = s.shot_seed < 0 ? "" : s.shot_seed; }
       liveEdit(s);
     }
+    if (k === "seconds" && S.lenBase && S.lenBase.id === s.id) {
+      // 0.17.0: fit it between its neighbours (capped, or starting earlier)
+      const before = s.seconds, note = fitLength(s, S.lenBase.by);
+      S.lenBase = null;
+      if (s.seconds !== before) { el.value = s.seconds; liveEdit(s); }
+      if (note) toast(note);
+      renderShots();
+    }
     if (changed && !s.bypassed) shotEdited(s, k);
     scheduleSave();
     return;
@@ -7522,6 +7971,8 @@ function shotInput(el) {
   if (k === "text") s.text = el.value;
   else if (k === "seconds") {
     const v = parseFloat(el.value);
+    // 0.17.0: the Shot after it keeps its place (the layout from before the edit is kept)
+    if (!S.lenBase || S.lenBase.id !== s.id) { S.lenBase = { id: s.id, by: JSON.parse(JSON.stringify(LAYOUT.byId)) }; pinNext(s, S.lenBase.by); }
     if (Number.isFinite(v) && v >= 0.1) s.seconds = v; else S.bad[key] = true;
   } else if (k === "shot_seed") {
     const v = el.value.trim().toLowerCase();

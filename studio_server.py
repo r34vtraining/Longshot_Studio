@@ -1375,8 +1375,12 @@ def register(routes=None):
                 notes.append("ffmpeg isn't available: Context Shots render without the frame before.")
                 break
             slug = gb.project_slug(project)
+            try:
+                back = max(0, int(sh.get("context_back") or 0))     # 0.17.0: it starts inside the Shot before
+            except (TypeError, ValueError):
+                back = 0
             info = pj.context_frame(folder_paths.get_output_directory(), folder_paths.get_input_directory(),
-                                    slug, prev, ffmpeg=ffmpeg)
+                                    slug, prev, ffmpeg=ffmpeg, back=back)
             if info:
                 sh["context_image"] = info
             elif not dry_run:

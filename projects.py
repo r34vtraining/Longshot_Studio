@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.15.5"
+STUDIO_VERSION = "0.17.0"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -401,11 +401,14 @@ CONTEXT_DIR = "context"
 _TAKE_FILE_RE = re.compile(r"[A-Za-z0-9_-]{1,160}\.safetensors")
 
 
-def context_frame(output_dir, input_dir, slug, prev, ffmpeg="ffmpeg", run=None):
+def context_frame(output_dir, input_dir, slug, prev, ffmpeg="ffmpeg", run=None, back=0):
     """Context Continuity: the last frame of the Shot before (its take's clip,
     or a Clip Shot's video at its trim) as a PNG in the project's input folder,
     made once per take. Returns {file, subfolder} or None when there's nothing
-    to take it from yet (no take, or no clip for it)."""
+    to take it from yet (no take, or no clip for it).
+
+    0.17.0: back > 0 (frames): the Shot starts that many frames before the Shot before
+    ends (they overlap), so the frame is the one right before its start instead."""
     import subprocess
     run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, timeout=120))
     if not is_slug(slug) or not isinstance(prev, dict):
@@ -421,7 +424,7 @@ def context_frame(output_dir, input_dir, slug, prev, ffmpeg="ffmpeg", run=None):
             return None
         if not c.get("file") or not os.path.isfile(src):
             return None
-        end = (float(c.get("trim_in") or 0) + float(c.get("frames") or 0) / 24.0) - 1.0 / 24.0
+        end = (float(c.get("trim_in") or 0) + float(c.get("frames") or 0) / 24.0) - (1.0 + back) / 24.0
         key = "clip_" + hashlib.sha256(f"{c.get('file')}|{c.get('sha256')}|{end:.4f}".encode()).hexdigest()[:16]
         cmd_in = ["-ss", f"{max(0.0, end):.4f}", "-i", src, "-frames:v", "1"]
     else:
@@ -432,8 +435,11 @@ def context_frame(output_dir, input_dir, slug, prev, ffmpeg="ffmpeg", run=None):
         src = os.path.join(clips_folder(output_dir, slug), key + ".mp4")
         if not os.path.isfile(src):
             return None
-        cmd_in = ["-sseof", "-1", "-i", src, "-update", "1"]
-    name = f"{key}_last.png"
+        if back:
+            cmd_in = ["-sseof", f"-{(back + 1) / 24.0 + 0.0005:.4f}", "-i", src, "-frames:v", "1"]
+        else:
+            cmd_in = ["-sseof", "-1", "-i", src, "-update", "1"]
+    name = f"{key}_last.png" if not back or prev.get("kind") == "clip" else f"{key}_b{back}.png"
     dest = os.path.join(folder, name)
     if not os.path.isfile(dest) or os.path.getmtime(dest) < os.path.getmtime(src):
         os.makedirs(folder, exist_ok=True)

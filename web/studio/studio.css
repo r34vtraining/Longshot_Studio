@@ -724,7 +724,7 @@ textarea.fit { resize: none; overflow: hidden; line-height: 1.5; }
 #shots-panel.flipped { display: flex; flex-direction: column; }
 #shots-panel.flipped > .panel-head { order: 0; }
 #shots-panel.flipped > #add-shot { order: 1; margin-bottom: 8px; }
-#shots-panel.flipped > #shots { order: 2; }
+#shots-panel.flipped > .shot-scroll { order: 2; }
 #shots-panel.flipped > .first-row { order: 3; margin-top: 8px; }
 #shots-panel.flipped .first-row .addtile.wide, #shots-panel.flipped .first-row .clip-tile { margin-bottom: 0; }
 #shots-panel.flipped .shot-list { flex-direction: column-reverse; }
@@ -1015,3 +1015,30 @@ body.trimming, body.trimming * { cursor: ew-resize !important; user-select: none
   row-gap: 4px; padding-left: 4px; }
 .shot-tools > * { flex: none; white-space: nowrap; }
 @media (max-width: 640px) { .sleft > .sprev { display: none; } }
+
+/* 0.16.0: the Shot list stops at 15 Shots tall and scrolls (its height is set from the rows) */
+.shot-scroll { position: relative; }
+.shot-scroll.scrolls { overflow-y: auto; overscroll-behavior: contain; padding-right: 4px; scrollbar-gutter: stable;
+  border-bottom: 1px solid var(--line); }
+#shots-panel.folded .shot-scroll { display: none; }
+
+/* 0.16.0: the folded Preview's line: the bar takes what's left after the text, never more */
+.viewer-head .viewer-mini .vm-text { flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.viewer-head .viewer-mini .vm-bar { order: 0; flex: 1 1 60px; min-width: 40px; max-width: 100%; }
+
+/* 0.17.0: two tracks. A Shot that starts inside the one before sits on the other track;
+   the top track is what the film shows, up to the edit point. */
+.tl-strip.two { background: linear-gradient(to bottom, transparent calc(50% - 1px), var(--line) calc(50% - 1px), var(--line) calc(50% + 1px), transparent calc(50% + 1px)); }
+.tl-strip.two .tl-block { bottom: auto; height: calc(50% - 2px); }
+.tl-strip.two .tl-block.t1 { top: calc(50% + 2px); }
+.tl-hide { position: absolute; top: 0; bottom: 0; z-index: 2; pointer-events: none;
+  background: repeating-linear-gradient(135deg, rgba(8, 9, 10, .62) 0 5px, rgba(8, 9, 10, .38) 5px 10px); box-shadow: inset 0 0 0 1px rgba(185, 163, 240, .35); }
+.tl-hide.l { left: 1px; border-radius: 5px 0 0 5px; }
+.tl-hide.r { right: 1px; border-radius: 0 5px 5px 0; }
+.tl-cut { position: absolute; top: -3px; bottom: -3px; width: 11px; margin-left: -5px; z-index: 6; cursor: ew-resize; touch-action: none; }
+.tl-cut::before { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 3px; border-radius: 2px; background: var(--amber); box-shadow: 0 0 0 1px rgba(0, 0, 0, .55); }
+.tl-cut::after { content: ""; position: absolute; left: 1px; top: -1px; border: 4.5px solid transparent; border-top: 6px solid var(--amber); }
+.tl-cut:hover::before { background: var(--amber-lt); }
+.tl-block.movable .tl-pick { cursor: grab; }
+body.moving-block, body.moving-block * { cursor: grabbing !important; user-select: none; }
+.ov-tag { color: #B9A3F0; }

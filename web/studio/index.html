@@ -108,7 +108,7 @@
         <button class="addtile wide first" data-action="add-first" id="add-first" hidden></button>
         <button class="addtile first clip-tile" data-action="add-first-clip" id="add-first-clip" hidden title="Put a video clip before Shot 1">＋ Clip before Shot 1</button>
       </div>
-      <div id="shots" class="shot-list"></div>
+      <div id="shot-scroll" class="shot-scroll"><div id="shots" class="shot-list"></div></div>
       <button class="addtile wide" data-action="add-shot" id="add-shot"></button>
     </div>
   </section>
@@ -141,7 +141,7 @@
       </div>
       <div class="vcontrols" id="vcontrols">
       <div class="scrub" id="scrub-wrap">
-        <div id="tl-view" class="tl-view" title="Scroll: move along · Alt + scroll: zoom · Ctrl + scroll: taller / shorter · drag: move · double-click a Shot: its prompt · double-click the ruler: whole film">
+        <div id="tl-view" class="tl-view" title="Scroll: move along · Alt + scroll: zoom · Ctrl + scroll: taller / shorter · drag: move · double-click a Shot: its prompt · double-click the ruler: whole film · drag a Shot not rendered yet to move it between its neighbours · drag an edit point (in an overlap) to choose where the film switches">
           <div id="tl-canvas" class="tl-canvas">
             <div id="tl-ruler" class="tl-ruler" aria-hidden="true"></div>
             <div id="loop-band" class="loop-band" hidden></div>
@@ -254,6 +254,7 @@
           <button class="ghost sm" data-action="queue-flip" id="queue-flip" aria-pressed="false" aria-label="Latest on top" title="Oldest on top · click for latest on top">⇅</button>
           <button class="ghost sm" data-action="queue-pause" id="queue-pause" title="Finish the job that's running, then hold the rest">Pause</button>
           <button class="ghost sm" data-action="queue-clear" id="queue-clear" title="Remove finished, failed and stopped jobs from the list">Clear finished</button>
+          <button class="ghost sm" data-action="queue-stop-all" id="queue-stop-all" title="Stop the job that's running and every job still waiting (they stay in the list, stopped, to retry)">Stop all</button>
         </span>
       </div>
       <div id="queue" class="queue" aria-live="polite"></div>
