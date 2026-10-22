@@ -8,7 +8,8 @@ ComfyUI at `/longshot`. Build a film from short Shots, review and approve each o
 Studio stitches them into one continuous take or a cut sequence. Approved work is never
 thrown away.
 
-<img width="1825" height="1440" alt="image" src="https://github.com/user-attachments/assets/3c704cf0-6d8d-466b-aef8-cd5fea30d6d5" />
+<img width="1928" height="1346" alt="image" src="https://github.com/user-attachments/assets/fc58d530-ae3e-4081-a58b-d91bacfd1989" />
+
 
 ## Features
 
@@ -35,7 +36,7 @@ thrown away.
 - Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
 
-## What's new in 0.15.5
+## What's new in 0.17.0
 
 **Several Studio tabs at once**, each on its own project.
 
@@ -46,7 +47,8 @@ thrown away.
 5. The queue panel also lists what the other tabs have queued (greyed). If a tab closes with jobs still waiting, another Studio tab picks them up.
 6. Lip Sync function works now.  See Audio tab for audio control for lip syncing.
 7. Face Refine Added, refine selected clip then export them as approved clips.  
-
+8. Stackable timelines for overlapping clips with handles for easier editing.
+   
 ## Requirements
 
 - ComfyUI with native MiniMax H3 support, and the MiniMax H3 model files.
