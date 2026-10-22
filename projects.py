@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.15.4"
+STUDIO_VERSION = "0.15.5"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -777,8 +777,9 @@ def join_chunks(output_dir, slug, prefix, chunks, audio=None, masters=None, ffmp
         cmd = [ffmpeg, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listing]
         if wav:
             # the sound is padded with silence and cut at the picture's end: every frame stays
-            cmd += ["-i", wav, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-af", "apad", "-c:a", *audio_codec,
-                    "-shortest"]
+            secs = [_media_seconds(ffmpeg, f, run) for f in files]
+            total = sum(secs) if secs and all(secs) else None
+            cmd += ["-i", wav, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", *_pad_to(total), "-c:a", *audio_codec]
         else:
             cmd += ["-map", "0:v:0", "-c", "copy"]
         cmd += [*extra, tmp]
@@ -942,7 +943,7 @@ def _remix_sound(folder, name, key, it, output_dir, slug, ffmpeg, song_path, run
             continue
         tmp = dest + ".remix" + ext
         cmd = [ffmpeg, "-y", "-v", "error", "-i", dest, *src, "-map", "0:v:0", "-map", "1:a:0?",
-               "-c:v", "copy", "-af", "apad", "-shortest", "-c:a", *acodec]
+               "-c:v", "copy", *_pad_to(_media_seconds(ffmpeg, dest, run)), "-c:a", *acodec]
         if ext == ".mp4":
             cmd += ["-movflags", "+faststart"]
         res = run(cmd + [tmp])
@@ -955,6 +956,26 @@ def _remix_sound(folder, name, key, it, output_dir, slug, ffmpeg, song_path, run
             raise RuntimeError(f"Mixing the sound of {name[:-4]}{ext} failed: " +
                                (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))[-400:])
         os.replace(tmp, dest)
+
+
+def _media_seconds(ffmpeg, path, run):
+    """A video's length in seconds from ffmpeg's report, or None."""
+    try:
+        res = run([ffmpeg, "-hide_banner", "-i", path])
+    except Exception:
+        return None
+    err = getattr(res, "stderr", b"") or b""
+    text = err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err)
+    return parse_probe(text).get("duration") or None
+
+
+def _pad_to(seconds):
+    """0.15.5: the sound padded with silence to the picture's length and cut there, as
+    explicit times. "-af apad -shortest" never ends with the picture stream-copied on
+    ffmpeg 7.x (it ran until the 900 s timeout); without a length it falls back to that."""
+    if seconds:
+        return ["-af", f"apad=whole_dur={seconds:.6f}", "-t", f"{seconds:.6f}"]
+    return ["-af", "apad", "-shortest"]
 
 
 def clear_approved(output_dir, slug, keep_work=False):
@@ -1024,8 +1045,9 @@ def copy_approved(output_dir, slug, items, ffmpeg=None, input_dir=None, song=Non
             cmd += ["-ss", f"{max(0.0, float(cut.get('start') or 0)):.6f}", "-t", f"{float(cut['dur']):.6f}"]
         cmd += ["-i", src]
         if sng:
+            length = float(cut["dur"]) if cut else _media_seconds(ffmpeg, src, run)
             cmd += ["-ss", f"{max(0.0, sng[0]):.6f}", "-t", f"{sng[1]:.6f}", "-i", song_path,
-                    "-map", "0:v:0", "-map", "1:a:0", "-af", "apad", "-shortest"]
+                    "-map", "0:v:0", "-map", "1:a:0", *_pad_to(length)]
         else:
             cmd += ["-map", "0:v:0", "-map", "0:a?"]
         cmd += (["-c:v", "libx264", "-crf", "16", "-preset", "medium", "-pix_fmt", "yuv420p"] if cut else ["-c:v", "copy"])
@@ -1086,8 +1108,9 @@ def mux_approved(output_dir, slug, items, ffmpeg="ffmpeg", run=None, sig=None):
                 continue
             dest = os.path.join(folder, name + ext)
             cmd = [ffmpeg, "-y", "-v", "error", "-i", src]
-            cmd += (["-i", wav, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-af", "apad", "-c:a", *acodec,
-                     "-shortest"] if wav else ["-map", "0:v:0", "-c", "copy"])
+            cmd += (["-i", wav, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                     *_pad_to(_media_seconds(ffmpeg, src, run)), "-c:a", *acodec]
+                    if wav else ["-map", "0:v:0", "-c", "copy"])
             res = run(cmd + extra + [dest])
             if getattr(res, "returncode", 1) != 0 or not os.path.isfile(dest):
                 err = getattr(res, "stderr", b"") or b""
