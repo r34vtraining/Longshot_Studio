@@ -161,6 +161,28 @@ def render_windows(chain, overlap, planner):
     return {str(sh.get("id")): seg.window_frames for sh, seg in zip(chain, plan.segments)}
 
 
+def render_spans(chain, overlap, planner, with_start=False):
+    """{id: (first, end)}: the frames of the stitched render each Shot shows (0.14.0 face
+    refine leaves some alone). Long Shot stitches every piece of a render the same way:
+    each after the first hides its first `overlap` frames under the one before."""
+    specs = []
+    for sh in chain:
+        w = None
+        if sh.get("kind") == "clip":
+            w = planned_window(sh)
+        elif sh.get("lock"):
+            w = sh.get("window") or sh.get("frames")
+        elif sh.get("frames"):
+            w = sh.get("frames")
+        w = int(w) if isinstance(w, (int, float)) and planner.is_valid_frame_count(int(w)) else None
+        specs.append(planner.PieceSpec(shot_seconds(sh), w, (bool(sh.get("lock")) or sh.get("kind") == "clip")
+                                       and w is not None))
+    plan = planner.plan_pieces(specs, int(overlap))
+    return {str(sh.get("id")): ((seg.window_start if seg.index == 1 else seg.visible_start, seg.window_end)
+                                + ((seg.window_start,) if with_start else ()))
+            for sh, seg in zip(chain, plan.segments)}
+
+
 def film_shots(project):
     """The Shots on the film: active ones, plus those a render leaves out (they keep
     their time)."""

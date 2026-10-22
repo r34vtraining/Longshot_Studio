@@ -75,6 +75,8 @@ PACKS = {
     "MiniMaxH3RefModsLoader": "ComfyUI-MiniMaxH3Mod",
     "MelBandRoFormerSampler": "ComfyUI-MelBandRoFormer",
     "RTXVideoSuperResolution": "ComfyUI-NVIDIA-RTX-VSR-Pro (RTX Video Super Resolution)",
+    "MiniMaxH3FaceRefine": "H3 Long Shot 1.8.0+ (github.com/r34vtraining/H3_Longshot)",
+    "MiniMaxH3PasteFaces": "H3 Long Shot 1.8.1+ (github.com/r34vtraining/H3_Longshot)",
 }
 VSR_QUALITIES = ["LOW", "MEDIUM", "HIGH", "ULTRA"]
 
@@ -635,8 +637,10 @@ def build_clip_export(project: dict, items: list, env: Env | None = None) -> Bui
     # kept and reused), and the export is made from the refined takes, upscaled or not
     rc = refine_settings(project, env)
     upscale = bool(s.get("export_upscale")) or rc is None
+    faced = any((it or {}).get("face_clip") for it in items or [])
     need = ["MiniMaxH3Take", "VAELoader", "VAEDecode", "VAEDecodeAudio", "MiniMaxH3UpscaleChunk",
-            "MiniMaxH3SaveAudio"] + (["RTXVideoSuperResolution"] if upscale else [])
+            "MiniMaxH3SaveAudio"] + (["RTXVideoSuperResolution"] if upscale else []) + \
+        (["MiniMaxH3LoadVideo"] if faced else [])
     missing = [c for c in need if not env.has(c)]
     if missing:
         raise BuildError("ComfyUI is missing node(s) this needs:\n  " +
@@ -672,7 +676,18 @@ def build_clip_export(project: dict, items: list, env: Env | None = None) -> Bui
             raise BuildError(f"Not a take: {take!r}")
         lat = g.add(f"take{n}", "MiniMaxH3Take", f"Take {take}", cache_name=project_slug(project),
                     take=take, shot_id="", **refine_in)
-        images = g.add(f"dec{n}", "VAEDecode", "VAE Decode", samples=lat, vae=vae)
+        fclip = str((it or {}).get("face_clip") or "")
+        if fclip:
+            # 0.15.0: a Shot set to Refined exports its approved face-refined clip, as it was made
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", fclip):
+                raise BuildError(f"Not a clip: {fclip!r}")
+            images = g.add(f"facevid{n}", "MiniMaxH3LoadVideo", f"Refined clip {n}",
+                           video=f"{clips_subfolder(project)}/{fclip}.mp4 [output]", skip_first_frames=0,
+                           # the take's own frames (some ffmpeg builds add a few at the end)
+                           frame_load_cap=int(_num((it or {}).get("frames", 0) or 0, "Frames", 0, 1e6)),
+                           width=0, height=0, force_rate=float(FPS))
+        else:
+            images = g.add(f"dec{n}", "VAEDecode", "VAE Decode", samples=lat, vae=vae)
         # 0.9.0: the Shot's trims (frames off its take's start / end); a song slice is already cut to them
         start = int(_num((it or {}).get("trim_in", 0) or 0, "Trim", 0, 1e6))
         length = int(_num((it or {}).get("length", 0) or 0, "Length", 0, 1e7)) or 10_000_000
@@ -784,6 +799,225 @@ def _refine_nodes(g, project, r, env, sage):
     sigmas = g.add("refine_scheduler", "BasicScheduler", "BasicScheduler (refine)", model=model,
                    scheduler=r["scheduler"], steps=r["steps"], denoise=r["denoise"])
     return model, sigmas
+
+
+# ---------------------------------------------------------------------------
+# Face refine (0.14.0, Long Shot 1.8.0): small faces redrawn by H3 as close-ups
+# ---------------------------------------------------------------------------
+
+FACE_DEFAULTS = {"on": False, "model": None, "steps": 10, "denoise": 0.3, "shift_video": 4.0,
+                 "turbo": {"on": False, "lora": None, "strength": 1.0},
+                 "max_face": 150, "which": "all", "work": 640, "padding": 0.8, "follow": "auto",
+                 "mask": 1.0, "feather": 0.3, "color": 1.0, "hold_audio": True, "seed": 0,
+                 "describe": "", "cast": None}
+FACE_FOLLOW = ("auto", "fixed", "follow")
+FACE_WHICH = ("all", "largest")
+FACE_CLIP_SUFFIX = "__face"
+
+
+def face_prompt(with_ref=False, label="the person", describe=""):
+    """The close-up's prompt (the same as Long Shot's face_prompt): a face filling the
+    frame that keeps its expression and mouth movement. with_ref: ref2va's sections,
+    with <Picture 1> as the face's identity."""
+    who = (describe or "").strip().rstrip(".")
+    look = f" {who[0].upper() + who[1:]}." if who else ""
+    action = ("The face keeps exactly the same expression, head movement, eye movement and mouth "
+              "movement as before, in time with the sound. Sharp natural detail in the eyes, eyelashes, "
+              "skin texture, lips and teeth. The camera is static.")
+    sound = "overall_soundscape: The person's own voice and the room around them, unchanged.\nnon_diegetic_music: N/A"
+    if not with_ref:
+        return ("integrated_multimodal_description: [Shot 1] Cinematic, live-action, realistic. "
+                f"An extreme close-up of a person's face filling most of the frame.{look} {action}\n" + sound)
+    name = (label or "").strip() or "the person"
+    return (f"subject_definitions: <Subject 1> is {name}, whose face and appearance come from <Picture 1>.\n"
+            "summary: [reference generation] An extreme close-up of <Subject 1>'s face.\n"
+            "retention_analysis: <Subject 1> (appears in [Shot 1]): fully_preserved - face, identity, "
+            "hairstyle and skin tone.\n"
+            "detailed_description: Cinematic, live-action, realistic. [Shot 1] An extreme close-up of "
+            f"<Subject 1>'s face filling most of the frame.{look} {action}\n" + sound)
+
+
+def face_identity(project: dict, f: dict):
+    """The Cast member whose picture is the face's identity (ref2va only), or None."""
+    cid = f.get("cast")
+    if not cid or "fl2v" in str(f.get("model") or "").lower():
+        return None
+    for c in project.get("cast") or []:
+        if isinstance(c, dict) and str(c.get("id")) == str(cid) and c.get("image") and not c.get("bypassed"):
+            return c
+    return None
+
+
+def shot_face_on(shot: dict) -> bool:
+    """0.15.0: the Shot is set to Refined, with a refined clip of the take it uses."""
+    f = shot.get("face")
+    take = shot.get("lock") or shot.get("take")
+    return (isinstance(f, dict) and f.get("keep") == "refined" and bool(take) and f.get("take") == take
+            and bool(TAKE_NAME_RE.fullmatch(str(take))))
+
+
+def face_rows(f: dict) -> list:
+    """The redrawn faces' boxes from a Shot's refine report: one list per face."""
+    treated = {c.get("track") for c in f.get("crops") or []}
+    return [t.get("boxes") or [] for t in f.get("tracks") or [] if t.get("id") in treated and t.get("boxes")]
+
+
+def face_settings(project: dict, env: "Env | None" = None, strict: bool = True):
+    """0.14.0: the Face refine panel's settings when it applies (on, a model chosen, H3 Long
+    Shot 1.8.0 with its Face Refine node), with `key` naming the redraw model and settings,
+    `sig` all of what the result depends on and `text` the prompt; else None."""
+    s = project.get("settings") or {}
+    f = dict(FACE_DEFAULTS, **(s.get("face") or {}))
+    f["turbo"] = dict(FACE_DEFAULTS["turbo"], **(f.get("turbo") or {}))
+    if not f.get("on") or not f.get("model"):
+        return None
+    if env is not None and (not env.longshot_at_least(1, 8, 0) or not env.has("MiniMaxH3FaceRefine")):
+        if strict:
+            raise BuildError("Face refine needs H3 Long Shot 1.8.0 or later. Update it, then restart ComfyUI.")
+        return None
+    f["steps"] = int(_num(f.get("steps", 10), "Face refine steps", 1, 200, int))
+    f["denoise"] = _num(f.get("denoise", 0.3), "Face refine denoise", 0.01, 1.0)
+    f["shift_video"] = _num(f.get("shift_video", 4), "Face refine video shift", 0.01, 100)
+    f["shift_audio"] = _num(s.get("shift_audio", 3), "Audio shift", 0.01, 100)
+    f["max_face"] = int(_num(f.get("max_face", 150), "Face size", 8, 4096, int))
+    f["work"] = int(_num(f.get("work", 640), "Close-up size", 256, 1536, int)) // 32 * 32
+    f["padding"] = _num(f.get("padding", 0.8), "Room around the face", 0.2, 3.0)
+    f["mask"] = _num(f.get("mask", 1.0), "Mask size", 0.5, 2.5)
+    f["feather"] = _num(f.get("feather", 0.3), "Feather", 0.02, 1.0)
+    f["color"] = _num(f.get("color", 1.0), "Colour match", 0.0, 1.0)
+    f["seed"] = max(0, _seed(f.get("seed", 0), "Face refine seed"))
+    if f.get("follow") not in FACE_FOLLOW:
+        f["follow"] = "auto"
+    if f.get("which") not in FACE_WHICH:
+        f["which"] = "all"
+    f["scheduler"] = s.get("scheduler", "beta")
+    f["sampler"] = s.get("sampler", "er_sde")
+    t = f["turbo"]
+    if t.get("on") and not t.get("lora"):
+        raise BuildError("Face refine: Turbo is on but no Turbo LoRA file is chosen.")
+    who = face_identity(project, f)
+    f["identity"] = who
+    f["text"] = face_prompt(with_ref=who is not None, label=(who or {}).get("label") or "the person",
+                            describe=f.get("describe", ""))
+    import hashlib
+    ident = json.dumps([f["model"], f["steps"], round(f["denoise"], 4), round(f["shift_video"], 4),
+                        round(f["shift_audio"], 4), f["scheduler"], f["sampler"], s.get("clip"), s.get("video_vae"),
+                        bool(t.get("on")), t.get("lora") if t.get("on") else None,
+                        round(float(t.get("strength", 1) or 0), 4) if t.get("on") else None,
+                        f["work"], bool(f.get("hold_audio", True))])
+    f["key"] = "x" + hashlib.sha1(ident.encode()).hexdigest()[:12]
+    f["sig"] = hashlib.sha1(json.dumps([f["key"], f["text"], f["seed"], f["max_face"], f["which"],
+                                        round(f["padding"], 3), f["follow"], round(f["mask"], 3),
+                                        round(f["feather"], 3), round(f["color"], 3),
+                                        (who or {}).get("image")]).encode()).hexdigest()[:12]
+    return f
+
+
+def face_sig(project: dict, env: "Env | None" = None):
+    """The current Face refine settings' signature (None when it doesn't apply)."""
+    try:
+        f = face_settings(project, env, strict=False)
+    except BuildError:
+        return None
+    return f["sig"] if f else None
+
+
+def _face_nodes(g, project, f, env):
+    """The redraw model (its own model sampling and Turbo LoRA), sigmas, sampler, noise,
+    CLIP, VAE and the identity picture, added once per graph."""
+    s = project.get("settings") or {}
+    if "face_unet" in g.nodes:
+        return g.face
+    model = g.add("face_unet", "UNETLoader", "Face refine model", unet_name=f["model"],
+                  weight_dtype=s.get("weight_dtype", "default"))
+    sage = s.get("sage_attention", "auto")
+    if sage and sage not in ("disabled", "off", False) and env.has("PathchSageAttentionKJ"):
+        model = g.add("face_sage", "PathchSageAttentionKJ", "Patch Sage Attention KJ (face)",
+                      model=model, sage_attention=sage, allow_compile=False)
+    model = g.add("face_shift", "MiniMaxH3SigmaShift", "ModelSamplingMiniMaxH3 (face)", model=model,
+                  shift_video=f["shift_video"], shift_audio=f["shift_audio"])
+    t = f["turbo"]
+    if t.get("on"):
+        strength = _num(t.get("strength", 1.0), "Face refine Turbo strength", -10, 10)
+        if env.has("MiniMaxH3TurboLoRA"):
+            model = g.add("face_turbo", "MiniMaxH3TurboLoRA", "Turbo LoRA (face)", model=model,
+                          lora_name=t["lora"], strength=strength, low_vram=False)
+        else:
+            model = g.add("face_turbo", "LoraLoaderModelOnly", "Turbo LoRA (face)", model=model,
+                          lora_name=t["lora"], strength_model=strength)
+    clip = ["clip", 0] if "clip" in g.nodes else g.add("clip", "CLIPLoader", "Load CLIP", clip_name=s["clip"],
+                                                       type="minimax", device="default")
+    vae = ["vae_video", 0] if "vae_video" in g.nodes else g.add("vae_video", "VAELoader", "Video VAE",
+                                                                vae_name=s["video_vae"])
+    out = dict(model=model, clip=clip, vae=vae,
+               sigmas=g.add("face_scheduler", "BasicScheduler", "BasicScheduler (face)", model=model,
+                            scheduler=f["scheduler"], steps=f["steps"], denoise=f["denoise"]),
+               sampler=g.add("face_sampler", "KSamplerSelect", "KSamplerSelect (face)", sampler_name=f["sampler"]),
+               noise=g.add("face_noise", "RandomNoise", "RandomNoise (face)", noise_seed=f["seed"]))
+    who = f.get("identity")
+    if who:
+        try:
+            image = pj.input_path_value(who["image"], who.get("subfolder", ""))
+        except ValueError as err:
+            raise BuildError(f"Face refine identity ({who.get('label') or 'Cast'}): {err}") from None
+        out["ref"] = g.add("face_ref", "LoadImage", f"Face identity {who.get('label', '')}".strip(), image=image)
+    g.face = out
+    return out
+
+
+def _face_node(g, nid, project, f, env, images, latent, skip=None, title="Face refine"):
+    """MiniMax H3 Face Refine over `images` (decoded from `latent`)."""
+    m = _face_nodes(g, project, f, env)
+    extra = {"ref_image": m["ref"]} if m.get("ref") else {}
+    if skip:
+        extra["skip"] = json.dumps([[int(a), int(b)] for a, b in skip])
+    return g.add(nid, "MiniMaxH3FaceRefine", title, images=images, latent=latent, model=m["model"],
+                 clip=m["clip"], vae=m["vae"], noise=m["noise"], sampler=m["sampler"], sigmas=m["sigmas"],
+                 text=f["text"], max_face=f["max_face"], which=f["which"], work_size=f["work"],
+                 padding=f["padding"], follow=f["follow"], mask_scale=f["mask"], feather=f["feather"],
+                 color_match=f["color"], hold_audio=bool(f.get("hold_audio", True)), max_window=362,
+                 cache_name=project_slug(project), cache_key=f["key"], detect_every=2, enabled=True, **extra)
+
+
+def build_face_try(project: dict, item: dict, env: Env | None = None) -> Build:
+    """0.14.0, Try on this Shot: one take decoded, its faces refined, saved as its own clip
+    (clips/<take>__face.mp4) next to the take's clip for the A/B viewer. item: {key, take,
+    song_at, song_len}."""
+    env = env or Env()
+    s = project.get("settings") or {}
+    f = face_settings(project, env)
+    if f is None:
+        raise BuildError("Turn Face refine on and choose its model first.")
+    need = ["MiniMaxH3Take", "VAELoader", "VAEDecode", "VAEDecodeAudio", "MiniMaxH3SaveVideo",
+            "MiniMaxH3FaceRefine", "UNETLoader", "MiniMaxH3SigmaShift", "CLIPLoader", "BasicScheduler",
+            "KSamplerSelect", "RandomNoise"]
+    missing = [c for c in need if not env.has(c)]
+    if missing:
+        raise BuildError("ComfyUI is missing node(s) this needs:\n  " +
+                         "\n  ".join(f"{c} — from {PACKS.get(c, 'ComfyUI core')}" for c in missing))
+    for key in ("video_vae", "audio_vae", "clip"):
+        if not s.get(key):
+            raise BuildError(f"Settings: choose a {key.replace('_', ' ')} file.")
+    item = item or {}
+    key, take = str(item.get("key") or ""), str(item.get("take") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,150}", key) or not TAKE_NAME_RE.fullmatch(take):
+        raise BuildError(f"Not a take: {take!r}")
+    warnings = []
+    fmt = _video_format(env, warnings)
+    g = _Graph()
+    vae = g.add("vae_video", "VAELoader", "Video VAE", vae_name=s["video_vae"])
+    avae = g.add("vae_audio", "VAELoader", "Audio VAE", vae_name=s["audio_vae"])
+    lat = g.add("take", "MiniMaxH3Take", f"Take {take}", cache_name=project_slug(project), take=take, shot_id="")
+    images = g.add("dec", "VAEDecode", "VAE Decode", samples=lat, vae=vae)
+    face = _face_node(g, "face", project, f, env, images, lat)
+    songs = _song_slices(g, project, [item])
+    audio = songs.get(1) or g.add("aud", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
+    name = key + FACE_CLIP_SUFFIX
+    save = _clip_save(g, 1, project, _out(face, 0), audio, fmt, name)[0]
+    g.drop_unused("vae_audio")
+    return Build(prompt=g.nodes, width=0, height=0, chain=[], nodes={"face": "face", "clips": {name: save},
+                                                                    "sig": f["sig"]},
+                 filename_prefix=clips_subfolder(project), video_format=fmt, warnings=warnings)
 
 
 def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
@@ -1296,6 +1530,31 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
     if upscale_final and s.get("clip_pixels") and any(sh.get("kind") == "clip" for sh in chain):
         images = g.add("clip_pixels", "MiniMaxH3ClipPixels", "Original clip pixels",
                        images=images, latent=long_shot, enabled=True)
+    faced = [sh for sh in chain if shot_face_on(sh)] if upscale_final else []
+    if faced:
+        # 0.15.0: each Shot set to Refined gets its approved face-refined faces back, over its
+        # own frames of the film (only around the faces; nothing is redrawn here)
+        if not env.has("MiniMaxH3PasteFaces"):
+            raise BuildError("Refined faces in the final video need H3 Long Shot 1.8.1 or later. Update it, "
+                             "then restart ComfyUI (or set those Shots to Original).")
+        if env.planner is None:
+            warnings.append("Couldn't place the refined faces (H3 Long Shot's planner isn't loaded): the final "
+                            "video has the original faces.")
+        else:
+            spans = film.render_spans(chain, overlap, env.planner, with_start=True)
+            rows = []
+            for sh in faced:
+                sp = spans.get(str(sh.get("id")))
+                fc = sh["face"]
+                if not sp:
+                    continue
+                first, end, ws = sp
+                rows.append({"file": f"{clips_subfolder(project)}/{str(fc['take'])[:-len('.safetensors')]}{FACE_CLIP_SUFFIX}.mp4",
+                             "at": first, "from": first - ws, "frames": end - first,
+                             "w": int(fc.get("w") or 0), "h": int(fc.get("h") or 0), "faces": face_rows(fc)})
+            if rows:
+                images = g.add("faces", "MiniMaxH3PasteFaces", "Refined faces", images=images, items=json.dumps(rows))
+                ids["faces"] = "faces"
     vsr = s.get("rtx_vsr") or {}
     upscales = bool(vsr.get("on") or upscale_final)
     if upscales:

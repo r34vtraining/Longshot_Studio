@@ -19,6 +19,8 @@
     POST /longshot/open-folder     {"which": "output"|"input", "select", "project", "subfolder"} (loopback only)
     POST /longshot/install-pack    {pack}: clone an optional pack (loopback only)
     POST /longshot/install-preview the taeh3 live-preview decoder (loopback only)
+    POST /longshot/install-face-detector  the MTCNN face detector for Face refine (loopback only)
+    POST /longshot/faces/<slug>    {keys: [clip key]}: face sizes in those takes' clips (CPU)
     POST /longshot/live-preview    {client_id, method}: the tab's live-preview switch
     POST /longshot/layout          {overlap, pieces}: every Shot's place on the film (frames)
     POST /longshot/keep-awake      {on}: keep the machine awake while the queue has work
@@ -644,6 +646,7 @@ def options_payload():
         "optional_packs": {k: {"folder": f, "url": u} for k, (f, u) in OPTIONAL_PACKS.items()},
         "comfy": comfy_status(),
         "preview_decoder": preview_decoder_installed(names("vae_approx")),
+        "face_detector": face_detector_installed(),
         "live_switch": live_switch_supported(),
     }
 
@@ -934,6 +937,149 @@ def install_preview_decoder(folder, fetch=None, spec=None):
     return {"path": dest, "downloaded": True}
 
 
+# ---------------------------------------------------------------------------
+# Face refine (0.14.0): the face detector (MTCNN, MIT, from the facenet-pytorch
+# wheel on PyPI: three small weight files) and a quick look at the faces in a take
+# ---------------------------------------------------------------------------
+
+FACE_DETECTOR = {
+    "url": "https://files.pythonhosted.org/packages/ed/2e/2d56386bc2f834cdc683743903852cf1428b4e5ee119f16cf808b589d3cd/"
+           "facenet_pytorch-2.6.0-py3-none-any.whl",
+    "page": "https://pypi.org/project/facenet-pytorch/2.6.0/",
+    "size": 1881930,
+    "sha256": "ecb82b27beb226d106f2219efe8f829b01b87a8595badd01545679bdb9f19cca",
+    "files": {
+        "facenet_pytorch/data/pnet.pt": ("pnet.pt", "a2a71925e0b9996a42f63e47efc1ca19043e69558b5c523b978d611dfae49c8f"),
+        "facenet_pytorch/data/rnet.pt": ("rnet.pt", "bbb937de72efc9ef83b186c49f5f558467a1d7e3453a8ece0d71a886633f6a86"),
+        "facenet_pytorch/data/onet.pt": ("onet.pt", "165bfbe42940416ccfb977545cf0e976d5bf321f67083ae2aaaa5c764280118d"),
+    },
+}
+FACE_FILES = ("pnet.pt", "rnet.pt", "onet.pt")
+
+
+def face_detector_folder():
+    """models/facedetect/mtcnn (a facedetect folder from extra_model_paths.yaml counts too)."""
+    import folder_paths
+    if "facedetect" not in folder_paths.folder_names_and_paths:
+        folder_paths.folder_names_and_paths["facedetect"] = (
+            [os.path.join(folder_paths.models_dir, "facedetect")], set())
+    roots = folder_paths.get_folder_paths("facedetect") or [os.path.join(folder_paths.models_dir, "facedetect")]
+    for r in roots:
+        d = os.path.join(r, "mtcnn")
+        if all(os.path.isfile(os.path.join(d, f)) for f in FACE_FILES):
+            return d
+    return os.path.join(roots[0], "mtcnn")
+
+
+def face_detector_installed():
+    try:
+        d = face_detector_folder()
+    except Exception:
+        return False
+    return all(os.path.isfile(os.path.join(d, f)) for f in FACE_FILES)
+
+
+def _sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def install_face_detector(folder, fetch=None, spec=None):
+    """Download the facenet-pytorch wheel and keep its three MTCNN weight files in
+    `folder`, each checked against its SHA-256 (nothing else from the wheel is kept or
+    run). Returns {path, downloaded}."""
+    import hashlib
+    import zipfile
+    spec = spec or FACE_DETECTOR
+    os.makedirs(folder, exist_ok=True)
+    if all(os.path.isfile(os.path.join(folder, name)) and _sha256(os.path.join(folder, name)) == sha
+           for name, sha in spec["files"].values()):
+        return {"path": folder, "downloaded": False}
+    tmp = os.path.join(folder, ".facenet.whl.part")
+    try:
+        (fetch or _download)(spec["url"], tmp)
+        if os.path.getsize(tmp) != spec["size"] or _sha256(tmp) != spec["sha256"]:
+            raise RuntimeError("The download didn't match the expected file. Get facenet_pytorch-2.6.0's wheel "
+                               f"from {spec['page']} and copy pnet.pt, rnet.pt and onet.pt from its "
+                               f"facenet_pytorch/data folder into {folder}.")
+        with zipfile.ZipFile(tmp) as z:
+            for member, (name, sha) in spec["files"].items():
+                data = z.read(member)
+                if hashlib.sha256(data).hexdigest() != sha:
+                    raise RuntimeError(f"{name} in the download isn't the expected file.")
+                part = os.path.join(folder, name + ".part")
+                with open(part, "wb") as fh:
+                    fh.write(data)
+                os.replace(part, os.path.join(folder, name))
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return {"path": folder, "downloaded": True}
+
+
+def faces_module():
+    """Long Shot's faces module (1.8.0), or None."""
+    try:
+        import importlib
+        import nodes as comfy_nodes
+        cls = comfy_nodes.NODE_CLASS_MAPPINGS.get("MiniMaxH3FaceRefine")
+        if cls is None:
+            return None
+        return importlib.import_module(cls.__module__.rsplit(".", 1)[0] + ".faces")
+    except Exception:
+        return None
+
+
+def read_frames(path, every=6, ffmpeg=None, max_frames=80):
+    """Every `every`-th frame of a video as uint8 [N,H,W,3] (torch), with ffmpeg."""
+    import numpy as np
+    import torch
+    info = probe_video(path)
+    w, h = int(info.get("width") or 0), int(info.get("height") or 0)
+    ffmpeg = ffmpeg or _ffmpeg_path()
+    if not ffmpeg or not w or not h:
+        return None
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", path, "-vf", f"select=not(mod(n\\,{int(every)}))",
+           "-vsync", "0", "-frames:v", str(int(max_frames)), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    try:
+        res = subprocess.run(cmd, capture_output=True, timeout=120,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    n = len(res.stdout) // (w * h * 3)
+    if res.returncode != 0 or n == 0:
+        return None
+    arr = np.frombuffer(res.stdout[:n * w * h * 3], np.uint8).reshape(n, h, w, 3)
+    return torch.from_numpy(arr.copy())
+
+
+def scan_faces(path, faces, folder, every=6):
+    """The faces in one take's clip: {h, w, faces: [{size, cx, cy, w, hh}]} (size in pixels
+    of the clip, biggest first; cx..hh: the face's box in the middle of its run, as
+    fractions of the picture). On the CPU, so a render isn't slowed down."""
+    frames = read_frames(path, every)
+    if frames is None:
+        return None
+    det = faces.detector(folder, "cpu")
+    found = {}
+    for i in range(frames.shape[0]):
+        b, sc, p = det.detect(frames[i], min_face=12)
+        found[i] = [(b[j], float(sc[j]), p[j]) for j in range(len(sc)) if sc[j] >= 0.9]
+    tracks = faces.build_tracks(found, frames.shape[0], max_gap=3, min_hits=2, sigma=0.8)
+    H, W = int(frames.shape[1]), int(frames.shape[2])
+    rows = []
+    for t in sorted(tracks, key=lambda t: -t.size()):
+        mid = len(t.cx) // 2
+        rows.append({"size": round(t.size(), 1), "cx": round(float(t.cx[mid]) / W, 4),
+                     "cy": round(float(t.cy[mid]) / H, 4), "w": round(float(t.w[mid]) / W, 4),
+                     "hh": round(float(t.h[mid]) / H, 4)})
+    return {"h": H, "w": W, "faces": rows[:8]}
+
+
 def comfy_status():
     """ComfyUI's version, and whether it has what Long Shot needs (native H3 with
     guides at any frame: ComfyUI 0.35.0, Sept 2026). Checked by ability, so
@@ -1169,7 +1315,7 @@ def register(routes=None):
                 lists[kind] = []
         project = resolve_names(body.get("project") or {}, lists)
         context_notes = []
-        if not body.get("take_clips") and not body.get("export_clips"):
+        if not body.get("take_clips") and not body.get("export_clips") and not body.get("face_try"):
             context_notes = await asyncio.get_running_loop().run_in_executor(
                 None, add_context_frames, project, bool(body.get("dry_run")), body.get("upto"),
                 bool(body.get("standalone")))
@@ -1178,6 +1324,8 @@ def register(routes=None):
                 built = gb.build_take_audio(project, body["take_audio"].get("take"), env=current_env())
             elif isinstance(body.get("take_clips"), list):
                 built = gb.build_take_clips(project, body["take_clips"][:64], env=current_env())
+            elif isinstance(body.get("face_try"), dict):
+                built = gb.build_face_try(project, body["face_try"], env=current_env())
             elif isinstance(body.get("export_clips"), list):
                 built = gb.build_clip_export(project, body["export_clips"][:64], env=current_env())
             else:
@@ -1778,6 +1926,58 @@ def register(routes=None):
         except Exception as err:
             return error(f"Couldn't download the preview decoder: {err}", 500)
         return web.json_response(out)
+
+    @routes.post("/longshot/install-face-detector")
+    async def install_face_detector_route(request):
+        """Download the MTCNN face detector into models/facedetect/mtcnn. Local only."""
+        if not is_local_request(request.remote, request.headers):
+            return error("The face detector can only be installed from the machine running ComfyUI.", 403)
+        try:
+            out = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: install_face_detector(face_detector_folder()))
+        except Exception as err:
+            return error(f"Couldn't download the face detector: {err}", 500)
+        return web.json_response(out)
+
+    _face_scans = {}          # (path, mtime, size) -> result
+
+    @routes.post("/longshot/faces/{slug}")
+    async def scan_faces_route(request):
+        """{keys: [clip key]}: the faces in each take's clip, {key: {h, w, faces} | null}."""
+        import folder_paths
+        slug, body = slug_of(request), await body_of(request)
+        if not slug or body is None or not isinstance(body.get("keys"), list):
+            return error("Send {keys}.")
+        mod = faces_module()
+        if mod is None:
+            return error("Face refine needs H3 Long Shot 1.8.0 or later.", 404)
+        folder = face_detector_folder()
+        if not mod.weights_present(folder):
+            return error("The face detector isn't installed.", 409)
+        clips_dir = pj.clips_folder(folder_paths.get_output_directory(), slug)
+
+        def work():
+            out = {}
+            for key in [str(k) for k in body["keys"][:64]]:
+                if not pj.CLIP_KEY_RE.fullmatch(key):
+                    continue
+                path = os.path.join(clips_dir, key + ".mp4")
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    out[key] = None
+                    continue
+                sig = (path, st.st_mtime_ns, st.st_size)
+                if sig not in _face_scans:
+                    try:
+                        _face_scans[sig] = scan_faces(path, mod, folder)
+                    except Exception as err:
+                        logger.warning("H3 Long Shot Studio: couldn't look for faces in %s: %s", key, err)
+                        _face_scans[sig] = None
+                out[key] = _face_scans[sig]
+            return out
+        res = await asyncio.get_running_loop().run_in_executor(None, work)
+        return web.json_response(res, headers=no_cache)
 
     @routes.post("/longshot/phrases")
     async def phrases_route(request):

@@ -101,7 +101,7 @@ const uid = (p) => p + Date.now().toString(36) + (uidN++).toString(36);
 
 const S = {
   project: null, projects: [], opts: null, local: false,
-  conn: "connecting", open: null, takes: {}, styleOpen: false, audioOpen: false, advOpen: false, refineOpen: false, settingsOpen: true, uploading: {},
+  conn: "connecting", open: null, takes: {}, styleOpen: false, audioOpen: false, advOpen: false, refineOpen: false, faceOpen: false, faceScan: {}, faceScanning: false, settingsOpen: true, uploading: {},
   busy: null, error: null, loop: false, dry: null, saveState: "",
   refState: {}, refInfo: {}, inputs: null, segStats: null, conflict: null, checkedFor: null,
   clips: {},       // timeline clips of this project: key -> {dur, made, thumb}
@@ -126,6 +126,11 @@ const DEFAULT_SETTINGS = {
   // 0.10.0: a refine pass with a second model (e.g. fl2va over ref2va takes), Long Shot 1.7.0+
   refine: { on: false, export_only: false, model: null, steps: 10, denoise: 0.3, shift_video: 12,
     turbo: { on: false, lora: null, strength: 1.0 } },
+  // 0.14.0: Face refine, small faces redrawn by H3 as close-ups (Long Shot 1.8.0+)
+  face: { on: false, model: null, steps: 10, denoise: 0.3, shift_video: 4,
+    turbo: { on: false, lora: null, strength: 1.0 },
+    max_face: 150, which: "all", work: 640, padding: 0.8, follow: "auto", mask: 1.0, feather: 0.3,
+    color: 1.0, hold_audio: true, seed: 0, describe: "", cast: null },
 };
 
 function normalize(p) {
@@ -182,6 +187,8 @@ function normalize(p) {
     align: s.align && typeof s.align === "object" && s.align.take ? s.align : null,
     // 0.12.5: lined up by hand with the song ({key}: the take or clip it was for); locks its place
     aligned: s.aligned && typeof s.aligned === "object" && s.aligned.key ? { key: String(s.aligned.key) } : null,
+    // 0.14.0: Face refine: its last try ({take, sig, treated, tracks…}) and which faces it exports with
+    face: s.face && typeof s.face === "object" ? s.face : null,
     seam: ["ok", "mismatch"].includes(s.seam) ? s.seam : null,   // its left join, as last known
     cleared: !!s.cleared && s.status === "queued",              // Clear render: waiting to render again
     clip: s.kind === "clip" ? Object.assign({ file: "", subfolder: "", original_name: "", sha256: null,
@@ -209,6 +216,8 @@ function normalize(p) {
   s.rtx_vsr = Object.assign({}, DEFAULT_SETTINGS.rtx_vsr, s.rtx_vsr || {});
   s.refine = Object.assign({}, DEFAULT_SETTINGS.refine, s.refine || {});
   s.refine.turbo = Object.assign({}, DEFAULT_SETTINGS.refine.turbo, s.refine.turbo || {});
+  s.face = Object.assign({}, DEFAULT_SETTINGS.face, s.face || {});
+  s.face.turbo = Object.assign({}, DEFAULT_SETTINGS.face.turbo, s.face.turbo || {});
   if (![1.5, 2].includes(Number(s.rtx_vsr.scale))) s.rtx_vsr.scale = 2;   // 1.5× or 2× only
   s.loras = [0, 1, 2].map((i) => Object.assign({ on: false, name: null, strength: 1.0 }, (s.loras || [])[i] || {}));
   p.settings = s;
@@ -420,6 +429,26 @@ function requestLayout() {
     renderShots();
     renderViewer();
   }, 120);
+}
+
+/** 0.15.0: the film layout for the project in place, fetched now if it isn't known yet
+ *  (an export's records depend on it: a queue resumed after a restart, or a job for a
+ *  project that isn't the open one, used to work them out from a missing or other layout). */
+async function layoutReady() {
+  if (!P()) return;
+  const pieces = layoutPieces();
+  if (!pieces.length) { LAYOUT.sig = ""; LAYOUT.byId = {}; LAYOUT.total = 0; return; }
+  const overlap = Number(P().settings.overlap) || 22;
+  const sig = JSON.stringify([overlap, pieces]);
+  if (sig === LAYOUT.sig && !LAYOUT.error && !LAYOUT.pending) return;
+  clearTimeout(LAYOUT.timer);
+  const r = await api("/longshot/layout", { method: "POST", body: { overlap, pieces } });
+  LAYOUT.byId = Object.fromEntries(r.pieces.map((x) => [x.id, x]));
+  LAYOUT.total = r.total;
+  LAYOUT.fps = r.fps || FPS;
+  LAYOUT.error = null;
+  LAYOUT.sig = sig;
+  LAYOUT.pending = null;
 }
 
 /** A Shot's span on the film in frames, with its trims and move (0.9.0), or null. */
@@ -1594,6 +1623,7 @@ function jobTitle(spec, pass, of, ids) {
     case "final": return "Upscale final video";
     case "preview": return "Update preview";
     case "export": return "Export approved clips · upscaled";
+    case "face": return `Face refine · ${pad(spec.target)}`;
     default: return spec.type;
   }
 }
@@ -1734,13 +1764,21 @@ function jobOpts(job) {
   }
   if (sp.type === "final") return finalOpts();
   if (sp.type === "preview") return previewOpts(sp.focus);
+  if (sp.type === "face") {
+    const s = shot(sp.target);
+    if (!s || s.kind === "clip" || !s.take) return null;
+    return { kind: "face", faceTry: Object.assign({ key: takeStem(s.take), take: s.take }, takeSong(s.take)),
+      label: `Face refine · ${titleOf(s)}`, note: "Its take decoded, small faces redrawn as close-ups, saved for A/B",
+      extra: { shot: s.id, take: s.take, sig: faceSig() }, onDone: () => {} };
+  }
   if (sp.type === "export") {
     const todo = new Set(job.exportTodo || []);
     const items = approvedForExport().filter((x) => !job.exportTodo || todo.has(x.key));
     if (!items.length) return null;
     const v = P().settings.rtx_vsr || {};
     const skipped = active().filter((x) => x.kind !== "clip" && x.status !== "approved").length;
-    return { kind: "export", exportClips: items.map((x) => Object.assign({ take: x.take }, exportCut(x.s))),
+    return { kind: "export", exportClips: items.map((x) => Object.assign({ take: x.take },
+        faceRefined(x.s) ? { face_clip: faceKey(x.s), frames: Number(x.s.window) || 0 } : {}, exportCut(x.s))),
       label: `Exporting ${items.length} approved clip${items.length === 1 ? "" : "s"} · upscaled ${v.scale || 2}× ${v.quality || "ULTRA"}`,
       note: "Each approved take decoded on its own, whole, and upscaled a frame at a time",
       extra: { items: items.map((x) => ({ name: x.name, key: x.key, sig: itemSig(x), asig: itemAsig(x) })), skipped, kept: job.exportKept || 0, sig: upSig() },
@@ -2106,25 +2144,26 @@ function pickFields(o, keys) {
 
 async function queueJob({ upto, dry, kind, label, note, onDone, final = false, standalone = false, batch = null,
   omit = null, trimLeft = false, takeClips = null, chunk = null, exportClips = null, extra = null, jobId = null,
-  joins = null, takeAudio = null }) {
+  joins = null, takeAudio = null, faceTry = null }) {
   if (S.busy) return;
   if (Object.keys(S.uploading).length) { toast("Wait for the image upload to finish."); return; }
   S.error = null;
   const dryBox = () => { if (kind === "dry") showModal("Dry run · it stopped with an error", S.error); };
   if (comfyTooOld()) { S.error = comfyTooOldText(); dryBox(); render(); return; }
-  const missing = kind === "clips" || kind === "export" || kind === "align" ? [] : missingRefs();
+  const missing = kind === "clips" || kind === "export" || kind === "align" || kind === "face" ? [] : missingRefs();
   if (missing.length) {
     S.error = `${missing.length} reference${missing.length > 1 ? "s are" : " is"} missing — relink or bypass ${missing.length > 1 ? "them" : "it"}.`;
     dryBox();
     render();
     return;
   }
-  const lost = missingModels(P());
+  const lost = kind === "face" ? missingFaceModels(P()) : missingModels(P());
   if (lost.length) {
     S.error = `Model file${lost.length > 1 ? "s" : ""} not found in ComfyUI's model folders: ${lost.join(", ")}. ` +
       `Choose ${lost.length > 1 ? "them" : "it"} under Advanced (Browse… can also add a folder ComfyUI doesn't know about).`;
     dryBox();
-    if (!lost.every((x) => x.startsWith("Vocal"))) S.advOpen = true;
+    if (kind === "face" && lost.some((x) => x.startsWith("Face"))) S.faceOpen = true;
+    else if (!lost.every((x) => x.startsWith("Vocal"))) S.advOpen = true;
     else S.audioOpen = true;
     render();
     const first = document.querySelector(".pick.missing-file");
@@ -2198,6 +2237,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
     const clipsFor = !dry && (kind === "render" || kind === "reroll")
       ? project.shots.filter((x) => !x.bypassed && x.kind !== "clip" && !x.lock).map((x) => x.id) : null;
     const body = takeAudio ? { project, take_audio: takeAudio } : takeClips ? { project, take_clips: takeClips } : exportClips ? { project, export_clips: exportClips }
+      : faceTry ? { project, face_try: faceTry }
       : { project, upto, dry_run: !!dry, final, standalone, clips_for: clipsFor, chunk };
     built = await api("/longshot/build", { method: "POST", body });
   } catch (e) {
@@ -2321,6 +2361,8 @@ async function finishIn(b, promptId, entry) {
     if (S.exportAfter) { S.exportAfter = false; setTimeout(exportApproved, 0); }
   } else if (b.kind === "export") {
     await exportDone(b, entry.outputs || {});
+  } else if (b.kind === "face") {
+    await faceDone(b, entry.outputs || {});
   } else if (b.kind === "align") {
     await alignDone(b, entry.outputs || {});
   } else {
@@ -3561,7 +3603,8 @@ function approvedForExport() {
   const act = active(), width = Math.max(2, String(act.length).length);
   return act.filter((s) => s.kind !== "clip" && s.status === "approved" && s.take).map((s) => ({
     s, key: takeStem(s.take), take: s.take,
-    name: `Shot ${String(numOf(s.id)).padStart(width, "0")} – seed ${seedOfTake(s)}`,
+    // 0.15.0: a Shot exported refined ends with FR
+    name: `Shot ${String(numOf(s.id)).padStart(width, "0")} – seed ${seedOfTake(s)}${faceRefined(s) ? " FR" : ""}`,
   }));
 }
 
@@ -3573,7 +3616,8 @@ function itemSig(x) {
   const c = exportCut(x.s);
   const cut = c.length ? `${c.trim_in}+${c.length}` : "";
   const ref = refineActive() ? JSON.stringify(P().settings.refine) : "";
-  const str = cut + "|" + ref;
+  const face = faceRefined(x.s) ? "|face:" + (x.s.face.made || x.s.face.sig || "") : "";      // 0.15.0: its refined clip
+  const str = cut + "|" + ref + face;
   let h = 0;
   for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
   return `${Number(v.scale || 2)}x ${v.quality || "ULTRA"}` + (str !== "|" ? ` · ${(h >>> 0).toString(36)}` : "");
@@ -3602,6 +3646,7 @@ const upSig = () => {
 /** Before an upscaled export: clips already upscaled from the same take stay
  *  (renamed if their number moved); stale ones leave the folder. */
 async function exportPrepare(job) {
+  await layoutReady();                           // 0.15.0: the records need this project's layout
   const items = approvedForExport();
   const r = await api(`/longshot/approved/${encodeURIComponent(P().slug)}`, { method: "POST",
     body: { mode: "keep", sig: upSig(), prores: !!P().settings.prores_master, items: items.map(exportItem),
@@ -3624,6 +3669,7 @@ function exportedToast(r, skipped, kept = 0) {
 
 async function exportApproved() {
   if (!P()) return;
+  try { await layoutReady(); } catch (e) { toast("Export failed: couldn't place the Shots on the film (" + e.message + ")."); return; }
   const items = approvedForExport();
   if (!items.length) { toast("No approved Shots to export yet."); return; }
   const skipped = active().filter((s) => s.kind !== "clip" && s.status !== "approved").length;
@@ -3632,7 +3678,7 @@ async function exportApproved() {
     enqueue({ type: "export" });                 // 0.10.0: with Refine, the export refines first
     return;
   }
-  const missing = items.filter((x) => !S.clips[x.key]);
+  const missing = items.filter((x) => !S.clips[x.key]);   // (a Refined Shot's own clip is there too)
   if (missing.length) {
     S.exportAfter = true;
     toast(`Making ${missing.length} clip${missing.length === 1 ? "" : "s"} first…`);
@@ -3645,7 +3691,8 @@ async function exportApproved() {
     const r = await api(`/longshot/approved/${encodeURIComponent(P().slug)}`, { method: "POST",
       body: { mode: "copy", song: songMode() ? { file: P().audio.file, subfolder: P().audio.subfolder || "" } : null,
         items: items.map((x) => {
-          const c = exportCut(x.s), it = { key: x.key, name: x.name };
+          // 0.15.0: a Shot set to Refined exports its refined clip
+          const c = exportCut(x.s), it = { key: faceRefined(x.s) ? faceKey(x.s) : x.key, name: x.name };
           if (c.length) it.cut = { start: c.trim_in / FPS, dur: c.length / FPS };
           if (c.song_len) Object.assign(it, { song_at: c.song_at, song_len: c.song_len });
           return it;
@@ -4121,6 +4168,7 @@ function focusShot(id) {
   renderShots();
   renderDecision();
   renderViewer();
+  renderFace();                                    // 0.14.1: the Face refine panel follows the selection
   tlReveal(id);
 }
 
@@ -4327,6 +4375,7 @@ function render() {
   renderSettings();
   renderAdvanced();
   renderRefine();
+  renderFace();
   renderPlan();
   renderQueue();
 }
@@ -6059,6 +6108,573 @@ function renderRefine() {
     <div class="muted small" style="margin-top:10px">${note}</div>`;
 }
 
+// ---------------------------------------------------------------------------
+// Face refine (0.14.0, Long Shot 1.8.0): faces too small to come out well are
+// redrawn by H3 as steady close-ups (the fl2va model by default) and blended back
+// in, on Export approved clips and Upscale final video. "Try on this Shot" makes
+// one take's version for the A/B viewer; each Shot can keep its original faces.
+// ---------------------------------------------------------------------------
+
+/** Face refine applies: on, a model chosen, Long Shot 1.8.0 with its node, the detector there. */
+function faceActive() {
+  const f = P() && P().settings.face, o = S.opts || {};
+  return !!(f && f.on && f.model && lsAtLeast(1, 8, 0) && !(o.nodes && o.nodes.MiniMaxH3FaceRefine === false)
+    && o.face_detector !== false);
+}
+function faceNodeReady() {
+  const o = S.opts || {};
+  return lsAtLeast(1, 8, 0) && !(o.nodes && o.nodes.MiniMaxH3FaceRefine === false);
+}
+const isFl2va = (m) => /fl2v/i.test(m || "");
+/** The fl2va model in ComfyUI's list (the default redraw model), or null. */
+const fl2vaModel = () => ((S.opts || {}).models || []).find((m) => isFl2va(m)) || null;
+
+function hash36(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+/** What a face-refined result depends on (settings, prompt, identity picture). */
+function faceSig() {
+  const s = P().settings, f = s.face, t = f.turbo;
+  const who = faceIdentity();
+  return hash36(JSON.stringify([f.model, f.steps, f.denoise, f.shift_video, t.on ? [t.lora, t.strength] : 0,
+    f.max_face, f.which, f.work, f.padding, f.follow, f.mask, f.feather, f.color, f.hold_audio, f.seed,
+    (f.describe || "").trim(), who ? [who.image, who.subfolder, who.label] : 0, s.clip, s.video_vae,
+    s.shift_audio, s.scheduler, s.sampler]));
+}
+/** The Cast member whose picture is the face's identity (only with a ref2va model). */
+function faceIdentity() {
+  const f = P().settings.face;
+  if (!f.cast || isFl2va(f.model)) return null;
+  return (P().cast || []).find((c) => c.id === f.cast && c.image && !c.bypassed) || null;
+}
+const faceKey = (s) => s && s.take ? takeStem(s.take) + "__face" : null;
+/** 0.15.0: the Shot is set to Refined and has a refined clip of its current take. */
+const faceRefined = (s) => !!(s && s.take && s.face && s.face.keep === "refined" && s.face.take === s.take &&
+  S.clips[faceKey(s)]);
+const faceKeepsOriginal = (s) => !faceRefined(s);
+/** A refined clip of the Shot's current take exists (so it can be set to Refined). */
+const faceHasClip = (s) => !!(s && s.take && s.face && s.face.take === s.take && S.clips[faceKey(s)]);
+/** The Shot the panel talks about: the one in the viewer, else the one in review. */
+function faceShot() {
+  const pick = (id) => { const s = id && shotById(id); return s && !s.bypassed && s.kind !== "clip" && s.take && isRendered(s) ? s : null; };
+  return pick(S.focus) || pick(S.open) || pick((reviewShot() || {}).id) ||
+    active().find((x) => x.kind !== "clip" && x.take && isRendered(x)) || null;
+}
+
+/** A take's faces, in render pixels: [{size, cx, cy, w, hh, px}] biggest first (null: unknown). */
+function faceSizes(s) {
+  const r = s && s.take ? S.faceScan[takeStem(s.take)] : undefined;
+  if (!r || typeof r !== "object") return r === null ? [] : null;
+  const size = sizeOf(P().settings), h = (size && size[1]) || r.h;
+  return (r.faces || []).map((x) => Object.assign({}, x, { px: Math.round(x.size * h / (r.h || h)) }));
+}
+const smallFaces = (s) => (faceSizes(s) || []).filter((x) => x.px < Number(P().settings.face.max_face || 150));
+
+/** Look for faces in the rendered Shots' clips (CPU, a few seconds each), a few at a time. */
+async function faceScanMore() {
+  if (S.faceScanning || !P() || !S.faceOpen || !(S.opts || {}).face_detector || !faceNodeReady()) return;
+  const keys = active().filter((x) => x.kind !== "clip" && x.take && isRendered(x) && S.clips[takeStem(x.take)]
+    && S.faceScan[takeStem(x.take)] === undefined).map((x) => takeStem(x.take)).slice(0, 4);
+  if (!keys.length) return;
+  S.faceScanning = true;
+  const slug = P().slug;
+  keys.forEach((k) => { S.faceScan[k] = "pending"; });
+  try {
+    const r = await api(`/longshot/faces/${encodeURIComponent(slug)}`, { method: "POST", body: { keys } });
+    if (P() && P().slug === slug) for (const k of keys) S.faceScan[k] = r[k] === undefined ? null : r[k];
+  } catch (e) {
+    keys.forEach((k) => { if (S.faceScan[k] === "pending") delete S.faceScan[k]; });
+    if (P() && P().slug === slug) S.faceScanError = e.message;
+  } finally { S.faceScanning = false; }
+  if (P() && P().slug === slug) { renderFace(); setTimeout(faceScanMore, 50); }
+}
+
+async function installFaceDetector() {
+  const page = "https://pypi.org/project/facenet-pytorch/2.6.0/";
+  if (!S.local) {
+    showModal("Face detector", "", `<p>On the machine running ComfyUI, open H3 Long Shot Studio there and download it, or get
+      facenet_pytorch-2.6.0's wheel from <a href="${page}" target="_blank" rel="noopener">${page}</a> and copy
+      <code>pnet.pt</code>, <code>rnet.pt</code> and <code>onet.pt</code> from its <code>facenet_pytorch/data</code> folder into
+      <code>ComfyUI/models/facedetect/mtcnn</code>.</p>`);
+    return;
+  }
+  const ok = await confirmBox({ title: "Download the face detector?",
+    body: "Downloads the facenet-pytorch package from PyPI (1.9 MB) and keeps only its three MTCNN face detector files " +
+      "(MIT licence) in ComfyUI's models/facedetect/mtcnn folder. Nothing is installed into Python. No restart needed.",
+    yes: "Download", no: "Cancel" });
+  if (!ok) return;
+  toast("Downloading the face detector…");
+  try { await api("/longshot/install-face-detector", { method: "POST" }); }
+  catch (e) { showModal("Face detector", "", `<p>${esc(e.message)}</p>`); return; }
+  try { S.opts = await api("/longshot/options"); } catch (e) { /* keep */ }
+  toast("Face detector installed.");
+  renderFace();
+  faceScanMore();
+}
+
+function renderFaceSummary() { if (P()) $("face-summary").textContent = faceSummaryText(); }
+
+function faceSummaryText() {
+  const f = P().settings.face;
+  if (!f.on) return "Off";
+  if (!f.model) return "On · choose a model";
+  const n = active().filter(faceRefined).length;
+  return `On · ${shortModel(f.model)} · under ${f.max_face} px · denoise ${Number(f.denoise).toFixed(2)}` +
+    ` · ${n ? `${n} Shot${n === 1 ? "" : "s"} refined` : "no Shot refined yet"}`;
+}
+
+function renderFace() {
+  if (!P()) return;
+  const s = P().settings, f = s.face, o = S.opts || {}, t = f.turbo;
+  $("face-summary").textContent = faceSummaryText();
+  $("face-chev").textContent = S.faceOpen ? "Hide ▴" : "Show ▾";
+  $("face-toggle").setAttribute("aria-expanded", String(!!S.faceOpen));
+  $("face").hidden = !S.faceOpen;
+  if (!S.faceOpen) return;
+  setTimeout(faceScanMore, 0);
+  if (!faceNodeReady()) {
+    $("face").innerHTML = `<div class="muted small" style="margin-top:12px">Update H3 Long Shot to 1.8.0 or later (and restart ComfyUI) for Face refine.</div>`;
+    return;
+  }
+  const dis = f.on ? "" : " disabled";
+  const detector = o.face_detector ? "" : `<div class="box face-get">
+      <div class="box-row"><div style="flex:1;min-width:200px"><div>The face detector isn't installed</div>
+        <div class="muted small">MTCNN, about 2 MB, into models/facedetect/mtcnn. It finds and follows the faces.</div></div>
+      <button class="ghost sm" data-action="face-detector">Download face detector</button></div></div>`;
+  const castOpts = (P().cast || []).filter((c) => c.image && !c.bypassed)
+    .map((c) => `<option value="${esc(c.id)}"${f.cast === c.id ? " selected" : ""}>${esc(c.label || "Cast member")}</option>`).join("");
+  const fl = isFl2va(f.model);
+  const advOpen = !folded("face-adv");
+  const rendered = active().filter((x) => x.kind !== "clip" && x.take && isRendered(x));
+  const known = rendered.filter((x) => Array.isArray(faceSizes(x)));
+  const withSmall = known.filter((x) => smallFaces(x).length);
+  const pending = rendered.filter((x) => S.faceScan[takeStem(x.take)] === "pending" ||
+    (S.clips[takeStem(x.take)] && S.faceScan[takeStem(x.take)] === undefined)).length;
+  const noClip = rendered.filter((x) => !S.clips[takeStem(x.take)]).length;
+  let film = "";
+  if (o.face_detector && rendered.length) {
+    film = `Small faces in <b>${withSmall.length}</b> of ${known.length} Shot${known.length === 1 ? "" : "s"} looked at` +
+      (pending ? ` · looking at ${pending} more…` : "") + (noClip ? ` · ${noClip} without a clip yet` : "") + ".";
+  }
+  const refinedNow = active().filter(faceRefined);
+  const refinedList = refinedNow.length ? `<div class="muted small" style="margin-top:8px">Exporting refined: ${refinedNow.map((x) => esc(titleOf(x))).join(", ")}</div>` : "";
+  const sh = faceShot();
+  let shotHTML = "";
+  if (sh) {
+    const sizes = faceSizes(sh), small = smallFaces(sh), fk = faceKey(sh);
+    const have = faceHasClip(sh), old = !!(fk && S.clips[fk]) && !have;
+    const stale = have && sh.face.sig !== faceSig();
+    let faces;
+    if (!o.face_detector) faces = "Install the face detector to look for faces.";
+    else if (!S.clips[takeStem(sh.take)]) faces = "No clip of this take yet (Make missing clips under the timeline).";
+    else if (sizes === null) faces = "Looking for faces…";
+    else if (!sizes.length) faces = "No faces found.";
+    else faces = `${sizes.length} face${sizes.length === 1 ? "" : "s"} · ` + sizes.slice(0, 4).map((x) =>
+      `<span class="${x.px < f.max_face ? "face-small" : ""}">${x.px} px</span>`).join(", ") +
+      (small.length ? ` · ${small.length} to redraw` : " · none under the size");
+    const keep = faceRefined(sh) ? "refined" : "original";
+    const busy = Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "face" && j.spec.target === sh.id);
+    shotHTML = `<div class="box face-shot">
+      <div class="box-row"><label class="face-pick"><span class="muted small">Shot</span>
+        <select data-face-shot aria-label="Shot to try Face refine on">${rendered.map((x) =>
+          `<option value="${esc(x.id)}"${x.id === sh.id ? " selected" : ""}>${esc(titleOf(x))}${smallFaces(x).length ? " · small face" : ""}</option>`).join("")}</select></label>
+        <span class="muted small">${faces}</span></div>
+      ${have ? `<div class="muted small" style="margin-top:6px">Refined: ${sh.face.treated || 0} face${sh.face.treated === 1 ? "" : "s"} redrawn${sh.face.cached ? " (kept from before)" : ""}.${stale ? " Made with other settings than these: Refine again to use them." : ""}</div>`
+        : old ? `<div class="muted small" style="margin-top:6px">⚠ The refined version was made from an older take. Refine this Shot again.</div>` : ""}
+      <div class="box-row" style="margin-top:10px">
+        <button class="ghost sm" data-action="face-try" data-shot="${esc(sh.id)}"${f.on && f.model && o.face_detector && !busy ? "" : " disabled"}>${busy ? "In the queue…" : have ? "Refine again" : "Refine this Shot"}</button>
+        <button class="ghost sm" data-action="face-ab" data-shot="${esc(sh.id)}"${have && S.clips[takeStem(sh.take)] ? "" : " disabled"}>Compare A/B</button>
+        <span class="push muted small">Export uses</span>
+        <div class="seg seg-sm" role="group" aria-label="Which version this Shot exports">
+          <button data-action="face-keep" data-v="refined" data-shot="${esc(sh.id)}" aria-pressed="${keep === "refined"}"${have ? "" : ' disabled title="Refine this Shot first"'}>Refined</button>
+          <button data-action="face-keep" data-v="original" data-shot="${esc(sh.id)}" aria-pressed="${keep === "original"}">Original</button>
+        </div>
+      </div></div>`;
+  }
+  $("face").innerHTML = `${detector}
+    <div class="route" style="margin-top:12px">${switchHTML(f.on, 'data-action="face-on" aria-label="Face refine"')}
+      <span class="route-text"><b>Redraw small faces</b><i>refine the Shots you choose: H3 redraws each small face as a steady close-up and blends it back in</i></span></div>
+    ${shotHTML}
+    ${refinedList}
+    <div class="model-files" style="margin-top:10px">
+      ${modelField("Face model", "diffusion_models", "face_model", `<select data-face="model" aria-label="Face refine model"${dis}>${fileOptions(o.models, f.model, "Choose a model…")}</select>`)}
+    </div>
+    <div class="grid3" style="margin-top:10px">
+      <label class="lbl">Steps <input type="number" min="1" max="200" step="1" data-face="steps" value="${esc(f.steps)}"${dis}></label>
+      <label class="lbl" title="How much of the face is redrawn: lower keeps the expression and mouth closer to the take, higher draws more new detail">Denoise <input type="number" min="0.05" max="1" step="0.05" data-face="denoise" value="${esc(f.denoise)}"${dis}></label>
+      <label class="lbl" title="ModelSamplingMiniMaxH3 for the face model. Lower (3–5) makes the same denoise a lighter touch">Video shift <input type="number" min="0.5" max="100" step="0.5" data-face="shift_video" value="${esc(f.shift_video)}"${dis}></label>
+    </div>
+    <div class="box" style="margin-top:10px">
+      <div class="box-row">
+        ${switchHTML(t.on, `data-action="face-turbo-on" aria-label="Face refine Turbo LoRA"${dis}`)}
+        <div style="flex:1;min-width:140px"><div>Turbo LoRA (face model)</div>
+          <div class="pick" style="margin-top:4px"><select data-face="turbo.lora" aria-label="Face refine Turbo LoRA file"${t.on && f.on ? "" : " disabled"}>${fileOptions(o.loras, t.lora, "Choose…")}</select></div></div>
+        <label class="strength" style="flex:1 1 180px">Strength
+          <input type="range" min="0" max="2" step="0.05" data-face="turbo.strength" value="${esc(t.strength)}"${t.on && f.on ? "" : " disabled"}><output>${Number(t.strength).toFixed(2)}</output></label>
+      </div>
+    </div>
+    <div class="grid2" style="margin-top:12px">
+      <label class="lbl" title="Faces shorter than this, in pixels of the render, are redrawn; bigger ones are left alone">Redraw faces under (px)
+        <input type="number" min="16" max="2000" step="10" data-face="max_face" value="${esc(f.max_face)}"${dis}></label>
+      <div class="lbl">Which faces
+        <div class="seg" role="group" aria-label="Which faces">
+          <button data-action="face-which" data-v="all" aria-pressed="${f.which !== "largest"}"${dis}>All small faces</button>
+          <button data-action="face-which" data-v="largest" aria-pressed="${f.which === "largest"}"${dis}>Largest only</button>
+        </div></div>
+    </div>
+    <div class="grid2" style="margin-top:12px">
+      <label class="lbl" title="${fl ? "The fl2va model takes no reference pictures: the face keeps the identity it has in the take" : "The ref2va model gets this Cast picture as the face's identity (<Picture 1>)"}">Identity picture${fl ? " (ref2va only)" : ""}
+        <select data-face="cast"${f.on && !fl ? "" : " disabled"}><option value="">None · keep the take's face</option>${castOpts}</select></label>
+      <label class="lbl" title="Added to the close-up's prompt, e.g. a young woman with freckles and red lipstick">Describe the face (optional)
+        <input type="text" data-face="describe" value="${esc(f.describe || "")}" placeholder="e.g. a young woman with freckles"${dis}></label>
+    </div>
+    <div class="box" style="margin-top:12px">
+      <button class="fold" data-action="fold" data-fold="face-adv" aria-expanded="${advOpen}">
+        <span>Close-up and blending</span><span class="muted chev">${advOpen ? "Hide ▴" : "Show ▾"}</span></button>
+      ${advOpen ? `<div class="grid3">
+        <label class="lbl" title="The close-up's size while H3 redraws it (square). Bigger: more detail, slower">Close-up size
+          <select data-face="work"${dis}>${[512, 640, 768, 896, 1024].map((v) => `<option value="${v}"${Number(f.work) === v ? " selected" : ""}>${v} px</option>`).join("")}</select></label>
+        <label class="lbl" title="Room around the face on each side, as a share of its size (0.8: the close-up is 2.6× the face)">Room around the face
+          <input type="number" min="0.2" max="3" step="0.1" data-face="padding" value="${esc(f.padding)}"${dis}></label>
+        <label class="lbl" title="Auto: the crop follows a face that moves, and stays put for one that doesn't">Crop
+          <select data-face="follow"${dis}>${[["auto", "Auto"], ["fixed", "Fixed"], ["follow", "Follows the face"]].map(([v, l]) => `<option value="${v}"${f.follow === v ? " selected" : ""}>${l}</option>`).join("")}</select></label>
+        <label class="lbl" title="How much of the face area is blended in (1: brow to chin, a little of the hair line)">Mask size
+          <input type="number" min="0.5" max="2.5" step="0.05" data-face="mask" value="${esc(f.mask)}"${dis}></label>
+        <label class="lbl" title="How softly the redrawn face fades into the picture">Feather
+          <input type="number" min="0.02" max="1" step="0.02" data-face="feather" value="${esc(f.feather)}"${dis}></label>
+        <label class="lbl" title="Brings the redrawn face's broad colour and shading back to the take's, keeping its new detail">Colour match
+          <input type="number" min="0" max="1" step="0.1" data-face="color" value="${esc(f.color)}"${dis}></label>
+        <label class="lbl">Seed <input type="number" min="0" step="1" data-face="seed" value="${esc(f.seed)}"${dis}></label>
+      </div>
+      <div class="route" style="margin-top:6px">${switchHTML(f.hold_audio, `data-action="face-hold" aria-label="Hold the Shot's sound"${dis}`)}
+        <span class="route-text"><b>Hold the Shot's sound</b><i>the mouth is redrawn against the take's own sound (its timing stays)</i></span></div>` : ""}
+    </div>
+    ${film ? `<div class="muted small" style="margin-top:10px">${film}</div>` : ""}
+    ${S.faceScanError ? `<div class="muted small" style="margin-top:6px">Couldn't look for faces: ${esc(S.faceScanError)}</div>` : ""}`;
+}
+
+/** Try on this Shot: its take decoded, faces refined, saved as its own clip. */
+function faceTry(s) {
+  if (!s || !s.take) return;
+  if (!faceActive()) { toast(!(S.opts || {}).face_detector ? "Download the face detector first." : "Turn Redraw small faces on and choose the face model first."); return; }
+  if (Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "face" && j.spec.target === s.id)) {
+    toast("This Shot is already in the queue to be refined."); return;
+  }
+  enqueue({ type: "face", target: s.id });
+}
+
+// ---------------------------------------------------------------------------
+// A/B viewer (0.14.0): a Shot's take (A) against its face-refined version (B),
+// played in sync: wipe, flip or side by side, frame steps, zoom to the face.
+// ---------------------------------------------------------------------------
+
+const AB = { shot: null, mode: "wipe", split: 50, flip: false, zoom: false, boxes: false, loop: true, raf: 0, held: false };
+
+function openAB(s) {
+  if (!s || !s.take) return;
+  const a = takeStem(s.take), b = faceKey(s);
+  if (!S.clips[a] || !faceHasClip(s)) { toast(!faceHasClip(s) ? "Refine this Shot first." : "This take has no clip yet."); return; }
+  AB.shot = s.id;
+  AB.flip = false;
+  try { AB.mode = store("h3studio.abmode") || "wipe"; } catch (e) { /* default */ }
+  if (!["wipe", "flip", "side"].includes(AB.mode)) AB.mode = "wipe";
+  $("ab").hidden = false;
+  renderAB(true);
+  const btn = $("ab").querySelector(".ab-close");
+  if (btn) btn.focus();
+}
+
+function closeAB() {
+  cancelAnimationFrame(AB.raf);
+  AB.raf = 0;
+  for (const v of $("ab").querySelectorAll("video")) { try { v.pause(); } catch (e) { /* gone */ } }
+  $("ab").hidden = true;
+  $("ab").innerHTML = "";
+  AB.shot = null;
+}
+
+const abVideos = () => [$("ab-a"), $("ab-b")];
+
+/** The face to zoom to at time t: the biggest redrawn face's box (fractions of the picture). */
+function abFaceAt(s, t) {
+  const f = s.face || {};
+  const tracks = f.tracks || [];
+  if (!tracks.length || !f.w || !f.h) {
+    const sz = faceSizes(s) || [];
+    const x = smallFaces(s)[0] || sz[0];
+    return x ? { cx: x.cx, cy: x.cy, hh: x.hh } : null;
+  }
+  const treated = new Set((f.crops || []).map((c) => c.track));
+  const tr = tracks.filter((x) => treated.has(x.id)).sort((a, b) => b.size - a.size)[0] ||
+    tracks.slice().sort((a, b) => b.size - a.size)[0];
+  const rows = tr.boxes || [];
+  if (!rows.length) return null;
+  const fr = t * FPS;
+  let k = rows.findIndex((r) => r[0] > fr);
+  if (k < 0) k = rows.length;
+  const r0 = rows[Math.max(0, k - 1)], r1 = rows[Math.min(rows.length - 1, k)];
+  const u = r1[0] === r0[0] ? 0 : Math.max(0, Math.min(1, (fr - r0[0]) / (r1[0] - r0[0])));
+  const lerp = (i) => r0[i] + (r1[i] - r0[i]) * u;
+  return { cx: lerp(1) / f.w, cy: lerp(2) / f.h, hh: lerp(4) / f.h };
+}
+
+/** Boxes of every face at time t (fractions), for the overlay. */
+function abBoxesAt(s, t) {
+  const f = s.face || {};
+  if (!f.w || !f.h) return [];
+  const fr = t * FPS, treated = new Set((f.crops || []).map((c) => c.track));
+  const out = [];
+  for (const tr of f.tracks || []) {
+    const rows = tr.boxes || [];
+    if (!rows.length || fr < rows[0][0] - 2 || fr > rows[rows.length - 1][0] + 4) continue;
+    let best = rows[0];
+    for (const r of rows) if (Math.abs(r[0] - fr) < Math.abs(best[0] - fr)) best = r;
+    out.push({ x: (best[1] - best[3] / 2) / f.w, y: (best[2] - best[4] / 2) / f.h, w: best[3] / f.w, h: best[4] / f.h,
+      redrawn: treated.has(tr.id), size: Math.round(tr.size) });
+  }
+  return out;
+}
+
+function renderAB(fresh) {
+  const s = AB.shot && shotById(AB.shot);
+  if (!s || $("ab").hidden) return;
+  const keep = faceKeepsOriginal(s) ? "original" : "refined";
+  const a = takeStem(s.take), b = faceKey(s);
+  const stale = s.face && s.face.sig !== faceSig();
+  if (fresh) {
+    $("ab").innerHTML = `<div class="ab-dialog">
+      <div class="ab-head">
+        <div class="ab-title"><h3 id="ab-title">${esc(titleOf(s))} · Face refine</h3>
+          <span class="muted small">A: the take as it is · B: small faces redrawn${s.face && s.face.treated ? ` (${s.face.treated})` : ""} · Export approved clips uses the one you pick</span></div>
+        <button class="ghost close ab-close" data-ab="close" aria-label="Close">
+          <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></button>
+      </div>
+      <div class="ab-stage-wrap"><div class="ab-stage" id="ab-stage">
+        <div class="ab-view ab-a"><div class="ab-zoom"><video id="ab-a" playsinline preload="auto" src="${esc(clipFile(a, ".mp4"))}"></video><svg class="ab-boxes" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><span class="ab-tag">A · Original</span></div>
+        <div class="ab-view ab-b"><div class="ab-zoom"><video id="ab-b" playsinline muted preload="auto" src="${esc(clipFile(b, ".mp4"))}"></video><svg class="ab-boxes" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><span class="ab-tag">B · Refined</span></div>
+        <div class="ab-divider" id="ab-divider" role="slider" tabindex="0" aria-label="Wipe position" aria-valuemin="0" aria-valuemax="100"></div>
+      </div></div>
+      <div class="ab-bar">
+        <button class="ghost sm ab-play" data-ab="play" aria-label="Play">▶</button>
+        <button class="ghost sm" data-ab="back" aria-label="One frame back" title="One frame back (←)">◀︎ 1f</button>
+        <button class="ghost sm" data-ab="fwd" aria-label="One frame forward" title="One frame forward (→)">1f ▶︎</button>
+        <input type="range" class="ab-scrub" id="ab-scrub" min="0" max="1000" step="1" value="0" aria-label="Position">
+        <span class="mono small ab-time" id="ab-time">0.00 s · f 0</span>
+      </div>
+      <div class="ab-bar">
+        <div class="seg seg-sm" role="group" aria-label="Compare">
+          <button data-ab="mode" data-v="wipe">Wipe</button>
+          <button data-ab="mode" data-v="flip">Flip</button>
+          <button data-ab="mode" data-v="side">Side by side</button>
+        </div>
+        <button class="ghost sm" data-ab="swap" id="ab-swap" title="Show the other one (hold F)">Showing B</button>
+        <button class="ghost sm" data-ab="zoom" id="ab-zoom-btn" title="Zoom to the face (Z)">Zoom to face</button>
+        <button class="ghost sm" data-ab="boxes" id="ab-boxes-btn" title="Face boxes (B)">Face boxes</button>
+        <button class="ghost sm" data-ab="loop" id="ab-loop" title="Loop">Loop</button>
+        <span class="push muted small">Export uses</span>
+        <div class="seg seg-sm" role="group" aria-label="Faces this Shot exports with">
+          <button data-ab="keep" data-v="refined">Refined</button>
+          <button data-ab="keep" data-v="original">Original</button>
+        </div>
+      </div>
+      <div class="muted small ab-keys">${stale ? "B was made with other settings than the panel's now. " : ""}Space play · ← → one frame · hold F to flip · Z zoom · B boxes · Esc close</div>
+    </div>`;
+    const [va, vb] = abVideos();
+    va.loop = vb.loop = AB.loop;
+    va.addEventListener("loadedmetadata", () => { abFit(); abTick(); });
+    va.addEventListener("seeked", () => { if (va.paused) vb.currentTime = va.currentTime; abTick(); });
+    va.addEventListener("play", () => { vb.play().catch(() => {}); renderABState(); });
+    va.addEventListener("pause", () => { vb.pause(); vb.currentTime = va.currentTime; renderABState(); });
+    va.addEventListener("ended", () => { vb.pause(); renderABState(); });
+    $("ab-scrub").addEventListener("input", (e) => {
+      const d = va.duration || 0;
+      if (d) { va.currentTime = (Number(e.target.value) / 1000) * d; vb.currentTime = va.currentTime; }
+    });
+    const stage = $("ab-stage");
+    const setSplit = (ev) => {
+      const r = stage.getBoundingClientRect();
+      AB.split = Math.max(0, Math.min(100, ((ev.clientX - r.left) / Math.max(1, r.width)) * 100));
+      abLayout();
+    };
+    stage.addEventListener("pointerdown", (ev) => {
+      if (AB.mode !== "wipe" || ev.button !== 0) return;
+      stage.setPointerCapture(ev.pointerId);
+      setSplit(ev);
+      const move = (e2) => setSplit(e2);
+      const up = () => { stage.removeEventListener("pointermove", move); stage.removeEventListener("pointerup", up); };
+      stage.addEventListener("pointermove", move);
+      stage.addEventListener("pointerup", up);
+    });
+    $("ab-divider").addEventListener("keydown", (ev) => {
+      if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
+        AB.split = Math.max(0, Math.min(100, AB.split + (ev.key === "ArrowLeft" ? -5 : 5)));
+        abLayout();
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+    });
+    cancelAnimationFrame(AB.raf);
+    const loop = () => { abTick(); AB.raf = requestAnimationFrame(loop); };
+    AB.raf = requestAnimationFrame(loop);
+  }
+  for (const btn of $("ab").querySelectorAll('[data-ab="keep"]')) btn.setAttribute("aria-pressed", String(btn.dataset.v === keep));
+  renderABState();
+}
+
+/** The stage keeps the video's shape (so face boxes and zoom line up). */
+function abFit() {
+  const va = $("ab-a");
+  const stage = $("ab-stage");
+  if (!va || !stage) return;
+  const ar = va.videoWidth && va.videoHeight ? va.videoWidth / va.videoHeight : 16 / 9;
+  stage.style.setProperty("--ar", String(ar));
+}
+
+function abLayout() {
+  const stage = $("ab-stage");
+  if (!stage) return;
+  stage.dataset.mode = AB.mode;
+  stage.classList.toggle("show-a", AB.mode === "flip" && (AB.flip !== AB.held));
+  stage.style.setProperty("--split", AB.split + "%");
+  const d = $("ab-divider");
+  if (d) d.setAttribute("aria-valuenow", String(Math.round(AB.split)));
+}
+
+function renderABState() {
+  if ($("ab").hidden) return;
+  const [va] = abVideos();
+  for (const btn of $("ab").querySelectorAll('[data-ab="mode"]')) btn.setAttribute("aria-pressed", String(btn.dataset.v === AB.mode));
+  const play = $("ab").querySelector(".ab-play");
+  if (play && va) { play.textContent = va.paused ? "▶" : "❚❚"; play.setAttribute("aria-label", va.paused ? "Play" : "Pause"); }
+  const sw = $("ab-swap");
+  if (sw) { sw.hidden = AB.mode !== "flip"; sw.textContent = (AB.flip !== AB.held) ? "Showing A" : "Showing B"; }
+  const z = $("ab-zoom-btn"); if (z) z.setAttribute("aria-pressed", String(AB.zoom));
+  const bx = $("ab-boxes-btn"); if (bx) bx.setAttribute("aria-pressed", String(AB.boxes));
+  const lp = $("ab-loop"); if (lp) lp.setAttribute("aria-pressed", String(AB.loop));
+  abLayout();
+  abTick();
+}
+
+/** Every frame: B follows A, the time, the scrubber, the zoom and the boxes. */
+function abTick() {
+  const s = AB.shot && shotById(AB.shot);
+  const [va, vb] = abVideos();
+  if (!s || !va || !vb) return;
+  if (!va.paused && Math.abs(vb.currentTime - va.currentTime) > 0.06) vb.currentTime = va.currentTime;
+  const t = va.currentTime || 0, d = va.duration || 0;
+  const tm = $("ab-time");
+  if (tm) tm.textContent = `${t.toFixed(2)} s · f ${Math.round(t * FPS)}${d ? ` / ${Math.round(d * FPS)}` : ""}`;
+  const sc = $("ab-scrub");
+  if (sc && d && document.activeElement !== sc) sc.value = String(Math.round((t / d) * 1000));
+  let tf = "none";
+  if (AB.zoom) {
+    const fc = abFaceAt(s, t);
+    if (fc && fc.hh > 0) {
+      const z = Math.max(1, Math.min(8, 0.42 / fc.hh));
+      tf = `translate(${(50 - z * fc.cx * 100).toFixed(3)}%, ${(50 - z * fc.cy * 100).toFixed(3)}%) scale(${z.toFixed(4)})`;
+    }
+  }
+  const boxes = AB.boxes ? abBoxesAt(s, t) : [];
+  const svg = boxes.map((b) => `<rect x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" class="${b.redrawn ? "redrawn" : ""}" vector-effect="non-scaling-stroke"></rect>`).join("");
+  for (const z of $("ab").querySelectorAll(".ab-zoom")) {
+    if (z.style.transform !== tf) z.style.transform = tf === "none" ? "" : tf;
+    const g = z.querySelector(".ab-boxes");
+    if (g && g.dataset.k !== svg) { g.innerHTML = svg; g.dataset.k = svg; }
+  }
+}
+
+function abStep(n) {
+  const [va, vb] = abVideos();
+  if (!va) return;
+  va.pause();
+  const d = va.duration || 0;
+  va.currentTime = Math.max(0, Math.min(d ? d - 1 / FPS / 2 : 1e9, (Math.round(va.currentTime * FPS) + n) / FPS));
+  vb.currentTime = va.currentTime;
+}
+
+function abAction(el) {
+  const k = el.dataset.ab, [va, vb] = abVideos();
+  switch (k) {
+    case "close": closeAB(); return;
+    case "play": if (va) { if (va.paused) va.play().catch(() => {}); else va.pause(); } return;
+    case "back": abStep(-1); return;
+    case "fwd": abStep(1); return;
+    case "mode": AB.mode = el.dataset.v; try { store("h3studio.abmode", AB.mode); } catch (e) { /* fine */ } break;
+    case "swap": AB.flip = !AB.flip; break;
+    case "zoom": AB.zoom = !AB.zoom; break;
+    case "boxes": AB.boxes = !AB.boxes; break;
+    case "loop": AB.loop = !AB.loop; if (va) va.loop = vb.loop = AB.loop; break;
+    case "keep": {
+      const s = shotById(AB.shot);
+      if (!s || setupGuard()) return;
+      if (el.dataset.v === "refined" && !faceHasClip(s)) { toast("Refine this Shot again first (its take changed)."); return; }
+      s.face = Object.assign({}, s.face || {}, { keep: el.dataset.v === "original" ? "original" : "refined" });
+      commit();
+      renderAB();
+      return;
+    }
+    default: return;
+  }
+  renderABState();
+}
+
+document.addEventListener("click", (e) => {
+  const el = e.target.closest && e.target.closest("[data-ab]");
+  if (!el || $("ab").hidden || !$("ab").contains(el)) return;
+  e.preventDefault();
+  e.stopPropagation();
+  abAction(el);
+}, true);
+
+$("ab").addEventListener("click", (e) => { if (e.target === $("ab")) closeAB(); });
+
+document.addEventListener("keydown", (e) => {
+  if ($("ab").hidden) return;
+  const tag = (e.target.tagName || "").toLowerCase();
+  if (tag === "input" && e.target.type !== "range") return;
+  const [va] = abVideos();
+  let used = true;
+  if (e.key === "Escape") closeAB();
+  else if (e.key === " " || e.code === "Space") { if (va) { if (va.paused) va.play().catch(() => {}); else va.pause(); } }
+  else if (e.key === "ArrowLeft" && e.target.id !== "ab-divider") abStep(-1);
+  else if (e.key === "ArrowRight" && e.target.id !== "ab-divider") abStep(1);
+  else if (e.key === "f" || e.key === "F") { if (!e.repeat) { if (AB.mode !== "flip") AB.mode = "flip"; AB.held = true; renderABState(); } }
+  else if (e.key === "z" || e.key === "Z") { AB.zoom = !AB.zoom; renderABState(); }
+  else if (e.key === "b" || e.key === "B") { AB.boxes = !AB.boxes; renderABState(); }
+  else if (e.key === "Tab") {
+    const items = [...$("ab").querySelectorAll("button:not([hidden]), input, [tabindex='0']")].filter((x) => x.offsetParent);
+    if (items.length) {
+      const i = items.indexOf(document.activeElement);
+      items[(i + (e.shiftKey ? -1 : 1) + items.length) % items.length].focus();
+    }
+  } else used = false;
+  if (used) { e.preventDefault(); e.stopPropagation(); }
+}, true);
+
+document.addEventListener("keyup", (e) => {
+  if ($("ab").hidden) return;
+  if ((e.key === "f" || e.key === "F") && AB.held) { AB.held = false; renderABState(); e.stopPropagation(); }
+}, true);
+
+async function faceDone(b, outputs) {
+  await adoptClips(Object.entries(b.built.nodes.clips || {}).map(([key, node]) => ({ key, node })), outputs);
+  const s = shotById(b.extra.shot);
+  if (!s) return;
+  let rep = {};
+  try { rep = JSON.parse(((outputs[b.built.nodes.face] || {}).face_report || [])[0] || "{}"); } catch (e) { rep = {}; }
+  const tracks = (rep.tracks || []).slice(0, 6).map((t) => ({ id: t.id, size: t.size, boxes: t.boxes }));
+  s.face = { take: b.extra.take, sig: b.extra.sig,
+    keep: (s.face && s.face.take === b.extra.take && s.face.keep) || "original",
+    treated: rep.treated || 0, cached: (rep.crops || []).length > 0 && (rep.crops || []).every((c) => c.cached),
+    w: rep.width || 0, h: rep.height || 0, crops: (rep.crops || []).map((c) => ({ track: c.track, start: c.start, frames: c.frames, side: c.side })),
+    tracks, note: rep.note || "", made: Date.now() };
+  scheduleSave();
+  if (!rep.treated) toast(rep.note === "no small faces" ? `${titleOf(s)}: no faces under ${P().settings.face.max_face} px, nothing redrawn.` : `${titleOf(s)}: nothing redrawn.`);
+  else if (!S.swapped && P().shots.includes(s)) { renderFace(); openAB(s); }
+}
+
 function renderAdvanced() {
   const s = P().settings, o = S.opts || {};
   const modelShort = (s.model || "no model").split(/[\\/]/).pop().replace(/\.(safetensors|gguf|ckpt|pt)$/i, "");
@@ -6229,6 +6845,28 @@ document.addEventListener("click", async (e) => {
     case "dry-run": dryRun(); break;
     case "dismiss-error": S.error = null; renderDecision(); break;
     case "toggle": S[el.dataset.key] = !S[el.dataset.key]; render(); break;
+    case "face-on": case "face-turbo-on": case "face-hold": {
+      if (setupGuard()) return;
+      const f = p.settings.face;
+      if (a === "face-on") { f.on = !f.on; if (f.on && !f.model) f.model = fl2vaModel(); }
+      else if (a === "face-turbo-on") f.turbo.on = !f.turbo.on;
+      else f.hold_audio = !f.hold_audio;
+      commit();
+      break;
+    }
+    case "face-which": if (setupGuard()) return; p.settings.face.which = el.dataset.v === "largest" ? "largest" : "all"; commit(); break;
+    case "face-detector": installFaceDetector(); break;
+    case "face-try": faceTry(shotById(el.dataset.shot)); break;
+    case "face-ab": openAB(shotById(el.dataset.shot)); break;
+    case "face-keep": {
+      const sh = shotById(el.dataset.shot);
+      if (!sh || setupGuard()) return;
+      if (el.dataset.v === "refined" && !faceHasClip(sh)) { toast("Refine this Shot first."); return; }
+      sh.face = Object.assign({}, sh.face || {}, { keep: el.dataset.v === "original" ? "original" : "refined" });
+      commit();
+      if (!$("ab").hidden) renderAB();
+      break;
+    }
     case "refine-on": case "refine-export": case "refine-turbo-on": {
       if (setupGuard()) return;
       const r = p.settings.refine;
@@ -6732,6 +7370,31 @@ document.addEventListener("change", async (e) => {
     }
     sh.seconds = c.frames / 24;
     if (changed) clipChanged(sh);
+    return commit();
+  }
+  if (el.dataset.faceShot !== undefined) {         // 0.14.1: pick the Shot (moves the viewer there too)
+    if (el.value && shotById(el.value)) focusShot(el.value);
+    return;
+  }
+  if (el.dataset.face) {
+    const f = p.settings.face, k = el.dataset.face;
+    const num = (lo, hi, d, int) => { const v = Number(el.value); const x = Number.isFinite(v) && el.value !== "" ? v : d; return Math.max(lo, Math.min(hi, int ? Math.round(x) : x)); };
+    if (k === "model") f.model = el.value || null;
+    else if (k === "turbo.lora") f.turbo.lora = el.value || null;
+    else if (k === "turbo.strength") f.turbo.strength = num(0, 2, 1);
+    else if (k === "steps") f.steps = num(1, 200, 10, true);
+    else if (k === "denoise") f.denoise = num(0.05, 1, 0.3);
+    else if (k === "shift_video") f.shift_video = num(0.5, 100, 4);
+    else if (k === "max_face") f.max_face = num(16, 2000, 150, true);
+    else if (k === "work") f.work = num(256, 1536, 640, true);
+    else if (k === "padding") f.padding = num(0.2, 3, 0.8);
+    else if (k === "mask") f.mask = num(0.5, 2.5, 1);
+    else if (k === "feather") f.feather = num(0.02, 1, 0.3);
+    else if (k === "color") f.color = num(0, 1, 1);
+    else if (k === "seed") f.seed = num(0, 2 ** 53, 0, true);
+    else if (k === "follow") f.follow = ["auto", "fixed", "follow"].includes(el.value) ? el.value : "auto";
+    else if (k === "cast") f.cast = el.value || null;
+    else if (k === "describe") { f.describe = el.value.slice(0, 300); scheduleSave(); renderFaceSummary(); return; }
     return commit();
   }
   if (el.dataset.refine) {
@@ -8237,6 +8900,16 @@ function relinkModels(p) {
   return n;
 }
 
+/** 0.14.0: the files a Face refine try loads (its own model and LoRA, the text encoder and VAEs). */
+function missingFaceModels(p) {
+  if (!S.opts) return [];
+  const s = p.settings, f = s.face;
+  const slots = [["Face model", "models", f.model], ["Text encoder", "clips", s.clip], ["Video VAE", "vaes", s.video_vae],
+    ["Audio VAE", "vaes", s.audio_vae]];
+  if (f.turbo.on) slots.push(["Face Turbo LoRA", "loras", f.turbo.lora]);
+  return slots.filter(([, kind, v]) => !matchModel(v, S.opts[kind])).map(([label, , v]) => `${label}${v ? ` (${v})` : ""}`);
+}
+
 function missingModels(p) {
   if (!S.opts) return [];
   return modelSlots(p).filter(([, kind, get]) => !matchModel(get(), S.opts[kind]))
@@ -8264,6 +8937,7 @@ function currentFor(target) {
   if (target === "turbo") return s.turbo.lora;
   if (target === "melband") return p.audio.melband_model;
   if (target === "refine_model") return s.refine.model;
+  if (target === "face_model") return s.face.model;
   if (target.startsWith("lora:")) return s.loras[+target.slice(5)].name;
   return s[target];
 }
@@ -8336,6 +9010,7 @@ async function mbPick(name) {
   if (before === name) return;
   if (t === "melband") { p.audio.melband_model = name; if (p.audio.voice_ref) sharedChanged("Audio"); return commit(); }
   if (t === "refine_model") { s.refine.model = name; S.dry = null; return commit(); }
+  if (t === "face_model") { s.face.model = name; return commit(); }
   const matters = t === "turbo" ? s.turbo.on : t.startsWith("lora:") ? s.loras[+t.slice(5)].on : true;
   const what = t === "turbo" ? "the Turbo LoRA" : t.startsWith("lora:") ? `LoRA ${+t.slice(5) + 1}` : KEEPABLE[t] || "the model";
   let mode = "all";

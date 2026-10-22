@@ -215,6 +215,14 @@
       <div id="refine" hidden></div>
     </div>
 
+    <div class="panel" id="face-panel">
+      <button class="fold" data-action="toggle" data-key="faceOpen" id="face-toggle" aria-expanded="false" aria-controls="face">
+        <span class="head-left"><span class="h2">Face refine</span><span class="muted small" id="face-summary"></span></span>
+        <span class="muted chev" id="face-chev">Show ▾</span>
+      </button>
+      <div id="face" hidden></div>
+    </div>
+
     <div class="panel" id="settings-panel">
       <button class="fold" data-action="toggle" data-key="settingsOpen" id="settings-toggle" aria-expanded="true" aria-controls="settings">
         <span class="head-left"><span class="h2">Settings</span><span class="warn-tag">⚠ all shots</span><span class="muted small" id="settings-summary"></span></span>
@@ -253,6 +261,7 @@
   </aside>
 </main>
 
+<div id="ab" class="ab" hidden role="dialog" aria-modal="true" aria-labelledby="ab-title"></div>
 <div id="modal" class="modal" hidden>
   <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <div class="dialog-head">
