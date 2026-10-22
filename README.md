@@ -32,7 +32,7 @@ thrown away.
 - Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
 
-## What's new in 0.13.3
+## What's new in 0.15.0
 
 **Several Studio tabs at once**, each on its own project.
 
@@ -41,7 +41,8 @@ thrown away.
 3. One project, one tab: a project open in another tab can't be opened in a second one (two tabs would save over each other); the project list marks it "open in another tab". A new tab opens the last project that isn't open elsewhere.
 4. A job queued in one tab for a project that's open in another tab moves to that tab when its turn comes, so the result lands where the project is open.
 5. The queue panel also lists what the other tabs have queued (greyed). If a tab closes with jobs still waiting, another Studio tab picks them up.
-6. Lip Sync function works now.  See Audio tab for audio control for lip syncing. 
+6. Lip Sync function works now.  See Audio tab for audio control for lip syncing.
+7. Face Refine Added, refine selected clip then export them as approved clips.  
 
 ## Requirements
 
