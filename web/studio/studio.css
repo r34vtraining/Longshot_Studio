@@ -999,21 +999,19 @@ body.trimming, body.trimming * { cursor: ew-resize !important; user-select: none
 .face-pick select { background: var(--panel); border: 1px solid var(--field-line); border-radius: 6px; color: var(--text);
   padding: 5px 8px; font-size: 13px; max-width: 220px; }
 
-/* 0.15.2: a Shot's row: the title and its details on the left, its notices and buttons
-   right-aligned on the same line, the prompt preview on a line of its own under them (the
-   whole width); on a narrow row the buttons move under the title */
+/* 0.15.4: a Shot's row: the title and its details on the left with the prompt preview under
+   them, as wide as that line (cut off with an ellipsis); its notices and buttons right-aligned.
+   On a narrow row the buttons move under it. */
 .shot-row { flex-wrap: wrap; }
 .shot-head { flex: 1 1 auto; min-width: 200px; flex-wrap: wrap; row-gap: 4px; }
+.sleft { display: inline-grid; min-width: 0; max-width: 100%; row-gap: 2px; }
+.sline { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; row-gap: 2px; min-width: 0; }
 .smeta { min-width: 0; white-space: normal; }
 .smeta > * { white-space: nowrap; }
+.sleft > .sprev { width: 0; min-width: 100%; }      /* as wide as the title line, never wider */
 .snotes { margin-left: auto; display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 4px 10px; }
 .snotes > * { flex: none; white-space: nowrap; }
 .shot-tools { flex: 0 1 auto; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; align-items: center;
   row-gap: 4px; padding-left: 4px; }
 .shot-tools > * { flex: none; white-space: nowrap; }
-.shot-row > .sprev { flex: 1 1 100%; order: 10; display: block; text-align: left; background: transparent; border: 0;
-  padding: 0 14px 12px 50px; cursor: pointer; }
-.shot-row:has(> .sprev) > .shot-head { padding-bottom: 6px; }
-.shot-row > .sprev.has-play { padding-left: 14px; }
-.shot.open > .shot-row > .sprev, .shot-row:has(.shot-head[aria-expanded="true"]) > .sprev { display: none; }
-@media (max-width: 640px) { .shot-row > .sprev { display: none; } }
+@media (max-width: 640px) { .sleft > .sprev { display: none; } }

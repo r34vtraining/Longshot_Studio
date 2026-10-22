@@ -4948,9 +4948,10 @@ function shotRowHTML(s) {
   const ctxBtn = ctxStale ? `<button class="ghost sm bridge" data-action="context-redo" title="Re-render ${title} from the new last frame of the Shot before (the Shots after it keep their takes)">Re-render</button>` : "";
   return `${play}<button class="shot-head${play ? " has-play" : ""}" data-action="toggle-shot" aria-expanded="${open}">
           ${play ? "" : `<span class="sdot" style="background:${L.dot};color:${L.fg}">${L.icon}</span>`}
-          <span class="stitle">${title}</span>
+          <span class="sleft"><span class="sline"><span class="stitle">${title}</span>
           <span class="smeta">${isEmptyShot(s) ? `${(Number(s.seconds) || 0).toFixed(2)}s · <span class="hold-tag" title="No prompt: it holds its time on the film and never renders. Moving the Shot next to it makes it longer or shorter.">holds time</span>`
-            : `${esc(s.seconds)}s · seed ${esc(seed)}`}${songSpanHTML(s)}${editTag(s)}${phraseTag(s)}${alignedTag(s)}${sizeTag(s)}</span>
+            : `${esc(s.seconds)}s · seed ${esc(seed)}`}${songSpanHTML(s)}${editTag(s)}${phraseTag(s)}${alignedTag(s)}${sizeTag(s)}</span></span>
+          <span class="sprev">${esc(s.text) || '<i class="muted">empty</i>'}</span></span>
           <span class="snotes">${flag}${cut}${standaloneTag}${ctxFlag}
           <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span></span>
         </button>
@@ -4959,8 +4960,7 @@ function shotRowHTML(s) {
           ${canReroll ? `<button class="icon lg reroll" data-action="reroll-shot" title="Reroll ${title} (new seed)" aria-label="Reroll ${title}">⟳</button>` : ""}
           <button class="icon lg${s.bypassed ? " on" : ""}" data-action="bypass-shot" aria-pressed="${s.bypassed}" title="${s.bypassed ? "Turn shot back on" : "Bypass shot"}">${POWER}</button>
           <button class="icon lg x" data-action="remove-shot" title="Remove" aria-label="Remove ${title}">${CROSS}</button>
-        </div>
-        <button class="sprev${play ? " has-play" : ""}" data-action="toggle-shot" tabindex="-1" aria-hidden="true">${esc(s.text) || '<i class="muted">empty</i>'}</button>`;
+        </div>`;
 }
 
 /** A run's progress moved on: the rows of the Shots in it (fields untouched). */
