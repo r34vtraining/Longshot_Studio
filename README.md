@@ -1,5 +1,8 @@
 # H3 Long Shot Studio
 
+Music video made by this API
+https://www.youtube.com/watch?v=rPmv9dpM0P8
+
 A browser studio for making long AI videos with MiniMax H3, shot by shot. It runs inside
 ComfyUI at `/longshot`. Build a film from short Shots, review and approve each one, and the
 Studio stitches them into one continuous take or a cut sequence. Approved work is never
