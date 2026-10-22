@@ -63,6 +63,7 @@ function toggleFold(k) {
   store("h3studio.folds", JSON.stringify(f));
   applyFolds();
   if (k === "vsr") renderSettings();
+  if (k.startsWith("face-")) renderFace();        // 0.15.1: the Face refine cards fold too
 }
 /** Is this zone folded in this browser? (Plan, Queue, the Upscale settings) */
 function folded(k) {
@@ -4950,16 +4951,16 @@ function shotRowHTML(s) {
           <span class="stitle">${title}</span>
           <span class="smeta">${isEmptyShot(s) ? `${(Number(s.seconds) || 0).toFixed(2)}s · <span class="hold-tag" title="No prompt: it holds its time on the film and never renders. Moving the Shot next to it makes it longer or shorter.">holds time</span>`
             : `${esc(s.seconds)}s · seed ${esc(seed)}`}${songSpanHTML(s)}${editTag(s)}${phraseTag(s)}${alignedTag(s)}${sizeTag(s)}</span>
-          <span class="sprev">${esc(s.text) || '<i class="muted">empty</i>'}</span>
-          ${flag}${cut}${standaloneTag}${ctxFlag}
-          <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span>
+          <span class="snotes">${flag}${cut}${standaloneTag}${ctxFlag}
+          <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span></span>
         </button>
         <div class="shot-tools">
           ${promptFlag}${promptBtn}${joinChip}${ctxBtn}
           ${canReroll ? `<button class="icon lg reroll" data-action="reroll-shot" title="Reroll ${title} (new seed)" aria-label="Reroll ${title}">⟳</button>` : ""}
           <button class="icon lg${s.bypassed ? " on" : ""}" data-action="bypass-shot" aria-pressed="${s.bypassed}" title="${s.bypassed ? "Turn shot back on" : "Bypass shot"}">${POWER}</button>
           <button class="icon lg x" data-action="remove-shot" title="Remove" aria-label="Remove ${title}">${CROSS}</button>
-        </div>`;
+        </div>
+        <button class="sprev${play ? " has-play" : ""}" data-action="toggle-shot" tabindex="-1" aria-hidden="true">${esc(s.text) || '<i class="muted">empty</i>'}</button>`;
 }
 
 /** A run's progress moved on: the rows of the Shots in it (fields untouched). */
@@ -6247,6 +6248,7 @@ function renderFace() {
     .map((c) => `<option value="${esc(c.id)}"${f.cast === c.id ? " selected" : ""}>${esc(c.label || "Cast member")}</option>`).join("");
   const fl = isFl2va(f.model);
   const advOpen = !folded("face-adv");
+  const modelOpen = !folded("face-model");
   const rendered = active().filter((x) => x.kind !== "clip" && x.take && isRendered(x));
   const known = rendered.filter((x) => Array.isArray(faceSizes(x)));
   const withSmall = known.filter((x) => smallFaces(x).length);
@@ -6256,7 +6258,7 @@ function renderFace() {
   let film = "";
   if (o.face_detector && rendered.length) {
     film = `Small faces in <b>${withSmall.length}</b> of ${known.length} Shot${known.length === 1 ? "" : "s"} looked at` +
-      (pending ? ` · looking at ${pending} more…` : "") + (noClip ? ` · ${noClip} without a clip yet` : "") + ".";
+      (pending ? ` · looking at ${pending} more` : "") + (noClip ? ` · ${noClip} without a clip yet` : "") + (pending ? "…" : ".");
   }
   const refinedNow = active().filter(faceRefined);
   const refinedList = refinedNow.length ? `<div class="muted small" style="margin-top:8px">Exporting refined: ${refinedNow.map((x) => esc(titleOf(x))).join(", ")}</div>` : "";
@@ -6298,7 +6300,11 @@ function renderFace() {
       <span class="route-text"><b>Redraw small faces</b><i>refine the Shots you choose: H3 redraws each small face as a steady close-up and blends it back in</i></span></div>
     ${shotHTML}
     ${refinedList}
-    <div class="model-files" style="margin-top:10px">
+    <div class="box face-card" style="margin-top:12px">
+      <button class="fold" data-action="fold" data-fold="face-model" aria-expanded="${modelOpen}">
+        <span>Face model and faces${modelOpen ? "" : `<span class="muted small"> · ${esc(f.model ? shortModel(f.model) : "no model")} · ${esc(f.steps)} steps · denoise ${Number(f.denoise).toFixed(2)} · under ${esc(f.max_face)} px</span>`}</span>
+        <span class="muted chev">${modelOpen ? "Hide ▴" : "Show ▾"}</span></button>
+      ${modelOpen ? `<div class="model-files" style="margin-top:10px">
       ${modelField("Face model", "diffusion_models", "face_model", `<select data-face="model" aria-label="Face refine model"${dis}>${fileOptions(o.models, f.model, "Choose a model…")}</select>`)}
     </div>
     <div class="grid3" style="margin-top:10px">
@@ -6329,6 +6335,7 @@ function renderFace() {
         <select data-face="cast"${f.on && !fl ? "" : " disabled"}><option value="">None · keep the take's face</option>${castOpts}</select></label>
       <label class="lbl" title="Added to the close-up's prompt, e.g. a young woman with freckles and red lipstick">Describe the face (optional)
         <input type="text" data-face="describe" value="${esc(f.describe || "")}" placeholder="e.g. a young woman with freckles"${dis}></label>
+    </div>` : ""}
     </div>
     <div class="box" style="margin-top:12px">
       <button class="fold" data-action="fold" data-fold="face-adv" aria-expanded="${advOpen}">
