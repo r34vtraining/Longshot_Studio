@@ -36,6 +36,11 @@ thrown away.
 - Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
 
+## What's new in 0.17.6
+
+1. Minor timeline UI adjustments for ease of use
+2. Minor shot box UI adjustments for alignment 
+
 ## What's new in 0.17.0
 
 **Several Studio tabs at once**, each on its own project.
