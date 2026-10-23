@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.17.0"
+STUDIO_VERSION = "0.17.6"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -1471,7 +1471,7 @@ def rename_project(store, input_dir, output_dir, slug, name, base=None):
     audio = project.get("audio") or {}
     if (audio.get("subfolder") or "").replace("\\", "/").strip("/") == old_sub:
         audio["subfolder"] = new_sub
-    for v in project.get("voices") or []:
+    for v in (project.get("voices") or []) + (project.get("videos") or []):     # 0.17.1: video references too
         if isinstance(v, dict) and (v.get("subfolder") or "").replace("\\", "/").strip("/") == old_sub:
             v["subfolder"] = new_sub
     for sh in project.get("shots") or []:
@@ -1563,6 +1563,9 @@ def _refs(project):
     for v in project.get("voices") or []:          # voice references (audio cards)
         if isinstance(v, dict) and v.get("file"):
             out.append((f"voice:{v.get('id')}", v, "file"))
+    for v in project.get("videos") or []:          # 0.17.1: video references (video cards)
+        if isinstance(v, dict) and v.get("file"):
+            out.append((f"video:{v.get('id')}", v, "file"))
     for sh in project.get("shots") or []:
         clip = sh.get("clip")
         if isinstance(clip, dict) and clip.get("file"):

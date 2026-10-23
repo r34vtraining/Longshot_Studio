@@ -111,33 +111,50 @@ def film_layout(pieces, overlap, planner):
         cur.append(p)
     if cur:
         runs.append(cur)
-    out, base = [], 0
+    out, shifts, base = [], [], 0
     for k, run in enumerate(runs):
         spans = _plan_run(run, overlap, planner)
         length = spans[-1][2] if spans else 0
-        start = _pinned_start(run[0].get("pin"), base, length, out) if k and out else base
+        own = _int(run[0].get("shift"))
+        start = _pinned_start(run[0].get("pin"), base, length, out, shifts, own) if k and out else base
         for p, (ws, vs, we) in zip(run, spans):
             out.append({"id": p.get("id"), "ws": start + ws, "vs": start + vs, "we": start + we, "run": k})
+            shifts.append(own)
         base = start + length
     total = max([base] + [p["we"] for p in out])
     return {"fps": FPS, "total": total, "pieces": out}
 
 
-def _pinned_start(pin, base, length, placed):
+def _int(x):
+    try:
+        return int(round(float(x or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pinned_start(pin, base, length, placed, shifts=None, own=0):
     """0.17.0: where a run that starts with a Cut / Context Shot starts: its pin, kept
     between the start of the Shot before and that Shot's end; never
-    over the Shot two back, and never ending before the Shot before ends."""
+    over the Shot two back, and never ending before the Shot before ends.
+
+    0.17.3: in the film's own frames, moves included (`shifts`: each placed piece's run
+    move, `own`: this run's). A move doesn't push the Shots after it, so the Shot after a
+    Shot moved later starts inside it; its pin can go up to that Shot's real end."""
+    if pin is None:
+        return base
     try:
         pin = int(round(float(pin)))
     except (TypeError, ValueError):
         return base
-    prev = placed[-1]
-    lo = max(prev["vs"], prev["we"] - length)
+    shifts = shifts or [0] * len(placed)
+    prev, ps = placed[-1], shifts[-1]
+    lo = max(prev["vs"] + ps, prev["we"] + ps - length)
     if len(placed) >= 2:
-        lo = max(lo, placed[-2]["we"])
-    if lo >= base:
+        lo = max(lo, placed[-2]["we"] + shifts[-2])
+    hi = max(prev["we"] + ps, base + own)              # no gap after the Shot before (as the film shows it)
+    if lo >= hi:
         return base
-    return max(lo, min(base, pin))
+    return max(lo, min(hi, pin + own)) - own
 
 
 def run_shifts(shots):
@@ -156,7 +173,8 @@ def run_shifts(shots):
 def film_pieces(shots, windows=None):
     """Layout pieces for these Shots (film order); `windows` overrides a Shot's frames."""
     windows = windows or {}
-    return [{"id": str(sh.get("id")), "seconds": shot_seconds(sh),
+    moves = run_shifts(shots)
+    return [{"id": str(sh.get("id")), "seconds": shot_seconds(sh), "shift": moves.get(str(sh.get("id")), 0),
              "window": windows.get(str(sh.get("id")), planned_window(sh)), "cut": is_cut(shots, i),
              "hold": hold_frames(sh) if is_empty(sh) else 0,
              "pin": shot_pin(shots, i)}

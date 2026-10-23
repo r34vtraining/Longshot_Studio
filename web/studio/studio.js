@@ -158,6 +158,13 @@ function normalize(p) {
     // sound of its own (<sfx> of cars driving by): sfx, ambience, music or your own words
     role: AUDIO_ROLES.some(([k]) => k === v.role) ? v.role : "voice", role_text: v.role_text || "",
     desc: v.desc || "", use: v.use === "copy" ? "copy" : "reference" }));
+  // 0.17.1: video references: <Video N> cards in Cast & Scenes, their soundtrack optional
+  p.videos = (p.videos || []).map((v) => ({ id: v.id || uid("w"), label: v.label || "", desc: v.desc || "",
+    role: REFMOD_ROLES.includes(v.role) ? v.role : "motion", file: v.file || "", subfolder: v.subfolder || "", type: "input",
+    original_name: v.original_name || v.file || "", sha256: v.sha256 || null, size_bytes: v.size_bytes ?? null,
+    start: Math.max(0, Number(v.start) || 0), length: Math.max(0, Number(v.length) || 0),
+    duration: Number(v.duration) || null, fps: Number(v.fps) || null, width: Number(v.width) || null, height: Number(v.height) || null,
+    has_audio: v.has_audio !== false, sound: !!v.sound, bypassed: !!v.bypassed }));
   p.ref_sets = p.ref_sets && typeof p.ref_sets === "object" ? p.ref_sets : {};      // 0.8.13: restore references
   p.take_refs = p.take_refs && typeof p.take_refs === "object" ? p.take_refs : {};
   p.style = Object.assign({ summary: "", retention: "", style_line: "", soundscape: "", music: "N/A",
@@ -245,7 +252,27 @@ const liveVoices = () => (P().voices || []).filter((v) => !v.bypassed && v.file)
 const voiceById = (id) => (P().voices || []).find((v) => v.id === id) || null;
 function audioLabelOf(v) {
   const i = v ? liveVoices().indexOf(v) : -1;
-  return i < 0 ? null : `<Audio ${songSlot() + i + 1}>`;
+  return i < 0 ? null : `<Audio ${videoAudioCount() + songSlot() + i + 1}>`;
+}
+/** 0.17.1: video references that are on (and have a file): <Video N> in card order. A
+ *  soundtrack that goes in takes the first <Audio N> labels, before the song and voices. */
+const MAX_REF_VIDEOS = 3, REF_VIDEO_MIN_S = 2, REF_VIDEO_MAX_S = 15;
+const liveVideos = () => (P().videos || []).filter((v) => !v.bypassed && v.file);
+const videoSound = (v) => !!v.sound && v.has_audio !== false;
+const videoAudioCount = () => liveVideos().filter(videoSound).length;
+const videoById = (id) => (P().videos || []).find((v) => v.id === id) || null;
+/** {v: "<Video N>", a: "<Audio M>" | null} for a live video reference, else null. */
+function videoLabelOf(v) {
+  const live = liveVideos(), i = v ? live.indexOf(v) : -1;
+  if (i < 0) return null;
+  const a = videoSound(v) ? live.slice(0, i + 1).filter(videoSound).length : 0;
+  return { v: `<Video ${i + 1}>`, a: a ? `<Audio ${a}>` : null };
+}
+/** The part of a video reference that goes in: [start, length] in seconds. */
+function videoSpan(v) {
+  const start = Math.max(0, Number(v.start) || 0), dur = Number(v.duration) || 0;
+  const len = Math.min(REF_VIDEO_MAX_S, Number(v.length) || (dur ? Math.max(0, dur - start) : REF_VIDEO_MAX_S));
+  return [start, len];
 }
 /** 0.9.1: the song takes <Audio 1> while its switch is on and a file is chosen. */
 const songRefOn = () => !!(P() && P().audio && P().audio.song_ref && P().audio.file);
@@ -415,7 +442,8 @@ function layoutPieces() {
   return act.map((s, i) => ({ id: s.id, seconds: s.kind === "clip" ? (Number(s.clip && s.clip.frames) || 0) / FPS
     : Number(s.seconds) || 0, window: plannedWindow(s), cut: i > 0 && runStartAt(act, i),
     hold: isEmptyShot(s) ? Math.max(1, Math.round((Number(s.seconds) || 0) * FPS)) : 0,
-    pin: i > 0 && runStartAt(act, i) && s.pin !== null && s.pin !== undefined ? s.pin : null }));
+    pin: i > 0 && runStartAt(act, i) && s.pin !== null && s.pin !== undefined ? s.pin : null,
+    shift: effEdit(s).shift }));                     // 0.17.3: a pin may reach a moved Shot's real end
 }
 
 /** Ask for the layout when the Shots changed (debounced); render again when it comes. */
@@ -677,7 +705,9 @@ function missingRefs() {
   const anchors = anchorKeys().filter((k) => anchorItem(k) && ["missing", "invalid"].includes(S.refState["anchor:" + k]))
     .map((k) => ({ label: anchorTitle(k) }));
   const voices = liveVoices().filter((v) => ["missing", "invalid"].includes(S.refState["voice:" + v.id]))
-    .map((v) => ({ label: v.label || audioLabelOf(v) }));
+    .map((v) => ({ label: v.label || audioLabelOf(v) }))
+    .concat(liveVideos().filter((v) => ["missing", "invalid"].includes(S.refState["video:" + v.id]))
+      .map((v) => ({ label: v.label || (videoLabelOf(v) || {}).v })));
   return liveCast().filter((c) => !c.image || ["missing", "invalid"].includes(S.refState[c.id])).concat(clips, anchors, voices);
 }
 const audioMissing = () => !!P().audio.file && ["missing", "invalid"].includes(S.refState.audio);
@@ -851,6 +881,9 @@ async function checkInputs() {
   for (const v of p.voices || []) {
     if (v.file) files.push({ key: "voice:" + v.id, name: v.file, subfolder: v.subfolder, sha256: v.sha256 });
   }
+  for (const v of p.videos || []) {
+    if (v.file) files.push({ key: "video:" + v.id, name: v.file, subfolder: v.subfolder, sha256: v.sha256 });
+  }
   if (!files.length) { S.refState = {}; return; }
   let res;
   try { res = await api("/longshot/check-inputs", { method: "POST", body: { files } }); } catch (e) { return; }
@@ -859,7 +892,7 @@ async function checkInputs() {
   for (const f of res.files) {
     state[f.key] = f.state;
     S.refInfo[f.key] = f;
-    const item = f.key === "audio" ? p.audio : f.key.startsWith("clip:") || f.key.startsWith("anchor:") || f.key.startsWith("voice:")
+    const item = f.key === "audio" ? p.audio : f.key.startsWith("clip:") || f.key.startsWith("anchor:") || f.key.startsWith("voice:") || f.key.startsWith("video:")
       ? refItem(f.key) : p.cast.find((c) => c.id === f.key);
     if (!item) continue;
     if (f.key.startsWith("anchor:")) {          // a frame anchor: just follow the file
@@ -940,9 +973,10 @@ function refItem(key) {
   if (key.startsWith("clip:")) { const sh = p.shots.find((x) => x.id === key.slice(5)); return sh && sh.clip; }
   if (key.startsWith("anchor:")) return anchorItem(key.slice(7));
   if (key.startsWith("voice:")) return voiceById(key.slice(6));
+  if (key.startsWith("video:")) return videoById(key.slice(6));
   return p.cast.find((c) => c.id === key);
 }
-function refName(key) { const it = refItem(key); return key === "audio" || key.startsWith("clip:") || key.startsWith("anchor:") || key.startsWith("voice:") ? it.file : it.image; }
+function refName(key) { const it = refItem(key); return key === "audio" || key.startsWith("clip:") || key.startsWith("anchor:") || key.startsWith("voice:") || key.startsWith("video:") ? it.file : it.image; }
 function refLabel(key) {
   if (key === "audio") return "The song";
   if (key.startsWith("clip:")) { const sh = P().shots.find((x) => x.id === key.slice(5)); return sh ? `${titleOf(sh)}'s clip` : "A clip"; }
@@ -3095,12 +3129,12 @@ async function installPreview() {
 // stored once in p.ref_sets; p.take_refs maps a take to its set.
 // ---------------------------------------------------------------------------
 
-const REF_KINDS = [["cast", "picture", "pictures"], ["voices", "voice", "voices"], ["refmods", "RefMod", "RefMods"]];
+const REF_KINDS = [["cast", "picture", "pictures"], ["videos", "video", "videos"], ["voices", "voice", "voices"], ["refmods", "RefMod", "RefMods"]];
 
 function refSnapshot(p = P()) {
   const live = (xs) => JSON.parse(JSON.stringify((xs || []).filter((x) => !x.bypassed)));
   // 0.16.0: and the Style & Sound text, so Restore all can put it back
-  return { cast: live(p.cast), voices: live(p.voices), refmods: live(p.refmods), style: JSON.parse(JSON.stringify(p.style || {})) };
+  return { cast: live(p.cast), videos: live(p.videos), voices: live(p.voices), refmods: live(p.refmods), style: JSON.parse(JSON.stringify(p.style || {})) };
 }
 
 function refSetKey(set) {
@@ -3691,9 +3725,12 @@ function takeSong(name) {
  *  trim_in for length, and the song under it on the film (its move included). */
 function exportCut(s) {
   const L = LAYOUT.byId[s.id], w = takeWindow(s.id, s.take), out = {};
-  if (L && w && hasEdit(s)) {
-    const e = effEdit(s), t0 = L.we - w;
-    out.trim_in = Math.max(0, L.vs - t0 + e.in);
+  const e = effEdit(s);
+  // 0.17.6: only a trim cuts the clip, and never the frames a Continuous Shot shares with
+  // the Shot before (handy in an editor). A move cuts nothing: it places the song.
+  if (L && w && (e.in || e.out)) {
+    const t0 = L.we - w;
+    out.trim_in = Math.max(0, e.in);
     out.length = Math.max(1, w - out.trim_in - e.out);
     if (songMode()) {
       out.song_at = +(songStart() + (t0 + out.trim_in + e.shift) / LAYOUT.fps).toFixed(4);
@@ -4121,9 +4158,10 @@ function fitLength(s, by) {
   let at = sl.L.vs;
   if (sl.left) {
     at = Math.max(lo, Math.min(hi, sl.L.vs));
-    s.pin = at < sl.Lp.we ? at - sl.shift : null;
+    s.pin = at - sl.shift;
   }
   sl.N.pin = at + w >= sl.Ln.vs ? sl.Ln.vs - effEdit(sl.N).shift : null;
+  holdCut(sl.left && at < sl.Lp.we ? s : null, at + w > sl.Ln.vs ? sl.N : null);
   return note;
 }
 
@@ -4186,8 +4224,9 @@ document.addEventListener("pointerup", () => {
   TRIM.swallow = performance.now() + 120;
   if (d.at === d.at0) return;
   const sl = d.sl;
-  d.s.pin = d.at < sl.Lp.we ? d.at - sl.shift : null;
+  d.s.pin = d.at - sl.shift;          // (kept at the very end too: the Shot before may be moved)
   if (sl.N && sl.right) sl.N.pin = d.at + d.w >= sl.Ln.vs ? sl.Ln.vs - effEdit(sl.N).shift : null;   // stays, or closes up
+  holdCut(d.at < sl.Lp.we ? d.s : null, sl.N && sl.right && d.at + d.w > sl.Ln.vs ? sl.N : null);
   if (songOn()) toast(`${titleOf(d.s)} gets the song from its new place when it renders.`);
   commit();
 });
@@ -4233,6 +4272,21 @@ document.addEventListener("pointerup", () => {
   commit();
 });
 
+/** 0.17.3: a Shot that overlaps a neighbour must be a Cut (or Context): a Continuous Shot
+ *  carries on from the one before and can't overlap it. An empty Shot (a placeholder) is
+ *  always on its own, so it could overlap as Continuous, then lost the overlap as soon as it
+ *  got a prompt. Returns the Shots switched to Cut. */
+function holdCut(...xs) {
+  const out = [];
+  for (const x of xs) {
+    if (!x || x.kind === "clip" || x.join === "cut" || x.join === "context") continue;
+    x.join = "cut";
+    out.push(x);
+  }
+  if (out.length) toast(`${out.map(titleOf).join(" and ")} ${out.length > 1 ? "are" : "is"} set to Cut so ${out.length > 1 ? "they keep their" : "it keeps its"} overlap (a Continuous Shot can't overlap the one before).`);
+  return out;
+}
+
 /** Back to no overlap: the Shot starts where the one before ends (the Shot after it keeps its place). */
 function clearOverlap(s) {
   if (!s || isRendered(s)) return;
@@ -4242,7 +4296,8 @@ function clearOverlap(s) {
     if (hi < sl.Lp.we) { toast(`${titleOf(s)} would cover too much of ${titleOf(sl.N)}. Make it shorter first.`); return; }
     sl.N.pin = sl.Ln.vs - effEdit(sl.N).shift;
   }
-  s.pin = null;
+  // right where the Shot before ends as the film shows it (its move included)
+  s.pin = sl ? sl.Lp.we - sl.shift : null;
   s.ov_cut = null;
   commit();
 }
@@ -4923,7 +4978,7 @@ function castSummary(p = P()) {
     if (!on && !off) return "";
     return `${on} ${on === 1 ? one : many}` + (off ? ` (+${off} off)` : "");
   };
-  return [part(p.cast, "picture", "pictures"), part(p.voices, "voice", "voices"), part(p.refmods, "RefMod", "RefMods")]
+  return [part(p.cast, "picture", "pictures"), part(p.videos, "video", "videos"), part(p.voices, "voice", "voices"), part(p.refmods, "RefMod", "RefMods")]
     .filter(Boolean).join(" · ") || "no references yet";
 }
 
@@ -4967,8 +5022,12 @@ function renderCast() {
   // rows (0.8.6): pictures, then audio references, then RefMods, each starting its own row
   cards.push(`<button class="addtile" data-action="add-cast" data-drop="add">${PLUS} <span>Add reference · ${esc(`<Picture ${n + 1}>`)}<br><span class="muted small">or drop images here</span></span></button>`);
   cards.push('<div class="cast-break"></div>');
+  // 0.17.1: video references, a row of their own
+  for (const v of P().videos || []) cards.push(videoCard(v));
+  cards.push(`<button class="addtile video-add" data-action="add-video">${PLUS} <span>Add video reference · ${esc(`<Video ${liveVideos().length + 1}>`)}<br><span class="muted small">motion, a camera move, a look · or drop a video here</span></span></button>`);
+  cards.push('<div class="cast-break"></div>');
   for (const v of P().voices || []) cards.push(voiceCard(v));
-  const nextA = songSlot() + liveVoices().length + 1;
+  const nextA = videoAudioCount() + songSlot() + liveVoices().length + 1;
   cards.push(`<button class="addtile voice-add" data-action="add-voice">${PLUS} <span>Add audio reference · ${esc(`<Audio ${nextA}>`)}<br><span class="muted small">a voice or a sound · or drop audio here</span></span></button>`);
   cards.push('<div class="cast-break"></div>');
   for (const m of P().refmods || []) cards.push(refmodCard(m));
@@ -5046,7 +5105,8 @@ function voiceCard(v) {
   const role = v.role || "voice";
   const who = [...liveCast().filter((c) => c.voice === v.id).map((c) => c.label || picOf(c)),
     ...(P().refmods || []).filter((m) => !m.bypassed && m.voice === v.id).map((m) => m.label || m.name)];
-  const over = !v.bypassed && a && Number(a.match(/\d+/)[0]) > MAX_AUDIO_REFS;
+  // standalone reference audios (the song, then voices); a video's soundtrack is its own input (0.17.1)
+  const over = !v.bypassed && a && songSlot() + liveVoices().indexOf(v) + 1 > MAX_AUDIO_REFS;
   const src = v.file && !missing ? viewURL({ filename: v.file, subfolder: v.subfolder, type: "input" }) : "";
   const up = S.uploading["voice:" + v.id] ? '<div class="drop-busy">Uploading…</div>' : "";
   const what = role === "voice" ? (who.length ? `Voice timbre of ${esc(who.join(", "))}` : "Voice timbre · not linked to a picture yet")
@@ -5074,7 +5134,7 @@ const liveRefmods = () => (P().refmods || []).filter((m) => !m.bypassed && m.nam
 function refmodLabelOf(m) {
   const i = liveRefmods().indexOf(m);
   if (i < 0) return null;
-  const counts = { image: liveCast().length, video: 0, audio: songSlot() + liveVoices().length };
+  const counts = { image: liveCast().length, video: liveVideos().length, audio: videoAudioCount() + songSlot() + liveVoices().length };
   let label = null;
   liveRefmods().slice(0, i + 1).forEach((x) => { counts[x.kind] += 1; label = `<${{ image: "Picture", video: "Video", audio: "Audio" }[x.kind]} ${counts[x.kind]}>`; });
   return label;
@@ -5112,6 +5172,100 @@ async function pickRefmod() {
 }
 
 function voiceOf(el) { const c = el.closest("[data-voice]"); return c && voiceById(c.dataset.voice); }
+function videoOf(el) { const c = el.closest("[data-video]"); return c && videoById(c.dataset.video); }
+
+/** 0.17.1: a video reference card: <Video N>, label, its role, a player, the part that goes in. */
+function videoCard(v) {
+  const L = videoLabelOf(v), state = S.refState["video:" + v.id];
+  const missing = !!v.file && (state === "missing" || state === "invalid");
+  const over = !v.bypassed && L && liveVideos().indexOf(v) >= MAX_REF_VIDEOS;
+  const src = v.file && !missing ? viewURL({ filename: v.file, subfolder: v.subfolder, type: "input" }) : "";
+  const up = S.uploading["video:" + v.id] ? '<div class="drop-busy">Uploading…</div>' : "";
+  const [st, len] = videoSpan(v);
+  const short = v.file && len < REF_VIDEO_MIN_S;
+  const label = v.bypassed ? "bypassed" : L ? L.v : "—";
+  return `<div class="card video-card${v.bypassed ? " off" : ""}${missing && !v.bypassed ? " missing" : ""}" data-video="${esc(v.id)}">${up}
+      <div class="thumb-col"><button class="thumb video-thumb" data-action="edit-video" title="Edit · drop a video on this card to replace it" aria-label="Edit ${esc(v.label || "this video reference")}">${src
+        ? `<video src="${esc(src)}#t=${st.toFixed(2)}" muted preload="metadata" playsinline></video>` : "🎞"}</button></div>
+      <div class="card-body">
+        <div class="card-top"><span class="pic">${esc(label)}</span>
+          <button class="label-view" data-action="edit-video" title="Edit this video reference">${esc(v.label) || '<i class="muted">no label</i>'}</button></div>
+        <div class="muted small">${over ? `<span class="warn">Long Shot takes ${MAX_REF_VIDEOS} reference videos: bypass one.</span>`
+          : short ? `<span class="warn">${len.toFixed(2)} s: H3 wants ${REF_VIDEO_MIN_S}–${REF_VIDEO_MAX_S} s.</span>`
+          : `${esc(v.role)}${v.has_audio === false ? " · no sound" : v.sound ? ` · with its sound${L && L.a ? ` <span class="pic">${esc(L.a)}</span>` : ""}` : " · picture only"}`}</div>
+        <button class="desc-view" data-action="edit-video" title="Edit this video reference">${esc(v.desc) || "<i>Add a description…</i>"}</button>
+        ${missing ? `<div class="missing">Missing: ${esc(v.original_name || v.file)}</div>` : ""}
+        <div class="muted small voice-file" title="${esc((v.subfolder ? v.subfolder + "/" : "") + v.file)}">${esc(v.original_name || v.file || "No file")}${v.file ? ` · ${st.toFixed(2)}–${(st + len).toFixed(2)} s` : ""}</div>
+      </div>
+      <div class="card-tools">
+        <button class="icon" data-action="edit-video" title="Edit" aria-label="Edit ${esc(v.label || "this video reference")}">${PENCIL}</button>
+        <button class="icon${v.bypassed ? " on" : ""}" data-action="bypass-video" aria-pressed="${v.bypassed}" title="${v.bypassed ? "Turn back on" : "Bypass"}">${POWER}</button>
+        <button class="icon x" data-action="remove-video" title="Remove" aria-label="Remove ${esc(v.label || "this video reference")}">${CROSS}</button>
+      </div></div>`;
+}
+
+/** Dropping (or choosing) videos on Cast & Scenes: one video reference per file, or a
+ *  new file for the card it was dropped on. */
+async function addVideos(fileList, targetId) {
+  const p = P();
+  const files = [...fileList].filter((x) => VIDEO_RE.test(x.name || ""));
+  if (!files.length) { toast("Drop a video file for a video reference (MP4, MOV, WebM, MKV)."); return; }
+  if (setupGuard()) return;
+  const target = targetId ? videoById(targetId) : null;
+  const list = target ? files.slice(0, 1) : files;
+  const cards = list.map((f) => {
+    if (target) return target;
+    const v = { id: uid("w"), label: "<" + (f.name || "video").replace(/\.[^.]+$/, "").slice(0, 24) + ">", desc: "", role: "motion",
+      file: "", subfolder: "", type: "input", original_name: "", sha256: null, size_bytes: null, start: 0, length: 0,
+      duration: null, fps: null, width: null, height: null, has_audio: true, sound: false, bypassed: false };
+    p.videos.push(v);
+    return v;
+  });
+  cards.forEach((v) => { S.uploading["video:" + v.id] = true; });
+  render();
+  const failed = [];
+  const uploaded = await Promise.all(list.map(async (f) => {
+    try {
+      const info = await uploadFile(f, "video");
+      const pr = await api(`/longshot/probe?name=${encodeURIComponent(info.name)}&subfolder=${encodeURIComponent(info.subfolder || "")}`);
+      return { info, pr };
+    } catch (e) { failed.push(`${f.name}: ${e.message}`); return null; }
+  }));
+  let changed = false;
+  uploaded.forEach((r, i) => {
+    const v = cards[i];
+    delete S.uploading["video:" + v.id];
+    if (!r) { if (!target) p.videos.splice(p.videos.indexOf(v), 1); return; }
+    const { info, pr } = r;
+    const same = !!v.sha256 && info.sha256 === v.sha256;
+    Object.assign(v, { file: info.name, subfolder: info.subfolder || "", original_name: info.name, sha256: info.sha256 || null,
+      size_bytes: info.size_bytes || null, duration: pr.duration || null, fps: pr.fps || null, width: pr.width || null,
+      height: pr.height || null, has_audio: !!pr.has_audio });
+    if (!same) { v.start = 0; v.length = 0; }
+    if (!v.has_audio) v.sound = false;
+    S.refState["video:" + v.id] = "ok";
+    if (!same && !v.bypassed) changed = true;
+  });
+  await loadInputs();
+  if (changed) applyRefChange((await askRefChange()) || "keep", "Video references");
+  commit();
+  const notes = [];
+  if (failed.length) notes.push(`Couldn't add ${failed.join("; ")}`);
+  if (liveVideos().length > MAX_REF_VIDEOS) notes.push(`Long Shot takes ${MAX_REF_VIDEOS} reference videos: bypass some before rendering.`);
+  const long = cards.find((v) => v.file && (Number(v.duration) || 0) > REF_VIDEO_MAX_S && !v.length);
+  if (long) notes.push(`${long.label} is longer than ${REF_VIDEO_MAX_S} s: its first ${REF_VIDEO_MAX_S} s go in (set Start and Length in its editor).`);
+  if (notes.length) toast(notes.join(" "));
+}
+
+function pickVideos(targetId) {
+  if (setupGuard()) return;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "video/*,.mkv,.webm,.mov";
+  inp.multiple = !targetId;
+  inp.addEventListener("change", () => { if (inp.files.length) addVideos(inp.files, targetId); });
+  inp.click();
+}
 
 /** Dropping (or choosing) audio on Cast & Scenes: one voice reference per file,
  *  or a new file for the card it was dropped on. */
@@ -7453,6 +7607,29 @@ document.addEventListener("click", async (e) => {
       break;
     }
     case "voice-replace": { const v = voiceOf(el); if (v) pickVoices(v.id); break; }
+    case "add-video": pickVideos(null); break;
+    case "video-replace": { const v = videoOf(el) || videoById(el.dataset.video); if (v) pickVideos(v.id); break; }
+    case "edit-video": openVideoEditor(videoOf(el)); break;
+    case "bypass-video": {
+      if (setupGuard()) return;
+      const v = videoOf(el);
+      if (!v) return;
+      const mode = await askRefChange();
+      v.bypassed = !v.bypassed;
+      applyRefChange(mode, "Video references");
+      commit();
+      break;
+    }
+    case "remove-video": {
+      if (setupGuard()) return;
+      const v = videoOf(el);
+      if (!v || !confirm(`Remove ${v.label || "this video reference"}?`)) return;
+      const mode = await askRefChange();
+      p.videos = p.videos.filter((x) => x.id !== v.id);
+      if (!v.bypassed) applyRefChange(mode, "Video references");
+      commit();
+      break;
+    }
     case "bypass-voice": {
       if (setupGuard()) return;
       const v = voiceOf(el);
@@ -7968,7 +8145,16 @@ function shotInput(el) {
   if (!s || el.readOnly) return;
   const k = el.dataset.shotField, key = s.id + ":" + k;
   delete S.bad[key];
-  if (k === "text") s.text = el.value;
+  if (k === "text") {
+    const wasEmpty = isEmptyShot(s);
+    if (wasEmpty && el.value.trim()) {
+      // 0.17.3: a placeholder that overlaps a neighbour keeps the overlap once it has a prompt
+      const by = overlaps(), act = active(), nx = act[act.indexOf(s) + 1];
+      const keep = [by[s.id] && by[s.id].cut ? s : null, nx && by[nx.id] && by[nx.id].cut && by[nx.id].cut.prev === s.id ? nx : null];
+      s.text = el.value;
+      holdCut(...keep);
+    } else s.text = el.value;
+  }
   else if (k === "seconds") {
     const v = parseFloat(el.value);
     // 0.17.0: the Shot after it keeps its place (the layout from before the edit is kept)
@@ -8534,6 +8720,8 @@ function dropTargetOf(e) {
   if (cast) {
     const vc = e.target.closest("[data-voice]");
     if (vc) return { zone: "cast", el: vc, id: null, voice: vc.dataset.voice };
+    const wc = e.target.closest("[data-video]");
+    if (wc) return { zone: "cast", el: wc, id: null, video: wc.dataset.video };
     const card = e.target.closest("[data-cast]");
     return card ? { zone: "cast", el: card, id: card.dataset.cast }
       : { zone: "cast", el: cast.querySelector("[data-drop=add]") || cast, id: null };
@@ -8582,7 +8770,8 @@ window.addEventListener("drop", (e) => {
   if (t.zone === "cast") {
     const fl = [...e.dataTransfer.files];
     // audio files on Cast & Scenes are voice references (a voice card: replace its file)
-    if (t.voice || (fl.some((x) => AUDIO_RE.test(x.name || "")) && !fl.some(isImageFile))) addVoices(fl, t.voice || null);
+    if (t.video || (fl.some((x) => VIDEO_RE.test(x.name || "")) && !fl.some(isImageFile))) addVideos(fl, t.video || null);   // 0.17.1
+    else if (t.voice || (fl.some((x) => AUDIO_RE.test(x.name || "")) && !fl.some(isImageFile))) addVoices(fl, t.voice || null);
     else addImages(e.dataTransfer.files, t.id);
   }
   else if (t.zone === "audio") addAudio(e.dataTransfer.files);
@@ -8865,6 +9054,35 @@ function openVoiceEditor(v) {
       </div>
     </div>`, "Edit audio reference");
 }
+/** 0.17.1: a video reference's editor: label, description, its role, the part that goes
+ *  in (Start, Length) with a player, and its sound. */
+function openVideoEditor(v) {
+  if (!v) return;
+  const L = videoLabelOf(v), state = S.refState["video:" + v.id];
+  const missing = !!v.file && (state === "missing" || state === "invalid");
+  const src = v.file && !missing ? viewURL({ filename: v.file, subfolder: v.subfolder, type: "input" }) : "";
+  openAltEditor("video", v.id, `
+    <div class="ed-form">
+      <div><span class="pic">${esc(v.bypassed ? "bypassed" : L ? L.v : "—")}</span> <span class="muted small">set automatically from the order of active videos</span></div>
+      <label class="lbl">Label <input class="field" data-ed="label" value="${esc(v.label)}" placeholder="<dance>" spellcheck="false"></label>
+      <label class="lbl">Description <textarea class="field" data-ed="desc" rows="3" placeholder="a dancer spinning on a rooftop">${esc(v.desc)}</textarea></label>
+      <label class="lbl">Definition: whose … comes from ${esc(L ? L.v : "it")}
+        <select class="field" data-ed="role">${REFMOD_ROLES.map((r) => `<option value="${r}"${r === v.role ? " selected" : ""}>${r}</option>`).join("")}</select></label>
+      <div class="muted small ed-preview"></div>
+      ${missing ? `<div class="missing">Missing: ${esc(v.original_name || v.file)}</div>`
+        : src ? `<video class="ed-player ed-video" id="ed-player" controls preload="metadata" playsinline src="${esc(src)}"></video>` : ""}
+      <div class="ed-row">
+        <label class="lbl-row">Start <input type="number" min="0" step="0.01" data-ed="start" value="${esc(v.start || 0)}" style="width:78px"> s</label>
+        <button class="ghost sm" data-action="ed-set-start" title="Start where the player is">Set start</button>
+        <label class="lbl-row">Length <input type="number" min="0" step="0.01" data-ed="length" value="${v.length ? esc(v.length) : ""}" placeholder="up to ${REF_VIDEO_MAX_S}" style="width:78px"> s</label>
+        <button class="ghost sm" data-action="ed-set-end" title="End where the player is">Set end</button>
+      </div>
+      <div class="muted small">H3 takes ${REF_VIDEO_MIN_S}–${REF_VIDEO_MAX_S} s; each Shot uses as much of it as its own length.${v.duration ? ` The file is ${Number(v.duration).toFixed(2)} s.` : ""}</div>
+      <label class="lbl-row"${v.has_audio === false ? ' title="This video has no sound"' : ""}><input type="checkbox" data-ed="sound"${v.sound ? " checked" : ""}${v.has_audio === false ? " disabled" : ""}>
+        Its sound goes in too <span class="muted small">(as an &lt;Audio N&gt; before the song and voices; their labels move up one)</span></label>
+      <div class="muted small">${esc(v.original_name || v.file || "No file")} <button class="ghost sm" data-action="video-replace" data-video="${esc(v.id)}">Replace file…</button></div>
+    </div>`, "Edit video reference");
+}
 function openRefmodEditor(m) {
   if (!m) return;
   openAltEditor("refmod", m.id, `
@@ -8899,6 +9117,12 @@ function editorAltSync() {
   const alt = $("editor-alt");
   if (!editing || editing.kind === "cast") return;
   const g = (k) => alt.querySelector(`[data-ed=${k}]`);
+  if (editing.kind === "video") {
+    const v = videoById(editing.id), pv = alt.querySelector(".ed-preview"), L = v && videoLabelOf(v);
+    const lab = (L && L.v) || "<Video N>";
+    if (pv) pv.textContent = `In the prompt: ${(g("label").value || "").trim() || lab} is ${(g("desc").value || "").trim() || "this video"}, whose ${g("role").value} comes from ${lab}.`;
+    return;
+  }
   if (editing.kind === "voice") {
     const role = g("role").value;
     alt.querySelectorAll(".ed-sound").forEach((x) => { x.hidden = role === "voice"; });
@@ -8922,7 +9146,7 @@ function soundLine(v, a) {
 }
 function editorAltValues() {
   const out = {};
-  $("editor-alt").querySelectorAll("[data-ed]").forEach((el) => { out[el.dataset.ed] = el.value; });
+  $("editor-alt").querySelectorAll("[data-ed]").forEach((el) => { out[el.dataset.ed] = el.type === "checkbox" ? el.checked : el.value; });
   out.links = {};
   $("editor-alt").querySelectorAll("[data-ed-link]").forEach((el) => { out.links[el.dataset.edLink] = el.checked; });
   return out;
@@ -8930,6 +9154,17 @@ function editorAltValues() {
 /** The edits as changes: [[object, key, value]] where the value differs. */
 function editorAltChanges() {
   const val = editorAltValues(), ch = [];
+  if (editing.kind === "video") {
+    const v = videoById(editing.id);
+    if (!v) return [];
+    for (const k of ["label", "desc", "role"]) if ((val[k] ?? "") !== (v[k] ?? "")) ch.push([v, k, val[k]]);
+    for (const k of ["start", "length"]) {
+      const n = Math.max(0, Number(val[k]) || 0);
+      if (n !== Number(v[k] || 0)) ch.push([v, k, n]);
+    }
+    if (!!val.sound !== !!v.sound && v.has_audio !== false) ch.push([v, "sound", !!val.sound]);
+    return ch;
+  }
   if (editing.kind === "voice") {
     const v = voiceById(editing.id);
     if (!v) return [];
@@ -9016,13 +9251,14 @@ async function editorAltSave() {
   const ch = editorAltChanges();
   if (!ch.length) return closeEditor();
   if (setupGuard()) return;
-  const own = editing.kind === "voice" ? voiceById(editing.id) : (P().refmods || []).find((x) => x.id === editing.id);
+  const own = editing.kind === "voice" ? voiceById(editing.id) : editing.kind === "video" ? videoById(editing.id)
+    : (P().refmods || []).find((x) => x.id === editing.id);
   // a voice reference's label isn't in the prompt (its pictures' labels are); everything else is
   const quiet = ch.every(([o, k]) => o === own && k === "label" && editing.kind === "voice" && (own.role || "voice") === "voice");
   const live = own && !own.bypassed;
   const mode = !quiet && live ? await askRefChange() : "keep";
   for (const [o, k, val] of ch) o[k] = val;
-  if (!quiet && live) applyRefChange(mode || "keep", editing.kind === "voice" ? "Audio references" : "RefMods");
+  if (!quiet && live) applyRefChange(mode || "keep", editing.kind === "voice" ? "Audio references" : editing.kind === "video" ? "Video references" : "RefMods");
   closeEditor();
   commit();
 }

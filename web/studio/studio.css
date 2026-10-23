@@ -1042,3 +1042,35 @@ body.trimming, body.trimming * { cursor: ew-resize !important; user-select: none
 .tl-block.movable .tl-pick { cursor: grab; }
 body.moving-block, body.moving-block * { cursor: grabbing !important; user-select: none; }
 .ov-tag { color: #B9A3F0; }
+
+/* 0.17.1: video references */
+.video-card .video-thumb { display: flex; align-items: center; justify-content: center; font-size: 22px; overflow: hidden; background: #0E0F12; }
+.video-thumb video { width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
+.ed-video { max-height: 260px; background: #000; border-radius: 6px; }
+.video-add { min-height: 64px; }
+
+/* 0.17.4: a collapsed Shot's row in three columns, so a long details line (trims, overlaps,
+   aligned…) wraps inside its own column: ▶ on the left, the title, details and prompt
+   preview in the middle, the notices and buttons right-aligned on the same row. The
+   details run on right after the title and wrap under it. On a narrow row the buttons
+   move under it, right-aligned. */
+.shot { container: shotcard / inline-size; }
+.shot-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; }
+.shot-row > .sdot-play { grid-column: 1; align-self: center; }
+.shot-row > .shot-head { grid-column: 2; min-width: 0; flex-wrap: nowrap; }
+.shot-row > .shot-head:first-child { grid-column: 1 / 3; }
+.shot-row > .shot-tools { grid-column: 3; max-width: 320px; }
+.shot-head > .sleft { flex: 0 1 auto; min-width: 0; }
+.shot-head > .snotes { flex: 0 1 auto; max-width: 40%; }
+.sleft > .sline { display: block; line-height: 1.55; }
+.sline > .stitle { margin-right: 10px; }
+.sline > .smeta { display: inline; }
+@container shotcard (max-width: 640px) {
+  .shot-row { grid-template-columns: auto minmax(0, 1fr); }
+  .shot-row > .shot-head:has(> .sleft) { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; row-gap: 6px; }
+  .shot-row > .shot-head.has-play:has(> .sleft) { grid-template-columns: minmax(0, 1fr); }
+  .shot-head > .snotes { max-width: none; grid-column: -2; justify-self: end; }
+  .shot-row > .shot-head:not(:has(> .sleft)) { flex-wrap: wrap; }
+  .shot-row > .shot-head { padding-bottom: 4px; }
+  .shot-row > .shot-tools { grid-column: 1 / -1; justify-self: end; max-width: none; padding-bottom: 8px; }
+}

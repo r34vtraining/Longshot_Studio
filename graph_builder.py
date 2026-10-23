@@ -263,11 +263,51 @@ SONG_LABEL = "<Audio 1>"
 SONG_RETENTION = (f"{SONG_LABEL} (the song): fully_copy - the song is reused as the soundtrack; the singer's "
                   "mouth moves only where its vocals are sung.")
 
+MAX_REF_VIDEOS = 3          # Long Shot's ref_videos autogrow limit
+REF_VIDEO_MIN_S, REF_VIDEO_MAX_S = 2.0, 15.0
+
+
+def active_videos(project: dict) -> list:
+    """0.17.1: video references (video cards in Cast & Scenes) that are on and have a file."""
+    return [v for v in project.get("videos") or []
+            if isinstance(v, dict) and not v.get("bypassed") and v.get("file")]
+
+
+def video_sound_on(v: dict) -> bool:
+    """A video reference whose soundtrack goes in too (it has one, and it's switched on)."""
+    return bool(v.get("sound") and v.get("has_audio", True))
+
+
+def video_audio_count(project: dict) -> int:
+    """Video soundtracks take the first <Audio N> labels, before the song and the voices."""
+    return sum(1 for v in active_videos(project) if video_sound_on(v))
+
+
+def video_labels(project: dict) -> dict:
+    """{video id: ('<Video N>', '<Audio M>' or None)}."""
+    out, audio = {}, 0
+    for k, v in enumerate(active_videos(project)):
+        a = None
+        if video_sound_on(v):
+            audio += 1
+            a = f"<Audio {audio}>"
+        out[str(v.get("id"))] = (f"<Video {k + 1}>", a)
+    return out
+
+
+def song_label(project: dict) -> str:
+    """The song's <Audio N>: 1, or after the video soundtracks (0.17.1)."""
+    return f"<Audio {video_audio_count(project) + 1}>"
+
+
+def song_retention(project: dict) -> str:
+    return SONG_RETENTION.replace(SONG_LABEL, song_label(project), 1)
+
 
 def audio_labels(project: dict) -> dict:
     """{voice id: '<Audio N>'}. The song takes <Audio 1> when it's on (0.9.1);
-    voice references follow in card order."""
-    base = song_slot(project)
+    voice references follow in card order. 0.17.1: video soundtracks come first."""
+    base = video_audio_count(project) + song_slot(project)
     return {str(v.get("id")): f"<Audio {base + k + 1}>" for k, v in enumerate(active_voices(project))}
 
 
@@ -367,8 +407,8 @@ def refmod_role(m: dict) -> str:
 def refmod_labels(project: dict) -> list:
     """Each active RefMod's label, numbered after the native references by kind,
     as Long Shot presents them (pictures after the Cast, audio after the voices)."""
-    counts = {"image": len(active_cast(project)), "video": 0,
-              "audio": len(audio_labels(project)) + song_slot(project)}
+    counts = {"image": len(active_cast(project)), "video": len(active_videos(project)),
+              "audio": len(audio_labels(project)) + song_slot(project) + video_audio_count(project)}
     out = []
     for m in active_refmods(project):
         kind = m.get("kind") if m.get("kind") in _REFMOD_KIND else "image"
@@ -722,6 +762,8 @@ def required_classes(project: dict, dry_run: bool = False, final: bool = False) 
         need.append("VAEDecodeAudio")
     if active_cast(project):
         need += ["LoadImage", "ImageScaleToMaxDimension", "MiniMaxH3Subject"]
+    if active_videos(project):
+        need += ["MiniMaxH3LoadVideo", "MiniMaxH3Subject"]
     if (s.get("turbo") or {}).get("on"):
         need.append("MiniMaxH3TurboLoRA")
     r = s.get("refine") or {}
@@ -1223,6 +1265,45 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             inputs["subjects"] = subjects
         subjects = g.add(f"subject{k + 1}", "MiniMaxH3Subject", f"{pic} subject", **inputs)
 
+    # --- video references (0.17.1): <Video N>, each a subject, its soundtrack optional
+    vids = active_videos(project)
+    if len(vids) > MAX_REF_VIDEOS:
+        raise BuildError(f"Long Shot takes at most {MAX_REF_VIDEOS} reference videos; {len(vids)} are on. Bypass some.")
+    vlabels = video_labels(project)
+    for k, v in enumerate(vids):
+        vlab, alab = vlabels[str(v.get("id"))]
+        try:
+            path = pj.input_path_value(v["file"], v.get("subfolder", ""))
+        except ValueError as err:
+            raise BuildError(f"{v.get('label') or vlab}: {err}") from None
+        start = _num(v.get("start", 0) or 0, f"{vlab} start", 0, 1e6)
+        dur = float(v.get("duration") or 0)
+        length = float(v.get("length") or 0) or max(0.0, (dur - start) if dur else REF_VIDEO_MAX_S)
+        length = min(REF_VIDEO_MAX_S, length)
+        if length < REF_VIDEO_MIN_S:
+            warnings.append(f"{v.get('label') or vlab} is {length:.2f}s; H3 expects reference videos of "
+                            f"{REF_VIDEO_MIN_S:g}-{REF_VIDEO_MAX_S:g}s.")
+        frames = max(5, int(round(length * FPS)))
+        # loaded at about the film's size (H3 shrinks it to its own canvas anyway): a 4K
+        # reference is never held in memory at full size
+        vw, vh = v.get("width"), v.get("height")
+        lw = lh = 0
+        if isinstance(vw, (int, float)) and isinstance(vh, (int, float)) and vw > 0 and vh > 0:
+            sc = min(1.0, ((width * height) / (vw * vh)) ** 0.5)
+            lw, lh = max(32, int(round(vw * sc / 2)) * 2), max(32, int(round(vh * sc / 2)) * 2)
+        load = g.add(f"refvid{k + 1}", "MiniMaxH3LoadVideo", f"{vlab} {v.get('label', '')}".strip(), video=path,
+                     force_rate=FPS, width=lw, height=lh, frame_load_cap=frames,
+                     skip_first_frames=int(round(start * FPS)))
+        refs[f"ref_videos.ref_video_{k}"] = [load[0], 0]
+        if alab:
+            refs[f"ref_video_audios.ref_video_audio_{k}"] = [load[0], 2]
+        role = v.get("role") if v.get("role") in REFMOD_ROLES else "motion"
+        inputs = dict(label=v.get("label") or vlab, description=v.get("desc", ""), role=role, reference=vlab,
+                      role_2="-", reference_2="")
+        if subjects is not None:
+            inputs["subjects"] = subjects
+        subjects = g.add(f"subject_v{k + 1}", "MiniMaxH3Subject", f"{vlab} subject", **inputs)
+
     # --- RefMods (0.8.6): Load H3 RefMods -> Long Shot refmods; each card is a subject
     mods = active_refmods(project)
     refmod_input = {}
@@ -1375,7 +1456,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         task_type_2=types[1], task_type_3=types[2],
         summary=style.get("summary", ""),
         retention_analysis="\n".join(x for x in [(style.get("retention") or "").strip(),
-                                                  SONG_RETENTION if songref else "", *voice_retention(project)] if x),
+                                                  song_retention(project) if songref else "", *voice_retention(project)] if x),
         style_line=style.get("style_line", ""), detailed_description="",
         overall_soundscape=style.get("soundscape", ""),
         non_diegetic_music=style.get("music", ""), shots=shots)
@@ -1395,7 +1476,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             song_value = pj.input_path_value(audio["file"], audio.get("subfolder", ""))
         except ValueError as err:
             raise BuildError(f"Audio file: {err}") from None
-        long_extra["song_ref"] = g.add("song_file_ref", "LoadAudio", "Song (<Audio 1>, a slice per Shot)",
+        long_extra["song_ref"] = g.add("song_file_ref", "LoadAudio", f"Song ({song_label(project)}, a slice per Shot)",
                                        audio=song_value)
     elif songref:
         # 0.9.1 (older Long Shot): the song as <Audio 1>, cut to Start / Length for every Shot
@@ -1409,10 +1490,10 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         song_len = _num(audio.get("length", 0), "Audio length", 0, 1e7)
         if not song_len:
             song_len = round(sum(float(x.get("seconds", 0) or 0) for x in chain), 3) or 5.0
-            warnings.append(f"Audio Length is 0, so {SONG_LABEL} is the song from Start for this render's "
+            warnings.append(f"Audio Length is 0, so {song_label(project)} is the song from Start for this render's "
                             f"length ({song_len:g}s).")
         long_extra["ref_audios.ref_audio_0"] = g.add(
-            "song_ref", "TrimAudioDuration", f"{SONG_LABEL} the song", audio=song_raw,
+            "song_ref", "TrimAudioDuration", f"{song_label(project)} the song", audio=song_raw,
             start_index=_num(audio.get("start", 0), "Audio start", 0, 1e7), duration=song_len)
     if lip or voice or final:
         if not audio.get("file"):
@@ -1450,8 +1531,8 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                 "vocals", "MelBandRoFormerSampler", "MelBand vocals", model=mel, audio=loader)
 
     # voice references (audio cards in Cast & Scenes): <Audio N> after the song's vocals
-    base = 1 if voice or songref else 0
-    slot0 = 0 if per_shot_song else base           # Long Shot puts song_ref before ref_audios
+    slot0 = 0 if per_shot_song else (1 if voice or songref else 0)   # Long Shot puts song_ref before ref_audios
+    base = video_audio_count(project) + (1 if voice or songref else 0)   # 0.17.1: video soundtracks first
     for k, v in enumerate(active_voices(project)):
         a_label = f"<Audio {base + k + 1}>"
         try:
