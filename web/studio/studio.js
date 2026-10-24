@@ -184,6 +184,7 @@ function normalize(p) {
     edit_from: s.edit_from && typeof s.edit_from === "object" ? Object.assign({}, s.edit_from, { gen: 0 }) : null,
     join: s.join === "cut" || s.join === "context" ? s.join : "bridge",
     context_from: s.context_from || null,     // Context: the take of the Shot before it was rendered from
+    context_at: Number.isFinite(Number(s.context_at)) && s.context_at !== null ? Number(s.context_at) : null,   // 0.17.11: its frame (back from the end)
     kind: s.kind === "clip" ? "clip" : "shot",
     // 0.9.0: trims and move on the film, in frames (non-destructive)
     place: s.place && typeof s.place === "object" && (s.place.in || s.place.out || s.place.shift)
@@ -202,6 +203,8 @@ function normalize(p) {
     aligned: s.aligned && typeof s.aligned === "object" && s.aligned.key ? { key: String(s.aligned.key) } : null,
     // 0.14.0: Face refine: its last try ({take, sig, treated, tracks…}) and which faces it exports with
     face: s.face && typeof s.face === "object" ? s.face : null,
+    // 0.17.8: Refine this Shot: {take, key, sig, keep: "refined" | "original", made}
+    refined: s.refined && typeof s.refined === "object" && s.refined.take ? s.refined : null,
     seam: ["ok", "mismatch"].includes(s.seam) ? s.seam : null,   // its left join, as last known
     cleared: !!s.cleared && s.status === "queued",              // Clear render: waiting to render again
     clip: s.kind === "clip" ? Object.assign({ file: "", subfolder: "", original_name: "", sha256: null,
@@ -505,14 +508,15 @@ function filmSpan(s) {
   return { a: L.vs + e.shift + e.in, b: L.we + e.shift - e.out, ws: L.ws, vs: L.vs, we: L.we };
 }
 
-/** 0.17.0: frames between where a Context Shot starts and where the take before it ends
- *  (they overlap), so its context frame is the one right before its start; 0: no overlap. */
+/** A Context Shot's reference frame, counted back from the end of the take (or clip) before
+ *  it: 0 is its very last frame. 0.17.11: the last frame the film shows of that Shot, so a
+ *  trim on its end, or the edit point where the two overlap, picks the frame. */
 function contextBack(x) {
   if (!x || x.join !== "context" || x.kind === "clip") return 0;
   const act = active(), i = act.findIndex((y) => y.id === x.id), pv = i > 0 ? act[i - 1] : null;
-  const L = LAYOUT.byId[x.id], Lp = pv && LAYOUT.byId[pv.id];
-  if (!L || !Lp) return 0;
-  return Math.max(0, (Lp.we + effEdit(pv).shift) - (L.ws + effEdit(x).shift));
+  const Lp = pv && LAYOUT.byId[pv.id], sp = pv && shownSpan(pv);
+  if (!Lp || !sp) return 0;
+  return Math.max(0, (Lp.we + effEdit(pv).shift) - sp.b);
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,13 +1081,19 @@ function queueFrom(id, includeSelf = true) {
 }
 
 /** Anything every Shot shares: everything is queued, approvals kept as a flag. */
+/** 0.17.7: the Shots of the render going now: a change made meanwhile leaves them alone.
+ *  The render finishes with what it started with; its takes land under review. */
+const runningIds = () => (inRenderAny() ? new Set(S.busy.built.chain) : new Set());
+
 function sharedChanged(what, quiet = false) {
   changedDuringRender(what);
-  const rendered = active().filter((s) => s.status !== "queued");
+  const running = runningIds();
+  const rendered = active().filter((s) => s.status !== "queued" && !running.has(s.id));
   S.dry = null;
   S.gen++;
   if (!rendered.length) return;
   for (const s of P().shots) {
+    if (running.has(s.id)) continue;
     if (s.status === "approved") s.was_approved = true;
     else if (s.status === "review") s.was_rendered = true;
     s.status = "queued";
@@ -1110,9 +1120,9 @@ function keepApproved(what, withAction = false) {
   changedDuringRender(what);
   S.dry = null;
   S.gen++;
-  const redo = [];
+  const redo = [], running = runningIds();
   for (const s of active()) {
-    if (s.kind === "clip") continue;
+    if (s.kind === "clip" || running.has(s.id)) continue;      // 0.17.7: the render going now keeps its Shots
     if (s.status === "review") { s.was_rendered = true; s.status = "queued"; redo.push(s); }
   }
   const n = approvedShots().length;
@@ -1891,6 +1901,13 @@ function jobOpts(job) {
       label: `Face refine · ${titleOf(s)}`, note: "Its take decoded, small faces redrawn as close-ups, saved for A/B",
       extra: { shot: s.id, take: s.take, sig: faceSig() }, onDone: () => {} };
   }
+  if (sp.type === "refine") {
+    const s = shot(sp.target);
+    if (!s || s.kind === "clip" || !s.take) return null;
+    return { kind: "refine", refineTry: Object.assign({ key: takeStem(s.take), take: s.take, take_model: takeModel(s) || null }, takeSong(s.take)),
+      label: `Refine · ${titleOf(s)}`, note: `Its take resampled with ${shortModel(P().settings.refine.model)}, saved for A/B`,
+      extra: { shot: s.id, take: s.take, sig: refineSig() }, onDone: () => {} };
+  }
   if (sp.type === "export") {
     const todo = new Set(job.exportTodo || []);
     const items = approvedForExport().filter((x) => !job.exportTodo || todo.has(x.key));
@@ -1898,7 +1915,7 @@ function jobOpts(job) {
     const v = P().settings.rtx_vsr || {};
     const skipped = active().filter((x) => x.kind !== "clip" && x.status !== "approved").length;
     return { kind: "export", exportClips: items.map((x) => Object.assign({ take: x.take },
-        faceRefined(x.s) ? { face_clip: faceKey(x.s), frames: Number(x.s.window) || 0 } : {}, exportCut(x.s))),
+        refChosen(x.s) ? { refine: x.s.refined.key } : faceRefined(x.s) ? { face_clip: faceKey(x.s), frames: Number(x.s.window) || 0 } : {}, exportCut(x.s))),
       label: `Exporting ${items.length} approved clip${items.length === 1 ? "" : "s"} · upscaled ${v.scale || 2}× ${v.quality || "ULTRA"}`,
       note: "Each approved take decoded on its own, whole, and upscaled a frame at a time",
       extra: { items: items.map((x) => ({ name: x.name, key: x.key, sig: itemSig(x), asig: itemAsig(x) })), skipped, kept: job.exportKept || 0, sig: upSig() },
@@ -2286,7 +2303,7 @@ function pickFields(o, keys) {
 
 async function queueJob({ upto, dry, kind, label, note, onDone, final = false, standalone = false, batch = null,
   omit = null, trimLeft = false, takeClips = null, chunk = null, exportClips = null, extra = null, jobId = null,
-  joins = null, takeAudio = null, faceTry = null }) {
+  joins = null, takeAudio = null, faceTry = null, refineTry = null }) {
   if (S.busy) return;
   if (Object.keys(S.uploading).length) { toast("Wait for the image upload to finish."); return; }
   S.error = null;
@@ -2300,6 +2317,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
     return;
   }
   const lost = kind === "face" ? missingFaceModels(P()) : missingModels(P());
+  if (kind === "refine" && S.opts && !matchModel(P().settings.refine.model, S.opts.models)) lost.push(`Refine model (${P().settings.refine.model || "none"})`);
   if (lost.length) {
     S.error = `Model file${lost.length > 1 ? "s" : ""} not found in ComfyUI's model folders: ${lost.join(", ")}. ` +
       `Choose ${lost.length > 1 ? "them" : "it"} under Advanced (Browse… can also add a folder ComfyUI doesn't know about).`;
@@ -2382,6 +2400,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
       ? project.shots.filter((x) => !x.bypassed && x.kind !== "clip" && !x.lock).map((x) => x.id) : null;
     const body = takeAudio ? { project, take_audio: takeAudio } : takeClips ? { project, take_clips: takeClips } : exportClips ? { project, export_clips: exportClips }
       : faceTry ? { project, face_try: faceTry }
+      : refineTry ? { project, refine_try: refineTry }
       : { project, upto, dry_run: !!dry, final, standalone, clips_for: clipsFor, chunk };
     built = await api("/longshot/build", { method: "POST", body });
   } catch (e) {
@@ -2409,7 +2428,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
   if (kind === "render" || kind === "reroll" || kind === "final" || kind === "refresh") saveNow();   // approvals / new seed survive a closed tab
   // what each Shot is rendered with, so an edit back to exactly this can bring the take back
   const sent = {};
-  for (const sh of project.shots) sent[sh.id] = { text: sh.text || "", seconds: Number(sh.seconds) };
+  for (const sh of project.shots) sent[sh.id] = { text: sh.text || "", seconds: Number(sh.seconds), back: Number(sh.context_back) || 0 };
   S.busy = {
     promptId: res.prompt_id, kind, target, label, note, baseNote: note, built, onDone, sent, batch, standalone, extra,
     jobId, slug: P().slug, project: P().name,
@@ -2507,6 +2526,8 @@ async function finishIn(b, promptId, entry) {
     await exportDone(b, entry.outputs || {});
   } else if (b.kind === "face") {
     await faceDone(b, entry.outputs || {});
+  } else if (b.kind === "refine") {
+    await refineDone(b, entry.outputs || {});
   } else if (b.kind === "align") {
     await alignDone(b, entry.outputs || {});
   } else {
@@ -2662,6 +2683,7 @@ function adoptRows(rows, sent, standalone = false) {
       sh.seed_pending = null;
       const act = active(), pv = act[act.indexOf(sh) - 1];
       sh.context_from = sh.join === "context" && pv ? (pv.kind === "clip" ? `clip:${pv.id}` : pv.take || null) : null;
+      sh.context_at = sh.context_from ? Number(((sent || {})[sh.id] || {}).back) || 0 : null;   // 0.17.11: which frame of it
     }
     const was = (sent || {})[sh.id] || { text: sh.text, seconds: Number(sh.seconds) };
     sh.rendered = { text: was.text, seconds: was.seconds, seed: Number(sh.shot_seed) };
@@ -2694,7 +2716,9 @@ function onRendered(targetId, standalone = false, opts = {}) {
     if (target) { target.status = "review"; target.was_rendered = false; target.was_approved = false; }
     // a Shot edited while this rendered no longer matches its new take. Only its
     // prompt changed (0.8.6): the take stays for review, flagged, with Re-render.
-    for (const s of P().shots) if (s.kind !== "clip" && s.status !== "queued" && s.rendered && !matchesRendered(s) && !promptOnlyChanged(s)) {
+    // 0.17.7: never the Shots of this render: their new takes always land under review (with
+    // their clips); what changed meanwhile is flagged on the card, with Re-render
+    for (const s of P().shots) if (!built.chain.includes(s.id) && s.kind !== "clip" && s.status !== "queued" && s.rendered && !matchesRendered(s) && !promptOnlyChanged(s)) {
       s.edit_from = { status: s.status, was_approved: s.was_approved, was_rendered: s.was_rendered, take: s.take, gen: S.gen };
       s.status = "queued";
     }
@@ -3785,7 +3809,7 @@ function approvedForExport() {
   return act.filter((s) => s.kind !== "clip" && s.status === "approved" && s.take).map((s) => ({
     s, key: takeStem(s.take), take: s.take,
     // 0.15.0: a Shot exported refined ends with FR
-    name: `Shot ${String(numOf(s.id)).padStart(width, "0")} – seed ${seedOfTake(s)}${faceRefined(s) ? " FR" : ""}`,
+    name: `Shot ${String(numOf(s.id)).padStart(width, "0")} – seed ${seedOfTake(s)}${refChosen(s) ? " R" : faceRefined(s) ? " FR" : ""}`,
   }));
 }
 
@@ -3797,7 +3821,8 @@ function itemSig(x) {
   const c = exportCut(x.s);
   const cut = c.length ? `${c.trim_in}+${c.length}` : "";
   const ref = refineActive() ? JSON.stringify(P().settings.refine) : "";
-  const face = faceRefined(x.s) ? "|face:" + (x.s.face.made || x.s.face.sig || "") : "";      // 0.15.0: its refined clip
+  const face = refChosen(x.s) ? "|ref:" + (x.s.refined.key || x.s.refined.made || "")         // 0.17.8: its refined take
+    : faceRefined(x.s) ? "|face:" + (x.s.face.made || x.s.face.sig || "") : "";      // 0.15.0: its refined clip
   const str = cut + "|" + ref + face;
   let h = 0;
   for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
@@ -3873,7 +3898,7 @@ async function exportApproved() {
       body: { mode: "copy", song: songMode() ? { file: P().audio.file, subfolder: P().audio.subfolder || "" } : null,
         items: items.map((x) => {
           // 0.15.0: a Shot set to Refined exports its refined clip
-          const c = exportCut(x.s), it = { key: faceRefined(x.s) ? faceKey(x.s) : x.key, name: x.name };
+          const c = exportCut(x.s), it = { key: refChosen(x.s) ? refClipKey(x.s) : faceRefined(x.s) ? faceKey(x.s) : x.key, name: x.name };
           if (c.length) it.cut = { start: c.trim_in / FPS, dur: c.length / FPS };
           if (c.song_len) Object.assign(it, { song_at: c.song_at, song_len: c.song_len });
           return it;
@@ -4043,13 +4068,16 @@ const MIN_SHOWN = 6;                       // frames a trimmed Shot keeps at lea
 
 /** Which edges of a block can be dragged, and what dragging does. */
 function trimEdges(s) {
-  if (!LAYOUT.byId[s.id] || busyHere()) return { left: null, right: null };
+  if (!LAYOUT.byId[s.id]) return { left: null, right: null };       // 0.17.7: also while a job runs
   if (s.kind === "clip" || isRendered(s)) {
     const f = freeEdges(s);
     return { left: f.left ? "in" : null, right: f.right ? "out" : null };
   }
-  return { left: null, right: "seconds" };
+  // a Shot being sampled now keeps its length until its take lands
+  return { left: null, right: sampling(s) ? null : "seconds" };
 }
+/** 0.17.7: a Shot the render going now samples (its take is being made at its place and length). */
+const sampling = (s) => !!s && s.status === "queued" && s.kind !== "clip" && inRender(s);
 
 function trimHandles(s) {
   const e = trimEdges(s);
@@ -4168,6 +4196,7 @@ function fitLength(s, by) {
 /** Can this Shot's block be dragged along the film? null, or why not. */
 function dragBlocked(s) {
   if (!s || s.kind === "clip" || isRendered(s)) return "rendered";
+  if (sampling(s)) return "rendering";
   const sl = slotOf(s);
   if (!sl) return "layout";
   if (!sl.left) return sl.i === 0 ? `${titleOf(s)} is the first Shot.` : `${titleOf(s)} continues from the Shot before (Continuous): set its join to Cut or Context to move it.`;
@@ -4249,7 +4278,7 @@ $("tl-strip").addEventListener("pointerdown", (e) => {
   const b = e.target.closest(".tl-block.movable");
   if (!b || e.target.closest(".tl-arrow, .tl-trim")) return;
   const s = shotById(b.dataset.tl);
-  if (!s || busyHere() || setupGuard()) return;
+  if (!s || setupGuard()) return;
   if (blockDragStart(e, s)) e.stopPropagation();       // not a pan of the view
 });
 document.addEventListener("pointermove", (e) => {
@@ -4315,7 +4344,6 @@ $("tl-strip").addEventListener("pointerdown", (e) => {
   if (!h || e.button !== 0) return;
   const b = h.closest("[data-tl]"), s = b && shotById(b.dataset.tl);
   if (!s || setupGuard()) return;
-  if (inRender(s)) { toast("This shot is part of the render in progress; edit it when it finishes."); return; }
   e.preventDefault();
   e.stopPropagation();
   const ed = editOf(s);
@@ -4383,7 +4411,6 @@ function absorbMove(run, d) {
   const act = active(), first = run[0], last = run[run.length - 1];
   const before = act[act.indexOf(first) - 1], after = act[act.indexOf(last) + 1];
   if (!before || !isEmptyShot(before)) return false;
-  if (busyHere() && run.some(inRender)) { toast("This run is part of the render in progress; move it when it finishes."); return true; }
   const MIN = 12;                                          // half a second, at least
   const bf = Math.round((Number(before.seconds) || 0) * FPS) + d;
   if (bf < MIN) { toast(`${titleOf(before)} can't get any shorter.`); return true; }
@@ -4420,7 +4447,6 @@ function moveShot(s, d) {
     return;
   }
   if (absorbMove(run, d)) return;
-  if (busyHere() && run.some(inRender)) { toast("This run is part of the render in progress; move it when it finishes."); return; }
   if (!run.some((x) => x.kind === "clip" || isRendered(x))) { toast(`Render ${titleOf(s)} first; then Alt + ← / → moves it.`); return; }
   const act = active(), first = run[0], last = run[run.length - 1];
   const sa = filmSpan(first), sb = filmSpan(last);
@@ -4649,6 +4675,7 @@ function focusShot(id) {
   renderDecision();
   renderViewer();
   renderFace();                                    // 0.14.1: the Face refine panel follows the selection
+  renderRefine();                                  // 0.17.8: so does Refine
   revealShotCard(id);                              // 0.16.0: the Shot list scrolls to it
   tlReveal(id);
 }
@@ -5521,9 +5548,14 @@ function shotRowHTML(s) {
       (() => { const nb = chipNear(s), odd = [nb.prev, nb.next].filter(otherSize);
         return odd.length ? esc(` ${odd.map(titleOf).join(" and ")} ${odd.length > 1 ? "are" : "is"} another size, so not pinned to (a hard cut there).`) : ""; })()}${
       opts.length < 2 ? " No Shot next to it, so Cut is the only choice." : ` Click to switch: ${opts.map((o) => chipName(s, o)).join(" → ")}.`}">${icon} ${chipName(s)}</button>` : "";
-  const ctxStale = s.join === "context" && s.status !== "queued" && s.context_from && prevR &&
+  const ctxTake = s.join === "context" && s.status !== "queued" && s.context_from && prevR &&
     (prevR.kind === "clip" ? `clip:${prevR.id}` : prevR.take) !== s.context_from;
-  const ctxFlag = ctxStale ? `<span class="flag cut" title="The Shot before has a different take now. Re-render ${title} to take its new last frame.">context changed</span>` : "";
+  // 0.17.11: or the frame moved (a trim on the Shot before, or the edit point)
+  const ctxFrame = !ctxTake && s.join === "context" && s.status !== "queued" && s.context_from && prevR &&
+    s.context_at !== null && s.context_at !== undefined && contextBack(s) !== s.context_at;
+  const ctxStale = ctxTake || ctxFrame;
+  const ctxFlag = ctxStale ? `<span class="flag cut" title="${ctxTake ? `The Shot before has a different take now. Re-render ${title} to take its new last frame.`
+    : `The last frame the film shows of the Shot before moved (a trim or the edit point). Re-render ${title} to use that frame.`}">context changed</span>` : "";
   const ctxBtn = ctxStale ? `<button class="ghost sm bridge" data-action="context-redo" title="Re-render ${title} from the new last frame of the Shot before (the Shots after it keep their takes)">Re-render</button>` : "";
   return `${play}<button class="shot-head${play ? " has-play" : ""}" data-action="toggle-shot" aria-expanded="${open}">
           ${play ? "" : `<span class="sdot" style="background:${L.dot};color:${L.fg}">${L.icon}</span>`}
@@ -6560,15 +6592,22 @@ function renderSettings() {
   const vsrFold = folded("vsr");
   const size = sizeOf(s);
   const t = s.turbo;
-  $("settings-summary").textContent = S.settingsOpen ? "" : [`seed ${s.seed}`,
+  $("settings-summary").textContent = S.settingsOpen ? "" : [
     `${s.steps} steps`, size ? `${size[0]}×${size[1]}` : `${s.megapixels} MP ${s.aspect}`,
     vsr.on && vsrOk ? `RTX ${vsr.scale}×` : ""].filter(Boolean).join(" · ");
   $("settings-chev").textContent = S.settingsOpen ? "Hide ▴" : "Show ▾";
   $("settings-toggle").setAttribute("aria-expanded", String(!!S.settingsOpen));
   $("settings").hidden = !S.settingsOpen;
+  // 0.17.12: folded, the seed stays at hand (one seed box on the page at a time)
+  const sq = $("settings-quick");
+  sq.hidden = !!S.settingsOpen;
+  if (S.settingsOpen) sq.innerHTML = "";
+  else if (!(sq.contains(document.activeElement) && document.activeElement.tagName === "INPUT")) {   // not while typing in it
+    sq.innerHTML = `<span class="lbl-q">Seed</span><span class="seed-field"><input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-label="Base seed" title="The base seed: drag left / right to change it (Shift: by 10), or click and type">${seedStepHTML("base-seed-step", false, "Shots on auto follow it")}</span>`;
+  }
   if (!S.settingsOpen) return;
   const t2 = s.turbo;
-  const warn = !t2.on && s.steps < 20 ? `<div class="warnbox" role="alert" style="margin-top:12px">
+  const warn = !t2.on && s.steps < 20 && !isFastModel(s.model) ? `<div class="warnbox" role="alert" style="margin-top:12px">
       <span style="flex:1">Turbo is off (Advanced) and steps are at ${esc(s.steps)}. Without Turbo, H3 needs about 20 steps or more. Expect a soft, unfinished result.</span>
       <button class="ghost sm" data-action="steps20">Set 20 steps</button></div>` : "";
   const mp = (o.megapixels || [0.4, 0.6, 0.9, 1.2]).map((m) =>
@@ -6677,26 +6716,58 @@ function renderRefine() {
   else if (r.export_only) note = `Renders stay as they are. Export approved clips and Upscale final refine ${todo.length} of ${rendered.length} rendered take${rendered.length === 1 ? "" : "s"} (takes made with ${esc(shortModel(r.model))} are left as they are); refined takes are kept for the next export.`;
   else note = `Each new take is refined right after it's sampled, and that's the take you review. Takes made with ${esc(shortModel(r.model))} are left as they are. Export and Upscale final also refine older takes still unrefined.`;
   const dis = r.on ? "" : " disabled";
-  $("refine").innerHTML = `
+  // 0.17.8: Refine this Shot (works with the switches below off)
+  const sh = faceShot();
+  let shotHTML = "";
+  if (sh) {
+    const have = refHasClip(sh), old = !!(refClipKey(sh) && S.clips[refClipKey(sh)]) && !have;
+    const stale = have && sh.refined.sig !== refineSig();
+    const keep = refChosen(sh) ? "refined" : "original";
+    const busy = Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "refine" && j.spec.target === sh.id);
+    // 0.17.10: what matters is the model this take was made with, not the Model setting now
+    const why = refineBlocked(sh), already = r.model && takeModel(sh) === r.model;
+    const can = !why && !busy;
+    const chosen = active().filter(refChosen);
+    shotHTML = `<div class="box face-shot" style="margin-top:12px">
+      <div class="box-row"><label class="face-pick"><span class="muted small">Shot</span>
+        <select data-refine-shot aria-label="Shot to refine">${rendered.map((x) =>
+          `<option value="${esc(x.id)}"${x.id === sh.id ? " selected" : ""}>${esc(titleOf(x))}${refChosen(x) ? " · R" : ""}</option>`).join("")}</select></label>
+        <span class="muted small">${why && !already ? esc(why) : already ? `Made with ${esc(shortModel(r.model))} already: nothing to refine.`
+          : `Refines with ${esc(shortModel(r.model))} · ${r.steps} steps · denoise ${Number(r.denoise).toFixed(2)}${takeModel(sh) ? ` · made with ${esc(shortModel(takeModel(sh)))}` : ""}`}</span></div>
+      ${have ? `<div class="muted small" style="margin-top:6px">Refined version ready.${stale ? " Made with other settings than these: Refine again to use them." : ""}</div>`
+        : old ? `<div class="muted small" style="margin-top:6px">⚠ The refined version was made from an older take. Refine this Shot again.</div>` : ""}
+      <div class="box-row" style="margin-top:10px">
+        <button class="ghost sm" data-action="refine-try" data-shot="${esc(sh.id)}"${can ? "" : " disabled"}>${busy ? "In the queue…" : have ? "Refine again" : "Refine this Shot"}</button>
+        <button class="ghost sm" data-action="refine-ab" data-shot="${esc(sh.id)}"${have && S.clips[takeStem(sh.take)] ? "" : " disabled"}>Compare A/B</button>
+        <span class="push muted small">Export uses</span>
+        <div class="seg seg-sm" role="group" aria-label="Which take this Shot exports">
+          <button data-action="refine-keep" data-v="refined" data-shot="${esc(sh.id)}" aria-pressed="${keep === "refined"}"${have ? "" : ' disabled title="Refine this Shot first"'}>Refined</button>
+          <button data-action="refine-keep" data-v="original" data-shot="${esc(sh.id)}" aria-pressed="${keep === "original"}">Original</button>
+        </div>
+      </div>
+      ${chosen.length ? `<div class="muted small" style="margin-top:8px">Exporting refined (ends with R): ${chosen.map((x) => esc(titleOf(x))).join(", ")}</div>` : ""}
+    </div>`;
+  }
+  $("refine").innerHTML = `${shotHTML}
     <div class="route" style="margin-top:12px">${switchHTML(r.on, 'data-action="refine-on" aria-label="Refine"')}
       <span class="route-text"><b>Refine each take</b><i>resample it with a second model, e.g. fl2va over ref2va for a sharper picture</i></span></div>
     <div class="route">${switchHTML(r.export_only, `data-action="refine-export" aria-label="Refine on export only"${dis}`)}
       <span class="route-text"><b>Refine on export only</b><i>renders stay quick; Export approved clips and Upscale final refine</i></span></div>
     <div class="model-files" style="margin-top:10px">
-      ${modelField("Refine model", "diffusion_models", "refine_model", `<select data-refine="model" aria-label="Refine model"${dis}>${fileOptions(o.models, r.model, "Choose a model…")}</select>`)}
+      ${modelField("Refine model", "diffusion_models", "refine_model", `<select data-refine="model" aria-label="Refine model">${fileOptions(o.models, r.model, "Choose a model…")}</select>`)}
     </div>
     <div class="grid3" style="margin-top:10px">
-      <label class="lbl">Steps <input type="number" min="1" max="200" step="1" data-refine="steps" value="${esc(r.steps)}"${dis}></label>
-      <label class="lbl" title="How much of each take is redrawn: lower keeps the motion and lip timing, higher lets the refine model change more">Denoise <input type="number" min="0.05" max="1" step="0.05" data-refine="denoise" value="${esc(r.denoise)}"${dis}></label>
-      <label class="lbl" title="ModelSamplingMiniMaxH3 for the refine model. Lower (3–5) makes the same denoise a lighter touch">Video shift <input type="number" min="0.5" max="100" step="0.5" data-refine="shift_video" value="${esc(r.shift_video)}"${dis}></label>
+      <label class="lbl">Steps <input type="number" min="1" max="200" step="1" data-refine="steps" value="${esc(r.steps)}"></label>
+      <label class="lbl" title="How much of each take is redrawn: lower keeps the motion and lip timing, higher lets the refine model change more">Denoise <input type="number" min="0.05" max="1" step="0.05" data-refine="denoise" value="${esc(r.denoise)}"></label>
+      <label class="lbl" title="ModelSamplingMiniMaxH3 for the refine model. Lower (3–5) makes the same denoise a lighter touch">Video shift <input type="number" min="0.5" max="100" step="0.5" data-refine="shift_video" value="${esc(r.shift_video)}"></label>
     </div>
     <div class="box" style="margin-top:10px">
       <div class="box-row">
-        ${switchHTML(t.on, `data-action="refine-turbo-on" aria-label="Refine Turbo LoRA"${dis}`)}
+        ${switchHTML(t.on, `data-action="refine-turbo-on" aria-label="Refine Turbo LoRA"`)}
         <div style="flex:1;min-width:140px"><div>Turbo LoRA (refine model)</div>
-          <div class="pick" style="margin-top:4px"><select data-refine="turbo.lora" aria-label="Refine Turbo LoRA file"${t.on && r.on ? "" : " disabled"}>${fileOptions(o.loras, t.lora, "Choose…")}</select></div></div>
+          <div class="pick" style="margin-top:4px"><select data-refine="turbo.lora" aria-label="Refine Turbo LoRA file"${t.on ? "" : " disabled"}>${fileOptions(o.loras, t.lora, "Choose…")}</select></div></div>
         <label class="strength" style="flex:1 1 180px">Strength
-          <input type="range" min="0" max="2" step="0.05" data-refine="turbo.strength" value="${esc(t.strength)}"${t.on && r.on ? "" : " disabled"}><output>${Number(t.strength).toFixed(2)}</output></label>
+          <input type="range" min="0" max="2" step="0.05" data-refine="turbo.strength" value="${esc(t.strength)}"${t.on ? "" : " disabled"}><output>${Number(t.strength).toFixed(2)}</output></label>
       </div>
     </div>
     <div class="muted small" style="margin-top:10px">${note}</div>`;
@@ -6966,16 +7037,72 @@ function faceTry(s) {
 }
 
 // ---------------------------------------------------------------------------
+// Refine this Shot (0.17.8): one take refined with the Refine panel's model (the panel's
+// switches can stay off), its own clip (<take>__ref) for the A/B viewer, and the version
+// each Shot exports: the refined one ends with " R".
+// ---------------------------------------------------------------------------
+
+const refClipKey = (s) => s && s.take ? takeStem(s.take) + "__ref" : null;
+/** A refined clip of the Shot's current take exists. */
+const refHasClip = (s) => !!(s && s.take && s.refined && s.refined.take === s.take && S.clips[refClipKey(s)]);
+/** The Shot exports its refined take. */
+const refChosen = (s) => refHasClip(s) && s.refined.keep === "refined";
+/** What a refined take depends on (the panel's model and its settings, as the key does). */
+function refineSig() {
+  const s = P().settings, r = s.refine, t = r.turbo;
+  return hash36(JSON.stringify([r.model, Number(r.steps), Number(r.denoise), Number(r.shift_video), s.shift_audio, s.scheduler,
+    s.sampler, t.on ? [t.lora, Number(t.strength)] : 0]));
+}
+/** Why a Shot's take can't be refined now (null: it can). */
+function refineBlocked(s) {
+  const r = P().settings.refine, made = takeModel(s);
+  if (!lsAtLeast(1, 7, 0)) return "Update H3 Long Shot to 1.7.0 or later to refine a Shot.";
+  if (!r.model) return "Choose the refine model below.";
+  if (made && made === r.model) return `${titleOf(s)}'s take was made with ${shortModel(r.model)} already: nothing to refine.`;
+  if (!made && r.model === P().settings.model)
+    return `Which model made ${titleOf(s)}'s take isn't recorded, and the refine model is the Model in Advanced. Set the Model to the one it was rendered with (e.g. ref2va) to refine it.`;
+  return null;
+}
+function refineTry(s) {
+  if (!s || !s.take) return;
+  const why = refineBlocked(s);
+  if (why) { toast(why); return; }
+  if (Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "refine" && j.spec.target === s.id)) {
+    toast("This Shot is already in the queue to be refined."); return;
+  }
+  enqueue({ type: "refine", target: s.id });
+}
+async function refineDone(b, outputs) {
+  await adoptClips(Object.entries(b.built.nodes.clips || {}).map(([key, node]) => ({ key, node })), outputs);
+  const s = shotById(b.extra.shot);
+  if (!s) return;
+  const prev = s.refined && s.refined.take === b.extra.take ? s.refined.keep : null;
+  s.refined = { take: b.extra.take, key: b.built.nodes.refine_key || null, sig: b.extra.sig, keep: prev || "original", made: Date.now() };
+  scheduleSave();
+  if (!S.swapped && P().shots.includes(s)) { renderRefine(); openAB(s, "refine"); }
+}
+/** Set which version a Shot exports. Refined (R) and face-refined (FR) are one or the other. */
+function setRefineKeep(s, v) {
+  if (v === "refined" && !refHasClip(s)) { toast("Refine this Shot first."); return false; }
+  s.refined = Object.assign({}, s.refined || {}, { keep: v === "refined" ? "refined" : "original" });
+  if (v === "refined" && faceRefined(s)) { s.face = Object.assign({}, s.face, { keep: "original" }); toast(`${titleOf(s)} exports its refined take; Face refine is set back to Original (one or the other).`); }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // A/B viewer (0.14.0): a Shot's take (A) against its face-refined version (B),
 // played in sync: wipe, flip or side by side, frame steps, zoom to the face.
 // ---------------------------------------------------------------------------
 
 const AB = { shot: null, mode: "wipe", split: 50, flip: false, zoom: false, boxes: false, loop: true, raf: 0, held: false };
 
-function openAB(s) {
+function openAB(s, kind = "face") {
   if (!s || !s.take) return;
-  const a = takeStem(s.take), b = faceKey(s);
-  if (!S.clips[a] || !faceHasClip(s)) { toast(!faceHasClip(s) ? "Refine this Shot first." : "This take has no clip yet."); return; }
+  const has = kind === "refine" ? refHasClip(s) : faceHasClip(s);
+  const a = takeStem(s.take);
+  if (!S.clips[a] || !has) { toast(!has ? "Refine this Shot first." : "This take has no clip yet."); return; }
+  AB.kind = kind;
+  if (kind === "refine") { AB.zoom = false; AB.boxes = false; }
   AB.shot = s.id;
   AB.flip = false;
   try { AB.mode = store("h3studio.abmode") || "wipe"; } catch (e) { /* default */ }
@@ -7040,14 +7167,15 @@ function abBoxesAt(s, t) {
 function renderAB(fresh) {
   const s = AB.shot && shotById(AB.shot);
   if (!s || $("ab").hidden) return;
-  const keep = faceKeepsOriginal(s) ? "original" : "refined";
-  const a = takeStem(s.take), b = faceKey(s);
-  const stale = s.face && s.face.sig !== faceSig();
+  const R = AB.kind === "refine";
+  const keep = R ? (refChosen(s) ? "refined" : "original") : faceKeepsOriginal(s) ? "original" : "refined";
+  const a = takeStem(s.take), b = R ? refClipKey(s) : faceKey(s);
+  const stale = R ? !!(s.refined && s.refined.sig !== refineSig()) : s.face && s.face.sig !== faceSig();
   if (fresh) {
     $("ab").innerHTML = `<div class="ab-dialog">
       <div class="ab-head">
-        <div class="ab-title"><h3 id="ab-title">${esc(titleOf(s))} · Face refine</h3>
-          <span class="muted small">A: the take as it is · B: small faces redrawn${s.face && s.face.treated ? ` (${s.face.treated})` : ""} · Export approved clips uses the one you pick</span></div>
+        <div class="ab-title"><h3 id="ab-title">${esc(titleOf(s))} · ${R ? "Refine" : "Face refine"}</h3>
+          <span class="muted small">A: the take as it is · B: ${R ? `refined with ${esc(shortModel(P().settings.refine.model))}` : `small faces redrawn${s.face && s.face.treated ? ` (${s.face.treated})` : ""}`} · Export approved clips uses the one you pick${R ? " (refined ends with R)" : ""}</span></div>
         <button class="ghost close ab-close" data-ab="close" aria-label="Close">
           <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></button>
       </div>
@@ -7070,16 +7198,16 @@ function renderAB(fresh) {
           <button data-ab="mode" data-v="side">Side by side</button>
         </div>
         <button class="ghost sm" data-ab="swap" id="ab-swap" title="Show the other one (hold F)">Showing B</button>
-        <button class="ghost sm" data-ab="zoom" id="ab-zoom-btn" title="Zoom to the face (Z)">Zoom to face</button>
-        <button class="ghost sm" data-ab="boxes" id="ab-boxes-btn" title="Face boxes (B)">Face boxes</button>
+        ${R ? "" : `<button class="ghost sm" data-ab="zoom" id="ab-zoom-btn" title="Zoom to the face (Z)">Zoom to face</button>
+        <button class="ghost sm" data-ab="boxes" id="ab-boxes-btn" title="Face boxes (B)">Face boxes</button>`}
         <button class="ghost sm" data-ab="loop" id="ab-loop" title="Loop">Loop</button>
         <span class="push muted small">Export uses</span>
-        <div class="seg seg-sm" role="group" aria-label="Faces this Shot exports with">
+        <div class="seg seg-sm" role="group" aria-label="${R ? "Which take this Shot exports" : "Faces this Shot exports with"}">
           <button data-ab="keep" data-v="refined">Refined</button>
           <button data-ab="keep" data-v="original">Original</button>
         </div>
       </div>
-      <div class="muted small ab-keys">${stale ? "B was made with other settings than the panel's now. " : ""}Space play · ← → one frame · hold F to flip · Z zoom · B boxes · Esc close</div>
+      <div class="muted small ab-keys">${stale ? "B was made with other settings than the panel's now. " : ""}Space play · ← → one frame · hold F to flip${R ? "" : " · Z zoom · B boxes"} · Esc close</div>
     </div>`;
     const [va, vb] = abVideos();
     va.loop = vb.loop = AB.loop;
@@ -7209,6 +7337,8 @@ function abAction(el) {
     case "keep": {
       const s = shotById(AB.shot);
       if (!s || setupGuard()) return;
+      if (AB.kind === "refine") { if (setRefineKeep(s, el.dataset.v)) { commit(); renderAB(); } return; }
+      if (el.dataset.v === "refined" && refChosen(s)) { s.refined.keep = "original"; toast(`${titleOf(s)} exports with refined faces; its refined take is set back to Original (one or the other).`); }
       if (el.dataset.v === "refined" && !faceHasClip(s)) { toast("Refine this Shot again first (its take changed)."); return; }
       s.face = Object.assign({}, s.face || {}, { keep: el.dataset.v === "original" ? "original" : "refined" });
       commit();
@@ -7278,7 +7408,15 @@ async function faceDone(b, outputs) {
 function renderAdvanced() {
   const s = P().settings, o = S.opts || {};
   const modelShort = (s.model || "no model").split(/[\\/]/).pop().replace(/\.(safetensors|gguf|ckpt|pt)$/i, "");
-  $("adv-summary").textContent = [modelShort, s.turbo.on ? "Turbo" : "no Turbo", s.sampler, s.scheduler, `overlap ${s.overlap}`]
+  // 0.17.12: folded, a switch between the last two models
+  const aq = $("adv-quick"), pair = modelPair();
+  aq.hidden = !!S.advOpen || !pair;
+  if (S.advOpen || !pair) aq.innerHTML = "";
+  else {
+    aq.innerHTML = `<div class="seg seg-sm" role="group" aria-label="Model">${pair.map((m) =>
+      `<button data-action="quick-model" data-model="${esc(m)}" aria-pressed="${m === s.model}" title="${esc(m)}">${esc(modelTag(m))}</button>`).join("")}</div>`;
+  }
+  $("adv-summary").textContent = [S.advOpen || !pair ? modelShort : "", s.turbo.on ? "Turbo" : "no Turbo", s.sampler, s.scheduler, `overlap ${s.overlap}`]
     .filter(Boolean).join(" · ");
   $("adv-chev").textContent = S.advOpen ? "Hide ▴" : "Show ▾";
   $("adv-toggle").setAttribute("aria-expanded", String(!!S.advOpen));
@@ -7463,8 +7601,17 @@ document.addEventListener("click", async (e) => {
       if (!sh || setupGuard()) return;
       if (el.dataset.v === "refined" && !faceHasClip(sh)) { toast("Refine this Shot first."); return; }
       sh.face = Object.assign({}, sh.face || {}, { keep: el.dataset.v === "original" ? "original" : "refined" });
+      if (el.dataset.v === "refined" && refChosen(sh)) { sh.refined.keep = "original"; toast(`${titleOf(sh)} exports with refined faces; its refined take (Refine panel) is set back to Original (one or the other).`); }
       commit();
       if (!$("ab").hidden) renderAB();
+      break;
+    }
+    case "refine-try": refineTry(shotById(el.dataset.shot)); break;
+    case "refine-ab": openAB(shotById(el.dataset.shot), "refine"); break;
+    case "refine-keep": {
+      const sh = shotById(el.dataset.shot);
+      if (!sh || setupGuard()) return;
+      if (setRefineKeep(sh, el.dataset.v)) { commit(); if (!$("ab").hidden) renderAB(); }
       break;
     }
     case "refine-on": case "refine-export": case "refine-turbo-on": {
@@ -7685,6 +7832,19 @@ document.addEventListener("click", async (e) => {
     case "reroll-shot": rerollShot(shotOf(el)); break;
     case "use-seed": useSeed(shotOf(el), Number(el.dataset.seed)); break;
     case "shot-seed-step": stepShotSeed(shotOf(el), Number(el.dataset.d) || 0); break;
+    case "quick-model": {                          // 0.17.12: the folded Advanced panel's model switch
+      if (setupGuard()) return;
+      const m = el.dataset.model;
+      if (!m || m === p.settings.model) break;
+      const mode = await askSettingChange("Change the model");
+      if (!mode) return render();
+      const before = p.settings.model;
+      p.settings.model = m;
+      modelSwitched(before, m);
+      applyRefChange(mode, "The model");
+      commit();
+      break;
+    }
     case "base-seed-step": {
       const inp = document.querySelector("[data-base-seed]");
       if (!inp) break;
@@ -7959,10 +8119,7 @@ document.addEventListener("change", async (e) => {
   }
   if (el.dataset.shotField) {
     const s = shotOf(el);
-    if (inRender(s)) {
-      toast("This shot is part of the render in progress; edit it when it finishes.");
-      return render();
-    }
+    if (inRender(s)) { scheduleSave(); return; }    // 0.17.7: the render keeps what it started with; the card flags the change
     // The value is already in the project (typing commits it, item 9). Leaving
     // the field only tidies an unfinished number; it never rebuilds the page,
     // so a click on Render right from the field lands the first time (item 10).
@@ -8004,6 +8161,10 @@ document.addEventListener("change", async (e) => {
     sh.seconds = c.frames / 24;
     if (changed) clipChanged(sh);
     return commit();
+  }
+  if (el.dataset.refineShot !== undefined) {       // 0.17.8: same for Refine this Shot
+    if (el.value && shotById(el.value)) focusShot(el.value);
+    return;
   }
   if (el.dataset.faceShot !== undefined) {         // 0.14.1: pick the Shot (moves the viewer there too)
     if (el.value && shotById(el.value)) focusShot(el.value);
@@ -8078,7 +8239,9 @@ document.addEventListener("change", async (e) => {
       // approved takes don't depend on it: they can be kept (item 2, round 5)
       const mode = await askSettingChange(`Change ${KEEPABLE[k]}`);
       if (!mode) return render();
+      const before = p.settings[k];
       p.settings[k] = v;
+      if (k === "model") modelSwitched(before, v);         // 0.17.9: FastH3 sets its own steps and Turbo
       applyRefChange(mode, KEEPABLE[k][0].toUpperCase() + KEEPABLE[k].slice(1));
       return commit();
     }
@@ -9566,6 +9729,46 @@ function matchModel(value, names) {
   return hits.length === 1 ? hits[0] : null;
 }
 
+/** 0.17.9: FastH3 (FastVideo's 8-step H3) makes a video in 8 steps on its own, without the
+ *  Turbo LoRA. Picking it remembers the steps and Turbo switch and sets 8 steps, Turbo off;
+ *  picking any other model puts them back. */
+const isFastModel = (m) => /fast[\s_-]?h3/i.test(m || "");
+
+/** 0.17.12: the two models the folded Advanced panel switches between: the one in use and
+ *  the one before it. With only one used so far: its ref2va / fl2va twin, when ComfyUI has
+ *  it. Sorted by name, so the buttons keep their places. null: nothing to switch to. */
+function modelPair() {
+  const s = P().settings, cur = s.model, have = (S.opts || {}).models;
+  if (!cur) return null;
+  const known = (m) => !have || have.includes(m);
+  let other = (s.model_recent || []).find((m) => m && m !== cur && known(m)) || null;
+  if (!other) {
+    const twin = /ref2va/i.test(cur) ? cur.replace(/ref2va/i, "fl2va") : /fl2va/i.test(cur) ? cur.replace(/fl2va/i, "ref2va") : null;
+    if (twin && have && have.includes(twin)) other = twin;
+  }
+  return other ? [cur, other].sort((a, b) => shortModel(a).localeCompare(shortModel(b))) : null;
+}
+/** A model's name on the switch: "ref2va_bf16" for minimax_h3_ref2va_bf16.safetensors. */
+const modelTag = (m) => shortModel(m).replace(/^minimax[_-]?h3[_-]?/i, "") || shortModel(m);
+const FAST_STEPS = 8;
+function modelSwitched(before, after) {
+  const s = P().settings, was = isFastModel(before), now = isFastModel(after);
+  if (after && before && after !== before) s.model_recent = [after, before];      // 0.17.12: for the quick switch
+  if (now === was) return;
+  if (now) {
+    s.pre_fast = { steps: Number(s.steps) || 8, turbo: !!s.turbo.on };
+    s.steps = FAST_STEPS;
+    s.turbo.on = false;
+    toast(`FastH3 renders in ${FAST_STEPS} steps without the Turbo LoRA: steps set to ${FAST_STEPS}, Turbo off. Picking another model puts them back.`);
+  } else {
+    const pf = s.pre_fast;
+    s.steps = pf ? pf.steps : s.steps;
+    s.turbo.on = pf ? pf.turbo : !!s.turbo.lora;
+    delete s.pre_fast;
+    toast(`Back to ${s.steps} steps${s.turbo.on ? " with the Turbo LoRA on" : ""}.`);
+  }
+}
+
 /** [label, kind, get, set] for every model file the project uses. */
 function modelSlots(p) {
   const s = p.settings, a = p.audio;
@@ -9711,7 +9914,7 @@ async function mbPick(name) {
   if (matters) { mode = await askSettingChange(`Change ${what}`); if (!mode) return render(); }
   if (t === "turbo") s.turbo.lora = name;
   else if (t.startsWith("lora:")) s.loras[+t.slice(5)].name = name;
-  else s[t] = name;
+  else { s[t] = name; if (t === "model") modelSwitched(before, name); }
   if (matters) applyRefChange(mode, what[0].toUpperCase() + what.slice(1));
   commit();
 }

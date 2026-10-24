@@ -1074,3 +1074,15 @@ body.moving-block, body.moving-block * { cursor: grabbing !important; user-selec
   .shot-row > .shot-head { padding-bottom: 4px; }
   .shot-row > .shot-tools { grid-column: 1 / -1; justify-self: end; max-width: none; padding-bottom: 8px; }
 }
+
+/* 0.17.12: Settings and Advanced, folded, keep a quick control in their header: the seed,
+   and a switch between the last two models */
+.fold-row { display: flex; align-items: center; gap: 10px; }
+.fold-row > .fold:first-child { flex: 1 1 auto; min-width: 0; width: auto; }
+.fold-row > .chev-btn { flex: none; width: auto; }
+.fold-quick { display: flex; align-items: center; gap: 6px; flex: none; }
+.fold-quick[hidden] { display: none; }
+.fold-quick .lbl-q { font-size: 11px; color: var(--muted); }
+.fold-quick .seed-field input { width: 104px; }
+.fold-quick .seg button { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 640px) { .fold-row { flex-wrap: wrap; } .fold-quick { order: 3; flex-basis: 100%; } }

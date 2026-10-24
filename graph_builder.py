@@ -714,8 +714,15 @@ def build_clip_export(project: dict, items: list, env: Env | None = None) -> Bui
         take = str((it or {}).get("take") or "")
         if not TAKE_NAME_RE.fullmatch(take):
             raise BuildError(f"Not a take: {take!r}")
+        own = {}
+        rk = str((it or {}).get("refine") or "")
+        if not refine_in and rk:
+            # 0.17.8: a Shot set to its refined take (Refine this Shot), already on disk
+            if not re.fullmatch(r"r[0-9a-f]{12}", rk):
+                raise BuildError(f"Not a refine key: {rk!r}")
+            own = {"refine": rk}
         lat = g.add(f"take{n}", "MiniMaxH3Take", f"Take {take}", cache_name=project_slug(project),
-                    take=take, shot_id="", **refine_in)
+                    take=take, shot_id="", **(refine_in or own))
         fclip = str((it or {}).get("face_clip") or "")
         if fclip:
             # 0.15.0: a Shot set to Refined exports its approved face-refined clip, as it was made
@@ -1021,6 +1028,61 @@ def _face_node(g, nid, project, f, env, images, latent, skip=None, title="Face r
                  cache_name=project_slug(project), cache_key=f["key"], detect_every=2, enabled=True, **extra)
 
 
+REFINE_CLIP_SUFFIX = "__ref"
+
+
+def build_refine_try(project: dict, item: dict, env: Env | None = None) -> Build:
+    """0.17.8, Refine this Shot: one take refined with the Refine panel's model (Long Shot's
+    refine pass on that take alone, kept in takes/refined), decoded and saved as its own clip
+    (clips/<take>__ref.mp4) for the A/B viewer. Works with the panel's switches off.
+    item: {key, take, song_at, song_len}."""
+    import copy
+    env = env or Env()
+    p = copy.deepcopy(project)
+    s = p.setdefault("settings", {})
+    s["refine"] = dict(s.get("refine") or {}, on=True)
+    if not s["refine"].get("model"):
+        raise BuildError("Choose the refine model first (Refine panel).")
+    if s["refine"]["model"] == s.get("model"):
+        # 0.17.10: the take is what gets refined: the model it was made with is what counts. The
+        # Long Shot run samples nothing (the take is locked), so its model input can be that one.
+        made = str((item or {}).get("take_model") or "")
+        if not made:
+            raise BuildError("Which model made this take isn't recorded, and the refine model is the Model in "
+                             "Advanced. Set the Model to the one it was rendered with to refine it.")
+        if made == s["refine"]["model"]:
+            raise BuildError("This take was made with the refine model already: nothing to refine.")
+        s["model"] = made
+    rc = refine_settings(p, env)
+    if rc is None:
+        raise BuildError("Update H3 Long Shot to 1.7.0 or later to refine a Shot.")
+    item = item or {}
+    key, take = str(item.get("key") or ""), str(item.get("take") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,150}", key) or not TAKE_NAME_RE.fullmatch(take):
+        raise BuildError(f"Not a take: {take!r}")
+    xp = _export_project(p, {take})
+    if not any(not sh.get("bypassed") for sh in xp.get("shots") or []):
+        raise BuildError("That take isn't on the timeline any more.")
+    base = build_prompt(xp, env=env, long_shot_only=True, refine_export=True)
+    warnings = list(base.warnings)
+    fmt = _video_format(env, warnings)
+    g = _Graph()
+    g.nodes.update(base.prompt)
+    vae = ["vae_video", 0] if "vae_video" in g.nodes else g.add("vae_video", "VAELoader", "Video VAE", vae_name=s["video_vae"])
+    avae = ["vae_audio", 0] if "vae_audio" in g.nodes else g.add("vae_audio", "VAELoader", "Audio VAE", vae_name=s["audio_vae"])
+    lat = g.add("reftake", "MiniMaxH3Take", f"Take {take} (refined)", cache_name=project_slug(p), take=take,
+                shot_id="", refine=rc["key"], after=["longshot", 1])
+    images = g.add("refdec", "VAEDecode", "VAE Decode", samples=lat, vae=vae)
+    songs = _song_slices(g, p, [item])
+    audio = songs.get(1) or g.add("refaud", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
+    name = key + REFINE_CLIP_SUFFIX
+    save = _clip_save(g, 1, p, images, audio, fmt, name)[0]
+    g.drop_unused("vae_audio")
+    return Build(prompt=g.nodes, width=0, height=0, chain=[], nodes={"clips": {name: save}, "refine_key": rc["key"],
+                                                                    "longshot": "longshot"},
+                 filename_prefix=clips_subfolder(p), video_format=fmt, warnings=warnings)
+
+
 def build_face_try(project: dict, item: dict, env: Env | None = None) -> Build:
     """0.14.0, Try on this Shot: one take decoded, its faces refined, saved as its own clip
     (clips/<take>__face.mp4) next to the take's clip for the A/B viewer. item: {key, take,
@@ -1207,7 +1269,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                           lora_name=turbo["lora"], strength_model=strength)
             warnings.append("Turbo LoRA through ComfyUI's stock loader. For full Turbo support "
                             "(pruned checkpoints), install ComfyUI-MiniMax-H3-Turbo.")
-    elif steps < 20:
+    elif steps < 20 and not re.search(r"fast[\s_-]?h3", str(s.get("model") or ""), re.I):   # 0.17.9: FastH3 is an 8-step model
         warnings.append(f"Turbo is off and steps are at {steps}. Without Turbo, H3 needs "
                         "about 20 steps or more.")
     for n, lora in enumerate((s.get("loras") or [])[:3], 1):

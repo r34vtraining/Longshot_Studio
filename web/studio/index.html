@@ -224,18 +224,24 @@
     </div>
 
     <div class="panel" id="settings-panel">
-      <button class="fold" data-action="toggle" data-key="settingsOpen" id="settings-toggle" aria-expanded="true" aria-controls="settings">
-        <span class="head-left"><span class="h2">Settings</span><span class="warn-tag">⚠ all shots</span><span class="muted small" id="settings-summary"></span></span>
-        <span class="muted chev" id="settings-chev">Hide ▴</span>
-      </button>
+      <div class="fold-row">
+        <button class="fold" data-action="toggle" data-key="settingsOpen" id="settings-toggle" aria-expanded="true" aria-controls="settings">
+          <span class="head-left"><span class="h2">Settings</span><span class="warn-tag">⚠ all shots</span><span class="muted small" id="settings-summary"></span></span>
+        </button>
+        <div class="fold-quick" id="settings-quick" hidden></div>
+        <button class="fold chev-btn" data-action="toggle" data-key="settingsOpen" aria-controls="settings" tabindex="-1"><span class="muted chev" id="settings-chev">Hide ▴</span></button>
+      </div>
       <div id="settings"></div>
     </div>
 
     <div class="panel" id="advanced-panel">
-      <button class="fold" data-action="toggle" data-key="advOpen" id="adv-toggle" aria-expanded="false" aria-controls="advanced">
-        <span class="head-left"><span class="h2">Advanced</span><span class="warn-tag">⚠ all shots</span><span class="muted small" id="adv-summary"></span></span>
-        <span class="muted chev" id="adv-chev">Show ▾</span>
-      </button>
+      <div class="fold-row">
+        <button class="fold" data-action="toggle" data-key="advOpen" id="adv-toggle" aria-expanded="false" aria-controls="advanced">
+          <span class="head-left"><span class="h2">Advanced</span><span class="warn-tag">⚠ all shots</span><span class="muted small" id="adv-summary"></span></span>
+        </button>
+        <div class="fold-quick" id="adv-quick" hidden></div>
+        <button class="fold chev-btn" data-action="toggle" data-key="advOpen" aria-controls="advanced" tabindex="-1"><span class="muted chev" id="adv-chev">Show ▾</span></button>
+      </div>
       <div id="advanced" hidden></div>
     </div>
 

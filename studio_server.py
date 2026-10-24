@@ -1315,7 +1315,8 @@ def register(routes=None):
                 lists[kind] = []
         project = resolve_names(body.get("project") or {}, lists)
         context_notes = []
-        if not body.get("take_clips") and not body.get("export_clips") and not body.get("face_try"):
+        if not body.get("take_clips") and not body.get("export_clips") and not body.get("face_try") \
+                and not body.get("refine_try"):
             context_notes = await asyncio.get_running_loop().run_in_executor(
                 None, add_context_frames, project, bool(body.get("dry_run")), body.get("upto"),
                 bool(body.get("standalone")))
@@ -1324,6 +1325,8 @@ def register(routes=None):
                 built = gb.build_take_audio(project, body["take_audio"].get("take"), env=current_env())
             elif isinstance(body.get("take_clips"), list):
                 built = gb.build_take_clips(project, body["take_clips"][:64], env=current_env())
+            elif isinstance(body.get("refine_try"), dict):
+                built = gb.build_refine_try(project, body["refine_try"], env=current_env())
             elif isinstance(body.get("face_try"), dict):
                 built = gb.build_face_try(project, body["face_try"], env=current_env())
             elif isinstance(body.get("export_clips"), list):
