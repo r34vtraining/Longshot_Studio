@@ -8,8 +8,7 @@ ComfyUI at `/longshot`. Build a film from short Shots, review and approve each o
 Studio stitches them into one continuous take or a cut sequence. Approved work is never
 thrown away.
 
-<img width="1928" height="1346" alt="image" src="https://github.com/user-attachments/assets/fc58d530-ae3e-4081-a58b-d91bacfd1989" />
-
+<img width="2389" height="1324" alt="image" src="https://github.com/user-attachments/assets/6fac718d-056d-4948-a8b1-072cbce39888" />
 
 ## Features
 
@@ -36,10 +35,11 @@ thrown away.
 - Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
 
-## What's new in 0.17.6
+## What's new in 0.17.12
 
-1. Minor timeline UI adjustments for ease of use
-2. Minor shot box UI adjustments for alignment 
+1. Minor timeline UI adjustments for ease of use (see above UI image for stacking timeline for creating overlapping handles for clips)
+2. Blank shots in timeline can now be stretched in the timeline itself to adjust shot length.  Move the blank shots to overlap previous shots.  
+3. Minor shot box UI adjustments for alignment 
 
 ## What's new in 0.17.0
 
