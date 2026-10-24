@@ -128,7 +128,7 @@ const DEFAULT_SETTINGS = {
   refine: { on: false, export_only: false, model: null, steps: 10, denoise: 0.3, shift_video: 12,
     turbo: { on: false, lora: null, strength: 1.0 } },
   // 0.14.0: Face refine, small faces redrawn by H3 as close-ups (Long Shot 1.8.0+)
-  face: { on: false, model: null, steps: 10, denoise: 0.3, shift_video: 4,
+  face: { on: true, model: null, steps: 10, denoise: 0.3, shift_video: 4,
     turbo: { on: false, lora: null, strength: 1.0 },
     max_face: 150, which: "all", work: 640, padding: 0.8, follow: "auto", mask: 1.0, feather: 0.3,
     color: 1.0, hold_audio: true, seed: 0, describe: "", cast: null },
@@ -183,6 +183,7 @@ function normalize(p) {
       : s.take && s.status !== "queued" ? { text: s.text || "", seconds: Number(s.seconds) || 5, seed: s.shot_seed ?? -1 } : null,
     edit_from: s.edit_from && typeof s.edit_from === "object" ? Object.assign({}, s.edit_from, { gen: 0 }) : null,
     join: s.join === "cut" || s.join === "context" ? s.join : "bridge",
+    free_end: !!s.free_end && s.join !== "cut" && s.join !== "context",   // 0.17.14: Continuous, its end not pinned to the Shot after
     context_from: s.context_from || null,     // Context: the take of the Shot before it was rendered from
     context_at: Number.isFinite(Number(s.context_at)) && s.context_at !== null ? Number(s.context_at) : null,   // 0.17.11: its frame (back from the end)
     kind: s.kind === "clip" ? "clip" : "shot",
@@ -220,13 +221,8 @@ function normalize(p) {
   p.audio.song_ref = !!p.audio.song_ref;
   p.audio.lip_sync = false;     // 0.9.5: the pinned song is gone from the Studio (no effect on lip timing)
   p.audio.final_override = !!p.audio.final_override;
-  p.audio.sync_nudge = Math.max(-240, Math.min(240, Math.round(Number(p.audio.sync_nudge) || 0)));
-  // 0.11.0: phrase starts in the song (seconds into the file), and how they're found
-  p.audio.phrases = (Array.isArray(p.audio.phrases) ? p.audio.phrases : []).map(Number)
-    .filter((x) => Number.isFinite(x) && x >= 0).sort((a, b) => a - b);
-  p.audio.phrase_gap = Math.max(0.1, Math.min(3, Number(p.audio.phrase_gap) || 0.5));
-  p.audio.phrase_sens = Math.max(0, Math.min(1, p.audio.phrase_sens === undefined ? 0.5 : Number(p.audio.phrase_sens) || 0));
-  p.audio.phrase_lead = Math.max(0, Math.min(48, Math.round(Number(p.audio.phrase_lead) || 0)));
+  p.audio.sync_nudge = 0;            // 0.17.15: Sync nudge is gone (a hidden value would shift every song slice)
+  delete p.audio.phrases; delete p.audio.phrase_gap; delete p.audio.phrase_sens; delete p.audio.phrase_lead;   // 0.17.15: phrase markers are gone
   const s = Object.assign({}, DEFAULT_SETTINGS, p.settings || {});
   s.turbo = Object.assign({}, DEFAULT_SETTINGS.turbo, s.turbo || {});
   s.rtx_vsr = Object.assign({}, DEFAULT_SETTINGS.rtx_vsr, s.rtx_vsr || {});
@@ -234,6 +230,7 @@ function normalize(p) {
   s.refine.turbo = Object.assign({}, DEFAULT_SETTINGS.refine.turbo, s.refine.turbo || {});
   s.face = Object.assign({}, DEFAULT_SETTINGS.face, s.face || {});
   s.face.turbo = Object.assign({}, DEFAULT_SETTINGS.face.turbo, s.face.turbo || {});
+  s.face.on = true;     // 0.17.16: always on; it only runs when you click Refine this Shot
   if (![1.5, 2].includes(Number(s.rtx_vsr.scale))) s.rtx_vsr.scale = 2;   // 1.5× or 2× only
   s.loras = [0, 1, 2].map((i) => Object.assign({ on: false, name: null, strength: 1.0 }, (s.loras || [])[i] || {}));
   p.settings = s;
@@ -334,19 +331,28 @@ function chipSides(s) {
   // 0.9.0: a neighbour under review counts too (its take is pinned as it is); a Shot
   // queued right behind one still rendering sees its take when its own render starts
   const ok = (x) => !!x && !otherSize(x) && (x.kind === "clip" || ((x.status === "approved" || x.status === "review") && !!x.take));
-  return { prev: i > 0 && ok(act[i - 1]) ? act[i - 1] : null, next: i >= 0 && ok(act[i + 1]) ? act[i + 1] : null };
+  // 0.17.14: the Shot after only pins this one's end when it carries on from it (its own
+  // join is Continuous); after a Cut or Context it starts fresh, so there's nothing to meet
+  const joined = (x) => x.kind === "clip" ? x.join !== "cut" : !["cut", "context"].includes(x.join);
+  const nx = i >= 0 ? act[i + 1] : null;
+  return { prev: i > 0 && ok(act[i - 1]) ? act[i - 1] : null, next: ok(nx) && joined(nx) ? nx : null };
 }
+/** The chip's choices. 0.17.14: "from" is Continuous with its end left free, offered when
+ *  the Shot after is rendered and carries on from this one (Bridge would pin into it). */
 function chipOptions(s) {
   const { prev, next } = chipNear(s);
-  if (prev) return ["bridge", "context", "cut"];
+  if (prev) return chipSides(s).next ? ["bridge", "from", "context", "cut"] : ["bridge", "context", "cut"];
   if (next) return ["bridge", "cut"];
   return ["cut"];
 }
 function chipJoin(s) {
-  const j = s.join || "bridge";
-  return chipOptions(s).includes(j) ? j : "cut";
+  let j = s.join || "bridge";
+  if (j === "bridge" && s.free_end) j = "from";
+  const opts = chipOptions(s);
+  return opts.includes(j) ? j : j === "from" ? "bridge" : "cut";
 }
 function chipName(s, j = chipJoin(s)) {
+  if (j === "from") return "Continuous";
   if (j === "bridge") { const { prev, next } = chipSides(s); return prev && next ? "Bridge" : "Continuous"; }
   return j === "context" ? "Context" : "Cut";
 }
@@ -616,8 +622,9 @@ function songGaps(project, drop) {
 
 function chipPlan(s) {
   const j = chipJoin(s);
-  if (j !== "bridge") return { alone: true, name: chipName(s, j) };
-  const { prev, next } = chipSides(s);
+  if (j !== "bridge" && j !== "from") return { alone: true, name: chipName(s, j) };
+  const { prev, next: pin } = chipSides(s);
+  const next = j === "from" ? null : pin;            // 0.17.14: Continuous leaves its end free
   if (!prev && !next) return { alone: true, name: "Continuous", pending: true };   // nothing approved to pin to yet
   const act = active(), i = act.indexOf(s), nx = act[i + 1];
   const joins = { [s.id]: prev ? "bridge" : "cut" };
@@ -754,11 +761,182 @@ async function api(path, opts = {}) {
 
 let saveTimer = null;
 function scheduleSave() {
+  hNote();
   clearTimeout(saveTimer);
   if (!S.conflict) S.saveState = "Unsaved changes";
   renderSaveState();
   saveTimer = setTimeout(saveNow, 2000);      // autosave 2 s after the last change
 }
+
+/* ---- Undo / redo (0.17.15) ----
+ * Every change made by the user (a click, a key, a field, a drag) is kept as a diff of the
+ * project: what each changed value was before and after. Undo puts the "before" values back,
+ * and only those, so what renders changed meanwhile (new takes, outputs) stays as it is.
+ * Changes the app makes on its own (a render landing) aren't steps. Up to 100 steps per
+ * project, kept for this tab. Renders, exports and files on disk aren't undone. */
+const H = { slug: null, base: null, undo: [], redo: [], lastUser: 0, lastPush: 0, lastTarget: null, applying: false };
+const H_MAX = 100, H_WINDOW = 1000, H_MERGE = 1200;
+const H_IGNORE = new Set(["saved_at", "last_output", "final_output", "preview_dirty"]);
+const hClone = (v) => v === undefined ? undefined : JSON.parse(JSON.stringify(v));
+const hIsObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+const hKeyed = (a) => a.every((x) => hIsObj(x) && x.id !== undefined && x.id !== null) && new Set(a.map((x) => x.id)).size === a.length;
+
+function hDiff(a, b, path = [], out = []) {
+  if (a === b) return out;
+  if (hIsObj(a) && hIsObj(b)) {
+    for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+      if (!path.length && H_IGNORE.has(k)) continue;
+      hDiff(a[k], b[k], [...path, k], out);
+    }
+    return out;
+  }
+  if (Array.isArray(a) && Array.isArray(b) && (a.length || b.length) && hKeyed(a) && hKeyed(b)) {
+    const ai = a.map((x) => x.id), bi = b.map((x) => x.id);
+    const am = new Map(a.map((x) => [x.id, x])), bm = new Map(b.map((x) => [x.id, x]));
+    for (const [i, id] of ai.entries()) if (!bm.has(id)) out.push({ path, op: "del", id, val: hClone(am.get(id)), at: i });
+    for (const [i, id] of bi.entries()) if (!am.has(id)) out.push({ path, op: "add", id, val: hClone(bm.get(id)), at: i });
+    for (const id of ai) if (bm.has(id)) hDiff(am.get(id), bm.get(id), [...path, { id }], out);
+    if (ai.join("\u0001") !== bi.join("\u0001")) out.push({ path, op: "order", before: ai, after: bi });
+    return out;
+  }
+  if (JSON.stringify(a) === JSON.stringify(b)) return out;
+  out.push({ path, op: "set", before: hClone(a), after: hClone(b) });
+  return out;
+}
+
+function hResolve(root, path) {
+  let c = root;
+  for (const seg of path) {
+    if (c === null || c === undefined) return null;
+    c = typeof seg === "object" ? (Array.isArray(c) ? c.find((x) => x && x.id === seg.id) : null) : c[seg];
+  }
+  return c === undefined ? null : c;
+}
+
+/** Put one side of a step back: "before" for undo, "after" for redo. */
+function hApply(root, ops, back) {
+  const side = (o) => back ? o.before : o.after;
+  for (const o of ops) if (o.op === "set") {
+    let c = hResolve(root, o.path.slice(0, -1));
+    const k = o.path[o.path.length - 1];
+    if (!c || typeof c !== "object") {
+      // the parent itself is gone or wasn't there: make it as plain objects
+      c = root;
+      for (const seg of o.path.slice(0, -1)) {
+        if (typeof seg === "object") { c = null; break; }
+        if (!c[seg] || typeof c[seg] !== "object") c[seg] = {};
+        c = c[seg];
+      }
+      if (!c) continue;
+    }
+    const v = side(o);
+    if (v === undefined) delete c[k]; else c[k] = hClone(v);
+  }
+  for (const o of ops) if (o.op === "add" || o.op === "del") {
+    const arr = hResolve(root, o.path);
+    if (!Array.isArray(arr)) continue;
+    const insert = (o.op === "del") === back;          // undoing a removal / redoing an addition
+    const i = arr.findIndex((x) => x && x.id === o.id);
+    if (insert) { if (i < 0) arr.splice(Math.min(o.at, arr.length), 0, hClone(o.val)); }
+    else if (i >= 0) arr.splice(i, 1);
+  }
+  for (const o of ops) if (o.op === "order") {
+    const arr = hResolve(root, o.path);
+    if (!Array.isArray(arr)) continue;
+    const want = side(o), pos = new Map(want.map((id, i) => [id, i]));
+    const keep = arr.filter((x) => !pos.has(x.id));      // added since: stay, at the end
+    const sorted = arr.filter((x) => pos.has(x.id)).sort((x, y) => pos.get(x.id) - pos.get(y.id));
+    arr.splice(0, arr.length, ...sorted, ...keep);
+  }
+}
+
+function hReset() {
+  Object.assign(H, { slug: P() ? P().slug : null, base: P() ? hClone(P()) : null, undo: [], redo: [], lastPush: 0, lastTarget: null });
+  renderUndo();
+}
+
+/** Called on every change (scheduleSave): a step if the user made it, else the new base. */
+function hNote() {
+  if (H.applying || S.swapped || !P()) return;
+  if (H.slug !== P().slug || !H.base) { hReset(); return; }
+  const now = Date.now();
+  const user = now - H.lastUser < H_WINDOW;
+  if (!user) { H.base = hClone(P()); return; }
+  const top = H.undo[H.undo.length - 1];
+  if (top && top.pre && now - H.lastPush < H_MERGE && H.lastTarget && top.target === H.lastTarget) {
+    top.ops = hDiff(top.pre, P());                        // typing, a slider: one step
+    if (!top.ops.length) H.undo.pop();
+  } else {
+    const ops = hDiff(H.base, P());
+    if (!ops.length) return;
+    if (top) delete top.pre;
+    H.undo.push({ ops, pre: H.base, target: H.lastTarget });
+    if (H.undo.length > H_MAX) H.undo.shift();
+  }
+  H.base = hClone(P());
+  H.lastPush = now;
+  H.redo = [];
+  renderUndo();
+}
+
+function hStep(back) {
+  if (!P() || S.swapped) return;
+  if (H.slug !== P().slug) hReset();
+  const from = back ? H.undo : H.redo, to = back ? H.redo : H.undo;
+  if (!from.length) { toast(back ? "Nothing to undo." : "Nothing to redo."); return; }
+  const fresh = hDiff(H.base, P());
+  if (fresh.length) H.base = hClone(P());                 // changes the app made meanwhile stay
+  const step = from.pop();
+  delete step.pre;
+  const top = to[to.length - 1];
+  if (top) delete top.pre;
+  hApply(P(), step.ops, back);
+  to.push(step);
+  H.lastPush = 0;
+  H.applying = true;
+  try {
+    S.project = normalize(P());
+    if (S.open && !P().shots.some((x) => x.id === S.open)) S.open = null;
+    if (S.focus && !P().shots.some((x) => x.id === S.focus)) S.focus = null;
+    H.base = hClone(P());
+    commit();
+  } finally { H.applying = false; }
+  renderUndo();
+}
+
+function renderUndo() {
+  const u = $("undo-btn"), r = $("redo-btn");
+  if (u) u.disabled = !H.undo.length;
+  if (r) r.disabled = !H.redo.length;
+}
+
+const hTextField = (t) => !!t && t.closest && (t.closest("textarea, select, [contenteditable]") ||
+  (t.tagName === "INPUT" && !["checkbox", "radio", "button", "range", "file", "color", "submit"].includes(t.type)));
+
+// a gesture starts: what's there now is the base (anything the app changed is in it)
+for (const ev of ["pointerdown", "keydown"]) document.addEventListener(ev, (e) => {
+  if (ev === "keydown" && (["Control", "Meta", "Shift", "Alt"].includes(e.key) ||
+      ((e.ctrlKey || e.metaKey) && ["z", "y"].includes((e.key || "").toLowerCase())))) return;
+  if (Date.now() - H.lastUser > H_WINDOW && P() && H.slug === P().slug && !S.swapped) H.base = hClone(P());
+  H.lastUser = Date.now();
+  H.lastTarget = e.target && e.target.id ? e.target.id : (e.target || null);
+}, true);
+for (const ev of ["input", "change", "click", "drop", "pointerup"]) document.addEventListener(ev, (e) => {
+  H.lastUser = Date.now();
+  if (ev === "input" || ev === "change") H.lastTarget = e.target && e.target.id ? e.target.id : (e.target || null);
+}, true);
+document.addEventListener("pointermove", (e) => { if (e.buttons) H.lastUser = Date.now(); }, true);
+
+document.addEventListener("keydown", (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+  const k = (e.key || "").toLowerCase();
+  if (k !== "z" && k !== "y") return;
+  if (hTextField(e.target)) return;                       // the field's own typing undo
+  if (!$("confirm").hidden || !$("editor").hidden) return;
+  e.preventDefault();
+  e.stopPropagation();
+  hStep(!(k === "y" || e.shiftKey));
+}, true);
 
 async function saveNow(force = false) {
   clearTimeout(saveTimer);
@@ -845,6 +1023,7 @@ async function loadProject(slug) {
   $("conflict").hidden = true;
   S.saveState = p.saved_at ? "Saved · " + clock(p.saved_at) : "";
   S.open = (reviewShot() || nextQueued() || {}).id || null;
+  hReset();
   store("h3studio.project", P().slug);
   OPEN.slug = P().slug;
   heartbeat();
@@ -3416,15 +3595,6 @@ function drawRuler(px, L, R) {
         `<div class="tl-rl${f % FPS ? " sub" : ""}" style="left:${x}px">${rulerLabel(f)}</div>`;
     } else h += `<div class="tl-rt" style="left:${x}px"></div>`;
   }
-  // 0.11.0: phrase starts, where the song sits under the film
-  if (songOn()) {
-    const st = songStart();
-    for (const t of phrases()) {
-      const f = (t - st) * FPS;
-      if (f < a - minor || f > b + minor) continue;
-      h += `<div class="tl-ph" style="left:${(f * pf).toFixed(1)}px" title="Phrase at ${fmtSong(t)} in the song"></div>`;
-    }
-  }
   $("tl-ruler").innerHTML = h;
 }
 
@@ -4882,13 +5052,14 @@ function render() {
   renderAudio();
   renderSettings();
   renderAdvanced();
+  renderLoras();
   renderRefine();
   renderFace();
   renderPlan();
   renderQueue();
 }
 
-function renderSaveState() { $("save-state").textContent = S.saveState; }
+function renderSaveState() { $("save-state").textContent = S.saveState; renderUndo(); }
 
 /** ComfyUI older than 0.35.0: no native H3 guides at any frame, so every render would fail. */
 function comfyTooOld() { return !!(S.opts && S.opts.comfy && S.opts.comfy.ok === false); }
@@ -5491,6 +5662,7 @@ const CHIP_HELP = {
 };
 function chipKey(s) {
   const j = chipJoin(s);
+  if (j === "from") return "from";
   if (j !== "bridge") return j;
   const { prev, next } = chipSides(s);
   return prev && next ? "bridge" : prev ? "from" : next ? "into" : "pending";
@@ -5542,7 +5714,7 @@ function shotRowHTML(s) {
   // the join chip: how ▶ renders it, from the rendered Shots next to it
   const actR = active(), prevR = !s.bypassed ? actR[actR.indexOf(s) - 1] : null;
   const cj = chipJoin(s), opts = chipOptions(s);
-  const icon = { bridge: "↔", context: "⧉", cut: "|" }[cj];
+  const icon = { bridge: "↔", from: "→", context: "⧉", cut: "|" }[cj];
   const joinChip = !s.bypassed && s.kind !== "clip"
     ? `<button class="join-chip j-${esc(cj)}${opts.length < 2 ? " only" : ""}" data-action="cycle-join" title="${esc(chipName(s) + ": " + CHIP_HELP[chipKey(s)])}${
       (() => { const nb = chipNear(s), odd = [nb.prev, nb.next].filter(otherSize);
@@ -5561,7 +5733,7 @@ function shotRowHTML(s) {
           ${play ? "" : `<span class="sdot" style="background:${L.dot};color:${L.fg}">${L.icon}</span>`}
           <span class="sleft"><span class="sline"><span class="stitle">${title}</span>
           <span class="smeta">${isEmptyShot(s) ? `${(Number(s.seconds) || 0).toFixed(2)}s · <span class="hold-tag" title="No prompt: it holds its time on the film and never renders. Moving the Shot next to it makes it longer or shorter.">holds time</span>`
-            : `${esc(s.seconds)}s · seed ${esc(seed)}`}${songSpanHTML(s)}${editTag(s)}${overlapTag(s)}${phraseTag(s)}${alignedTag(s)}${sizeTag(s)}</span></span>
+            : `${esc(s.seconds)}s · seed ${esc(seed)}`}${songSpanHTML(s)}${editTag(s)}${overlapTag(s)}${alignedTag(s)}${sizeTag(s)}</span></span>
           <span class="sprev">${esc(s.text) || '<i class="muted">empty</i>'}</span></span>
           <span class="snotes">${flag}${cut}${standaloneTag}${ctxFlag}
           <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span></span>
@@ -6080,117 +6252,6 @@ function startPreview() {
 }
 
 // ---------------------------------------------------------------------------
-// Phrase markers (0.11.0): where singing starts after a pause, in seconds into the
-// song file. Press M while the song plays (or with the scrub bar focused) to mark
-// one; drag a marker to move it, double-click to delete it. Detect suggests them
-// from the full mix (the centre channel in the voice range). A Shot card's
-// "Start on the next phrase" moves the Shot onto the next one.
-// ---------------------------------------------------------------------------
-
-const PH = { drag: null };
-
-function phrases() { return (P() && P().audio.phrases) || []; }
-
-function setPhrases(list) {
-  const a = P().audio;
-  a.phrases = [...new Set(list.map((t) => Math.round(Math.max(0, t) * FPS) / FPS))].sort((x, y) => x - y);
-  commit();
-}
-
-function markPhrase(t) {
-  const at = t !== undefined ? t : previewing() ? preview.el.currentTime : scrubPos();
-  if (!P().audio.file) return;
-  if (phrases().some((x) => Math.abs(x - at) < 0.1)) { toast("There's a marker there already."); return; }
-  setPhrases([...phrases(), at]);
-  toast(`Phrase marked at ${fmtSong(at)} (${phrases().length} in all).`);
-}
-
-function drawPhraseMarks() {
-  const bar = $("ascrub");
-  if (!bar) return;
-  bar.querySelectorAll(".ph-mark").forEach((x) => x.remove());
-  const r = scrubRange();
-  if (!isFinite(r.b) || r.b <= r.a) return;
-  phrases().forEach((t, i) => {
-    if (t < r.a || t > r.b) return;
-    const m = document.createElement("div");
-    m.className = "ph-mark";
-    m.dataset.ph = String(i);
-    m.style.left = ((t - r.a) / (r.b - r.a) * 100) + "%";
-    m.title = `Phrase at ${fmtSong(t)} · drag to move, double-click to delete`;
-    bar.appendChild(m);
-  });
-}
-
-document.addEventListener("pointerdown", (e) => {
-  const m = e.target.closest && e.target.closest(".ph-mark");
-  if (!m || e.button !== 0) return;
-  e.preventDefault();
-  e.stopPropagation();
-  PH.drag = { i: Number(m.dataset.ph), el: m };
-}, true);
-document.addEventListener("pointermove", (e) => {
-  if (!PH.drag) return;
-  const bar = $("ascrub"), r = scrubRange();
-  if (!bar || !isFinite(r.b)) return;
-  const box = bar.getBoundingClientRect();
-  const t = r.a + (r.b - r.a) * Math.max(0, Math.min(1, (e.clientX - box.left) / box.width));
-  PH.drag.t = t;
-  PH.drag.el.style.left = ((t - r.a) / (r.b - r.a) * 100) + "%";
-  trimReadout(e.clientX, e.clientY, fmtSong(t));
-});
-document.addEventListener("pointerup", () => {
-  const d = PH.drag;
-  if (!d) return;
-  PH.drag = null;
-  $("tl-readout").hidden = true;
-  if (d.t === undefined) return;
-  const list = phrases().slice();
-  list[d.i] = d.t;
-  setPhrases(list);
-});
-document.addEventListener("dblclick", (e) => {
-  const m = e.target.closest && e.target.closest(".ph-mark");
-  if (!m) return;
-  const list = phrases().slice();
-  list.splice(Number(m.dataset.ph), 1);
-  setPhrases(list);
-});
-
-async function detectPhrases() {
-  const a = P().audio;
-  if (!a.file || audioMissing()) return;
-  if (phrases().length && !confirm(`Replace the ${phrases().length} phrase marker${phrases().length === 1 ? "" : "s"} with detected ones?`)) return;
-  S.detecting = true;
-  renderAudio();
-  try {
-    const r = await api("/longshot/phrases", { method: "POST", body: { file: a.file, subfolder: a.subfolder || "",
-      min_gap: a.phrase_gap, sensitivity: a.phrase_sens } });
-    setPhrases(r.phrases || []);
-    toast(r.phrases && r.phrases.length ? `${r.phrases.length} phrases found. Check them on the scrub bar: drag to move, double-click to delete, M to add.`
-      : "No clear phrase starts found. Lower Min pause or raise Sensitivity, or mark them with M.");
-  } catch (e) { toast("Couldn't detect phrases: " + e.message); }
-  finally { S.detecting = false; renderAudio(); }
-}
-
-function phraseHTML(a) {
-  const ok = a.file && !audioMissing(), n = phrases().length;
-  return `<div class="ph-row">
-      <span class="small"><b>Phrases</b> <span class="muted">${n ? `${n} marked` : "none yet"} · M marks one while the song plays</span></span>
-      <span class="ph-btns">
-        <button class="ghost sm" data-action="phrase-mark"${ok ? "" : " disabled"} title="Mark a phrase at the playhead (M while the song plays)">+ Mark</button>
-        <button class="ghost sm" data-action="phrase-detect"${ok && !S.detecting ? "" : " disabled"} title="Suggest phrase starts from the song (the centre channel in the voice range)">${S.detecting ? "Detecting…" : "Detect"}</button>
-        <button class="ghost sm" data-action="phrase-clear"${n ? "" : " disabled"}>Clear</button>
-      </span>
-    </div>
-    <div class="shot-opts ph-opts">
-      <label class="lbl-row" title="How long the singing has to stop before the next start counts as a new phrase">Min pause <input type="number" min="0.1" max="3" step="0.1" data-audio="phrase_gap" value="${esc(a.phrase_gap)}" style="width:64px"> s</label>
-      <label class="lbl-row" title="Higher finds quieter phrase starts (and more false ones)">Sensitivity <input type="range" min="0" max="1" step="0.05" data-audio="phrase_sens" value="${esc(a.phrase_sens)}" style="width:90px"></label>
-      <label class="lbl-row" title="Start on the next phrase starts the Shot this many frames before the word">Lead-in <input type="number" min="0" max="48" step="1" data-audio="phrase_lead" value="${esc(a.phrase_lead)}" style="width:56px"> frames</label>
-    </div>`;
-}
-
-// ---------------------------------------------------------------------------
 // Align to song (0.11.0): decode a take's own audio (H3's performance of the song),
 // compare it with the song where the take sits, and move the take by the difference.
 // ---------------------------------------------------------------------------
@@ -6255,16 +6316,6 @@ function applyAlign(s) {
   }
 }
 
-/** On a Shot card: "▸ next phrase" (and, for a rendered Shot, Align to song). */
-function phraseTag(s) {
-  if (!songOn() || isEmptyShot(s)) return "";
-  let h = "";
-  if (phrases().length && runOf(s)[0] === s && nextPhraseFrame(s) !== null) {
-    h += ` · <span class="linkbtn" role="button" tabindex="0" data-action="phrase-next" title="Move this Shot so it starts on the next phrase marker (the empty Shot before it makes room)">▸ next phrase</span>`;
-  }
-  return h;
-}
-
 /** 0.12.7: "1056×608" on a Shot made at another size than Settings make now. */
 function sizeTag(s) {
   if (!otherSize(s)) return "";
@@ -6281,27 +6332,6 @@ function alignedTag(s) {
   return isAligned(s)
     ? ` · <span class="aligned-btn on" role="button" tabindex="0" data-action="aligned" aria-pressed="true" title="Lined up with the song: Alt + ← / → won't move it. Click to unmark.">aligned ✓</span>`
     : ` · <span class="aligned-btn" role="button" tabindex="0" data-action="aligned" aria-pressed="false" title="Mark this Shot as lined up with the song (it then stays put)">aligned</span>`;
-}
-
-/** The next phrase after a Shot's start on the film, as a film frame (null: none). */
-function nextPhraseFrame(s) {
-  const sp = filmSpan(s);
-  if (!sp) return null;
-  const lead = Number(P().audio.phrase_lead) || 0, st = songStart();
-  for (const t of phrases()) {
-    const f = Math.round((t - st) * FPS) - lead;
-    if (f > sp.a) return f;
-  }
-  return null;
-}
-
-/** Start on the next phrase: move the Shot (its run) so it starts on the next marker. */
-function startOnPhrase(s) {
-  const f = nextPhraseFrame(s), sp = filmSpan(s);
-  if (f === null || !sp) { toast(phrases().length ? "No phrase marker after this Shot's start." : "Mark the phrases first (Audio panel: M while the song plays, or Detect)."); return; }
-  const run = runOf(s);
-  if (run[0] !== s) { toast(`${titleOf(s)} continues from the Shot before; move the first Shot of the run.`); return; }
-  moveShot(s, f - sp.a);
 }
 
 // ---------------------------------------------------------------------------
@@ -6408,7 +6438,6 @@ function updateScrub() {
   $("ascrub-a").textContent = fmtSong(r.a);
   $("ascrub-b").textContent = isFinite(r.b) ? fmtSong(r.b) : (SCRUB.loading ? "loading…" : "—");
   $("ascrub-pos").textContent = `${fmtSong(pos)} in the song · ${(pos - r.a).toFixed(2)} s after Start`;
-  drawPhraseMarks();
 }
 
 function scrubTo(t) {
@@ -6503,9 +6532,18 @@ video.addEventListener("volumechange", () => { preview.el.volume = video.volume;
 
 function renderAudio() {
   const a = P().audio;
-  const on = [songRefOn() ? "song as <Audio 1>" : "", a.file && a.final_override ? "song in final" : ""].filter(Boolean);
-  $("audio-summary").textContent = on.length ? "On: " + on.join(" · ") : "Off · generated audio only";
+  const songLab = `<Audio ${videoAudioCount() + 1}>`;
+  const on = [songRefOn() ? `song as ${songLab}` : "", a.file && a.final_override ? "song in final" : ""].filter(Boolean);
+  // 0.17.13: folded, its two switches stay in the header; the summary names the song
+  $("audio-summary").textContent = S.audioOpen ? (on.length ? "On: " + on.join(" · ") : "Off · generated audio only")
+    : a.file ? (a.original_name || a.file) : "no song chosen";
   $("audio-chev").textContent = S.audioOpen ? "Hide ▴" : "Show ▾";
+  $("audio-toggle").setAttribute("aria-expanded", String(!!S.audioOpen));
+  const aq = $("audio-quick");
+  aq.hidden = !!S.audioOpen;
+  const off = a.file ? "" : ' disabled title="Choose a song in the Audio panel first"';
+  aq.innerHTML = S.audioOpen ? "" : [["song_ref", `Song as ${songLab}`], ["final_override", "Song in final"]].map(([k, t]) =>
+    `<label class="quick-switch">${switchHTML(!!a[k], `data-action="audio-route" data-key="${k}" aria-label="${esc(t)}"${off}`, true)}<span class="lbl-q">${esc(t)}</span></label>`).join("");
   $("audio").hidden = !S.audioOpen;
   if (!S.audioOpen) { stopPreview(); return; }
   $("audio").innerHTML = `<div class="audio-routes" style="display:flex;flex-direction:column;gap:2px;margin-bottom:12px">
@@ -6513,7 +6551,7 @@ function renderAudio() {
         <span class="route-text"><b>${esc(t)}</b><i>${esc(r)}</i></span><span class="badge">${badge}</span></div>`).join("")}
       ${a.song_ref ? `<div class="muted small" style="margin-top:4px">The Studio adds “audio reuse” to the summary and this retention line: <span class="mono">&lt;Audio 1&gt; (the song): fully_copy</span>. Each Shot's card shows ♪ where it sits in the song.</div>` : ""}
     </div>
-    <div class="note-ref2v" role="note"><b>Lip sync:</b> the ref2va model finds where the singing starts by itself. With fl2va, start each singing Shot on a sung word: it sings from the Shot's first frame. Phrase markers and “Start on the next phrase” help with that; “Align to song” lines up a take afterwards.</div>
+    <div class="note-ref2v" role="note"><b>Lip sync:</b> the ref2va model finds where the singing starts by itself. With fl2va, start each singing Shot on a sung word: it sings from the Shot's first frame. “Align to song” on a Shot lines up a take afterwards.</div>
     <div style="margin-top:12px">
       <div class="lbl">Audio file <span class="muted small">· drop a song anywhere on this panel</span>
         <div class="pick"><select class="field" data-relink="audio" aria-label="Audio file">${inputOptions("audio", a.subfolder, a.file, "No audio")}</select>
@@ -6529,12 +6567,6 @@ function renderAudio() {
         <span class="mono muted small" id="ap-time">${previewing() ? apLabel() : ""}</span>
       </div>
       ${scrubHTML(a)}
-      ${phraseHTML(a)}
-      <div style="display:flex;flex-direction:column;gap:2px;margin-top:14px">
-      <div class="shot-opts" style="margin-top:10px">
-        <label class="lbl-row" title="H3 sings a little late? Each Shot's song slice starts this many frames later in the song, so the singing lands on time. Negative: earlier. For Shots rendered from now on.">Sync nudge <input class="field" type="number" step="1" min="-240" max="240" data-audio="sync_nudge" value="${esc(Number(a.sync_nudge) || 0)}" style="width:72px"> frames</label>
-      </div>
-      </div>
       ${a.voice_ref ? `<div style="margin-top:10px">${modelField("Vocal separation model (MelBand RoFormer)", "diffusion_models", "melband",
         `<select data-melband aria-label="Vocal separation model">${fileOptions((S.opts || {}).melband, a.melband_model, "Choose…")}</select>`)}</div>` : ""}<div class="muted small" style="margin-top:8px">Pick from audio files in ComfyUI's input folder, or this project's input/longshot/${esc(P().slug)} folder.</div></div>`;
   ensureScrub();
@@ -6608,7 +6640,7 @@ function renderSettings() {
   if (!S.settingsOpen) return;
   const t2 = s.turbo;
   const warn = !t2.on && s.steps < 20 && !isFastModel(s.model) ? `<div class="warnbox" role="alert" style="margin-top:12px">
-      <span style="flex:1">Turbo is off (Advanced) and steps are at ${esc(s.steps)}. Without Turbo, H3 needs about 20 steps or more. Expect a soft, unfinished result.</span>
+      <span style="flex:1">Turbo is off (LoRAs panel) and steps are at ${esc(s.steps)}. Without Turbo, H3 needs about 20 steps or more. Expect a soft, unfinished result.</span>
       <button class="ghost sm" data-action="steps20">Set 20 steps</button></div>` : "";
   const mp = (o.megapixels || [0.4, 0.6, 0.9, 1.2]).map((m) =>
     `<option value="${m}"${Number(m) === Number(s.megapixels) ? " selected" : ""}>${m} MP</option>`).join("");
@@ -6783,7 +6815,7 @@ function renderRefine() {
 /** Face refine applies: on, a model chosen, Long Shot 1.8.0 with its node, the detector there. */
 function faceActive() {
   const f = P() && P().settings.face, o = S.opts || {};
-  return !!(f && f.on && f.model && lsAtLeast(1, 8, 0) && !(o.nodes && o.nodes.MiniMaxH3FaceRefine === false)
+  return !!(f && f.model && lsAtLeast(1, 8, 0) && !(o.nodes && o.nodes.MiniMaxH3FaceRefine === false)
     && o.face_detector !== false);
 }
 function faceNodeReady() {
@@ -6883,16 +6915,16 @@ function renderFaceSummary() { if (P()) $("face-summary").textContent = faceSumm
 
 function faceSummaryText() {
   const f = P().settings.face;
-  if (!f.on) return "Off";
-  if (!f.model) return "On · choose a model";
+  if (!f.model) return "choose a model";
   const n = active().filter(faceRefined).length;
-  return `On · ${shortModel(f.model)} · under ${f.max_face} px · denoise ${Number(f.denoise).toFixed(2)}` +
+  return `${shortModel(f.model)} · under ${f.max_face} px · denoise ${Number(f.denoise).toFixed(2)}` +
     ` · ${n ? `${n} Shot${n === 1 ? "" : "s"} refined` : "no Shot refined yet"}`;
 }
 
 function renderFace() {
   if (!P()) return;
   const s = P().settings, f = s.face, o = S.opts || {}, t = f.turbo;
+  if (!f.model && fl2vaModel()) f.model = fl2vaModel();
   $("face-summary").textContent = faceSummaryText();
   $("face-chev").textContent = S.faceOpen ? "Hide ▴" : "Show ▾";
   $("face-toggle").setAttribute("aria-expanded", String(!!S.faceOpen));
@@ -6903,7 +6935,8 @@ function renderFace() {
     $("face").innerHTML = `<div class="muted small" style="margin-top:12px">Update H3 Long Shot to 1.8.0 or later (and restart ComfyUI) for Face refine.</div>`;
     return;
   }
-  const dis = f.on ? "" : " disabled";
+  // 0.17.15: manual only (Refine this Shot): no on / off switch, the settings are always usable
+  const dis = "";
   const detector = o.face_detector ? "" : `<div class="box face-get">
       <div class="box-row"><div style="flex:1;min-width:200px"><div>The face detector isn't installed</div>
         <div class="muted small">MTCNN, about 2 MB, into models/facedetect/mtcnn. It finds and follows the faces.</div></div>
@@ -6950,7 +6983,7 @@ function renderFace() {
       ${have ? `<div class="muted small" style="margin-top:6px">Refined: ${sh.face.treated || 0} face${sh.face.treated === 1 ? "" : "s"} redrawn${sh.face.cached ? " (kept from before)" : ""}.${stale ? " Made with other settings than these: Refine again to use them." : ""}</div>`
         : old ? `<div class="muted small" style="margin-top:6px">⚠ The refined version was made from an older take. Refine this Shot again.</div>` : ""}
       <div class="box-row" style="margin-top:10px">
-        <button class="ghost sm" data-action="face-try" data-shot="${esc(sh.id)}"${f.on && f.model && o.face_detector && !busy ? "" : " disabled"}>${busy ? "In the queue…" : have ? "Refine again" : "Refine this Shot"}</button>
+        <button class="ghost sm" data-action="face-try" data-shot="${esc(sh.id)}"${f.model && o.face_detector && !busy ? "" : " disabled"}>${busy ? "In the queue…" : have ? "Refine again" : "Refine this Shot"}</button>
         <button class="ghost sm" data-action="face-ab" data-shot="${esc(sh.id)}"${have && S.clips[takeStem(sh.take)] ? "" : " disabled"}>Compare A/B</button>
         <span class="push muted small">Export uses</span>
         <div class="seg seg-sm" role="group" aria-label="Which version this Shot exports">
@@ -6960,8 +6993,7 @@ function renderFace() {
       </div></div>`;
   }
   $("face").innerHTML = `${detector}
-    <div class="route" style="margin-top:12px">${switchHTML(f.on, 'data-action="face-on" aria-label="Face refine"')}
-      <span class="route-text"><b>Redraw small faces</b><i>refine the Shots you choose: H3 redraws each small face as a steady close-up and blends it back in</i></span></div>
+    <div class="muted small" style="margin-top:12px">Pick a Shot and click Refine this Shot: H3 redraws each small face as a steady close-up and blends it back in. Nothing is refined on its own.</div>
     ${shotHTML}
     ${refinedList}
     <div class="box face-card" style="margin-top:12px">
@@ -6980,9 +7012,9 @@ function renderFace() {
       <div class="box-row">
         ${switchHTML(t.on, `data-action="face-turbo-on" aria-label="Face refine Turbo LoRA"${dis}`)}
         <div style="flex:1;min-width:140px"><div>Turbo LoRA (face model)</div>
-          <div class="pick" style="margin-top:4px"><select data-face="turbo.lora" aria-label="Face refine Turbo LoRA file"${t.on && f.on ? "" : " disabled"}>${fileOptions(o.loras, t.lora, "Choose…")}</select></div></div>
+          <div class="pick" style="margin-top:4px"><select data-face="turbo.lora" aria-label="Face refine Turbo LoRA file"${t.on ? "" : " disabled"}>${fileOptions(o.loras, t.lora, "Choose…")}</select></div></div>
         <label class="strength" style="flex:1 1 180px">Strength
-          <input type="range" min="0" max="2" step="0.05" data-face="turbo.strength" value="${esc(t.strength)}"${t.on && f.on ? "" : " disabled"}><output>${Number(t.strength).toFixed(2)}</output></label>
+          <input type="range" min="0" max="2" step="0.05" data-face="turbo.strength" value="${esc(t.strength)}"${t.on ? "" : " disabled"}><output>${Number(t.strength).toFixed(2)}</output></label>
       </div>
     </div>
     <div class="grid2" style="margin-top:12px">
@@ -6996,7 +7028,7 @@ function renderFace() {
     </div>
     <div class="grid2" style="margin-top:12px">
       <label class="lbl" title="${fl ? "The fl2va model takes no reference pictures: the face keeps the identity it has in the take" : "The ref2va model gets this Cast picture as the face's identity (<Picture 1>)"}">Identity picture${fl ? " (ref2va only)" : ""}
-        <select data-face="cast"${f.on && !fl ? "" : " disabled"}><option value="">None · keep the take's face</option>${castOpts}</select></label>
+        <select data-face="cast"${!fl ? "" : " disabled"}><option value="">None · keep the take's face</option>${castOpts}</select></label>
       <label class="lbl" title="Added to the close-up's prompt, e.g. a young woman with freckles and red lipstick">Describe the face (optional)
         <input type="text" data-face="describe" value="${esc(f.describe || "")}" placeholder="e.g. a young woman with freckles"${dis}></label>
     </div>` : ""}
@@ -7029,7 +7061,7 @@ function renderFace() {
 /** Try on this Shot: its take decoded, faces refined, saved as its own clip. */
 function faceTry(s) {
   if (!s || !s.take) return;
-  if (!faceActive()) { toast(!(S.opts || {}).face_detector ? "Download the face detector first." : "Turn Redraw small faces on and choose the face model first."); return; }
+  if (!faceActive()) { toast(!(S.opts || {}).face_detector ? "Download the face detector first." : "Choose the face model first (Face refine panel)."); return; }
   if (Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "face" && j.spec.target === s.id)) {
     toast("This Shot is already in the queue to be refined."); return;
   }
@@ -7416,18 +7448,12 @@ function renderAdvanced() {
     aq.innerHTML = `<div class="seg seg-sm" role="group" aria-label="Model">${pair.map((m) =>
       `<button data-action="quick-model" data-model="${esc(m)}" aria-pressed="${m === s.model}" title="${esc(m)}">${esc(modelTag(m))}</button>`).join("")}</div>`;
   }
-  $("adv-summary").textContent = [S.advOpen || !pair ? modelShort : "", s.turbo.on ? "Turbo" : "no Turbo", s.sampler, s.scheduler, `overlap ${s.overlap}`]
+  $("adv-summary").textContent = [S.advOpen || !pair ? modelShort : "", s.sampler, s.scheduler, `overlap ${s.overlap}`]
     .filter(Boolean).join(" · ");
   $("adv-chev").textContent = S.advOpen ? "Hide ▴" : "Show ▾";
   $("adv-toggle").setAttribute("aria-expanded", String(!!S.advOpen));
   $("advanced").hidden = !S.advOpen;
   if (!S.advOpen) return;
-  const t = s.turbo;
-  const loras = s.loras.map((l, i) => `<div class="lora${l.on ? "" : " off"}">
-      ${switchHTML(l.on, `data-action="lora-on" data-i="${i}" aria-label="LoRA ${i + 1}"`, true)}
-      <div class="pick" style="flex:1 1 160px"><select data-lora="${i}" data-k="name" aria-label="LoRA ${i + 1} file"${l.on ? "" : " disabled"}>${fileOptions(o.loras, l.name, "Choose a LoRA…")}</select>${browseBtn("loras", "lora:" + i, !l.on)}</div>
-      <label class="strength"><input type="range" min="0" max="2" step="0.05" data-lora="${i}" data-k="strength" value="${esc(l.strength)}"${l.on ? "" : " disabled"} aria-label="LoRA ${i + 1} strength"><output>${Number(l.strength).toFixed(2)}</output></label>
-    </div>`).join("");
   const overlaps = [5, 22, 39, 56, 73].map((v) => `<option value="${v}"${v === Number(s.overlap) ? " selected" : ""}>${v}</option>`).join("");
   const sage = (o.sage_modes && o.sage_modes.length ? o.sage_modes : ["disabled", "auto"]);
   $("advanced").innerHTML = `    <div class="model-files">
@@ -7438,17 +7464,6 @@ function renderAdvanced() {
         ${modelField("Audio VAE", "vae", "audio_vae", select('data-set="audio_vae" aria-label="Audio VAE"', o.vaes, s.audio_vae, "Choose…"))}
       </div>
     </div>
-    <div class="box">
-      <div class="box-row">
-        ${switchHTML(t.on, 'data-action="turbo-on" aria-label="Turbo LoRA"')}
-        <div style="flex:1;min-width:140px"><div>Turbo LoRA</div>
-          <div class="pick" style="margin-top:4px"><select data-turbo="lora" aria-label="Turbo LoRA file"${t.on ? "" : " disabled"}>${fileOptions(o.loras, t.lora, "Choose…")}</select>${browseBtn("loras", "turbo", !t.on)}</div></div>
-        <label class="strength" style="flex:1 1 180px">Strength
-          <input type="range" min="0" max="2" step="0.05" data-turbo="strength" value="${esc(t.strength)}"${t.on ? "" : " disabled"}><output>${Number(t.strength).toFixed(2)}</output></label>
-      </div>
-      ${hasPack("turbo") ? "" : `<div class="pack-note muted small">Using ComfyUI's stock LoRA loader. ${installBtn("turbo")}</div>`}
-    </div>
-    <div class="loras">${loras}</div>
     <div class="adv-sub">Sampling</div>
     <div class="grid2">
       <label class="lbl">Sampler ${select('data-set="sampler"', o.samplers, s.sampler)}</label>
@@ -7459,6 +7474,34 @@ function renderAdvanced() {
       <label class="lbl">Shift video <input data-set="shift_video" data-num type="number" step="0.5" value="${esc(s.shift_video)}"></label>
       <label class="lbl">Shift audio <input data-set="shift_audio" data-num type="number" step="0.5" value="${esc(s.shift_audio)}"></label>
     </div>`;
+}
+
+/** 0.17.15: the LoRAs panel: the Turbo LoRA and LoRA 1-3 (they were in Advanced). */
+function renderLoras() {
+  const s = P().settings, o = S.opts || {}, t = s.turbo;
+  const on = s.loras.filter((l) => l.on && l.name).map((l) => shortModel(l.name));
+  $("lora-summary").textContent = [t.on ? `Turbo ${Number(t.strength).toFixed(2)}` : "no Turbo", ...on].join(" · ");
+  $("lora-chev").textContent = S.loraOpen ? "Hide ▴" : "Show ▾";
+  $("lora-toggle").setAttribute("aria-expanded", String(!!S.loraOpen));
+  $("loras-box").hidden = !S.loraOpen;
+  if (!S.loraOpen) return;
+  const loras = s.loras.map((l, i) => `<div class="lora${l.on ? "" : " off"}">
+      ${switchHTML(l.on, `data-action="lora-on" data-i="${i}" aria-label="LoRA ${i + 1}"`, true)}
+      <div class="pick" style="flex:1 1 160px"><select data-lora="${i}" data-k="name" aria-label="LoRA ${i + 1} file"${l.on ? "" : " disabled"}>${fileOptions(o.loras, l.name, "Choose a LoRA…")}</select>${browseBtn("loras", "lora:" + i, !l.on)}</div>
+      <label class="strength"><input type="range" min="0" max="2" step="0.05" data-lora="${i}" data-k="strength" value="${esc(l.strength)}"${l.on ? "" : " disabled"} aria-label="LoRA ${i + 1} strength"><output>${Number(l.strength).toFixed(2)}</output></label>
+    </div>`).join("");
+  $("loras-box").innerHTML = `
+    <div class="box" style="margin-top:12px">
+      <div class="box-row">
+        ${switchHTML(t.on, 'data-action="turbo-on" aria-label="Turbo LoRA"')}
+        <div style="flex:1;min-width:140px"><div>Turbo LoRA</div>
+          <div class="pick" style="margin-top:4px"><select data-turbo="lora" aria-label="Turbo LoRA file"${t.on ? "" : " disabled"}>${fileOptions(o.loras, t.lora, "Choose…")}</select>${browseBtn("loras", "turbo", !t.on)}</div></div>
+        <label class="strength" style="flex:1 1 180px">Strength
+          <input type="range" min="0" max="2" step="0.05" data-turbo="strength" value="${esc(t.strength)}"${t.on ? "" : " disabled"}><output>${Number(t.strength).toFixed(2)}</output></label>
+      </div>
+      ${hasPack("turbo") ? "" : `<div class="pack-note muted small">Using ComfyUI's stock LoRA loader. ${installBtn("turbo")}</div>`}
+    </div>
+    <div class="loras">${loras}</div>`;
 }
 
 function pinText(r) {
@@ -7583,11 +7626,10 @@ document.addEventListener("click", async (e) => {
     case "dry-run": dryRun(); break;
     case "dismiss-error": S.error = null; renderDecision(); break;
     case "toggle": S[el.dataset.key] = !S[el.dataset.key]; render(); break;
-    case "face-on": case "face-turbo-on": case "face-hold": {
+    case "face-turbo-on": case "face-hold": {
       if (setupGuard()) return;
       const f = p.settings.face;
-      if (a === "face-on") { f.on = !f.on; if (f.on && !f.model) f.model = fl2vaModel(); }
-      else if (a === "face-turbo-on") f.turbo.on = !f.turbo.on;
+      if (a === "face-turbo-on") f.turbo.on = !f.turbo.on;
       else f.hold_audio = !f.hold_audio;
       commit();
       break;
@@ -7871,10 +7913,6 @@ document.addEventListener("click", async (e) => {
       break;
     }
     case "audio-set-start": scrubSet("start"); break;
-    case "phrase-mark": markPhrase(); break;
-    case "phrase-detect": detectPhrases(); break;
-    case "phrase-clear": if (confirm("Delete all phrase markers?")) setPhrases([]); break;
-    case "phrase-next": { const sh = shotOf(el); if (sh) startOnPhrase(sh); break; }
     case "aligned": {
       const sh = shotOf(el);
       if (!sh || !isRendered(sh)) break;
@@ -7940,6 +7978,8 @@ document.addEventListener("click", async (e) => {
     case "clear-all": clearAll(); break;
     case "open-folder": openFolder(el.dataset.which); break;
     case "export-approved": exportApproved(); break;
+    case "undo": hStep(true); break;
+    case "redo": hStep(false); break;
     case "queue-pause": case "queue-clear": case "queue-stop-all": case "queue-open": case "queue-stop": case "queue-retry":
     case "queue-remove": case "queue-up": case "queue-down": case "queue-flip": queueAction(a, el); break;
     case "anchor-pick": { const k = el.closest("[data-anchor]"); if (k) anchorPick(k.dataset.anchor); break; }
@@ -8209,14 +8249,7 @@ document.addEventListener("change", async (e) => {
   }
   if (el.dataset.audio) {
     const k = el.dataset.audio;
-    if (k === "sync_nudge") {
-      p.audio.sync_nudge = Math.max(-240, Math.min(240, Math.round(Number(el.value) || 0)));
-    } else if (k === "phrase_gap" || k === "phrase_sens" || k === "phrase_lead") {
-      const v = Number(el.value) || 0;
-      p.audio[k] = k === "phrase_gap" ? Math.max(0.1, Math.min(3, v)) : k === "phrase_sens" ? Math.max(0, Math.min(1, v))
-        : Math.max(0, Math.min(48, Math.round(v)));
-      return commit();
-    } else {
+    {
       const v = parseTC(el.value);
       if (!Number.isFinite(v)) { toast("Type the time in seconds, e.g. 13.67."); render(); return; }
       p.audio[k] = toFrame(Math.max(0, v));
@@ -8427,8 +8460,7 @@ document.addEventListener("keydown", (e) => {
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   if (e.key === "m" || e.key === "M") {
     e.preventDefault();
-    if (previewing() && S.audioOpen) markPhrase();       // 0.11.0: M while the song plays marks a phrase
-    else toggleMute();
+    toggleMute();
   }
   else if (e.key === "f" || e.key === "F") { e.preventDefault(); toggleFullscreen(); }
   else if (e.key === "t" || e.key === "T") { e.preventDefault(); setTheater(!S.theater); }
@@ -8679,7 +8711,6 @@ async function relinkFromSelect(el) {
   }
   if (isAudio) {
     if (!item.file) item.song_ref = true;
-    if (item.file !== name) item.phrases = [];             // markers belong to the song they were made on
     Object.assign(item, { file: name }); SCRUB.pos = null;
   }
   else Object.assign(item, { image: name });
@@ -8832,7 +8863,6 @@ async function addAudio(fileList) {
   finally { delete S.uploading.audio; }
   const same = !!p.audio.sha256 && info.sha256 === p.audio.sha256;
   if (!p.audio.file) p.audio.song_ref = true;
-  if (p.audio.file !== info.name) p.audio.phrases = [];
   SCRUB.pos = null;
   Object.assign(p.audio, { file: info.name, subfolder: info.subfolder, original_name: info.name,
     sha256: info.sha256, size_bytes: info.size_bytes });
@@ -10063,8 +10093,10 @@ function cycleJoin(s) {
     return;
   }
   const wasJ = chipJoin(s), was = chipName(s, wasJ);
-  s.join = order[(order.indexOf(wasJ) + 1) % order.length];
-  const name = { [s.join]: chipName(s, s.join) };
+  const nextJ = order[(order.indexOf(wasJ) + 1) % order.length];
+  s.join = nextJ === "from" ? "bridge" : nextJ;      // 0.17.14: "from" is Continuous with a free end
+  s.free_end = nextJ === "from";
+  const name = { [s.join]: chipName(s, nextJ) };
   P().preview_dirty = true;
   S.dry = null;
   if (s.status !== "queued" && s.take) {

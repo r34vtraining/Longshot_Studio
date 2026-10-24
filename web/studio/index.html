@@ -30,6 +30,10 @@
           <button role="menuitem" data-action="delete-project" class="danger">Delete…</button>
         </div>
       </div>
+      <span class="undo-btns" role="group" aria-label="Undo">
+        <button class="ghost xs" data-action="undo" id="undo-btn" title="Undo the last change (Ctrl+Z / ⌘Z)" disabled>↶</button>
+        <button class="ghost xs" data-action="redo" id="redo-btn" title="Redo (Ctrl+Shift+Z / Ctrl+Y)" disabled>↷</button>
+      </span>
       <span id="save-state" class="muted small"></span>
     </div>
   </div>
@@ -160,10 +164,6 @@
           <button class="linkbtn" data-action="make-clips" id="tl-make" hidden title="Takes in Take history that have no clip yet: decode each on its own (nothing is sampled)."></button>
         </div>
         </div>
-        <div id="tl-export" class="tl-approx tl-export" hidden>
-          <button class="linkbtn" data-action="export-approved" id="tl-export-btn" title="Copy each approved Shot's own clip (whole, with sound) into output/longshot/&lt;project&gt;/Approved_Clips, numbered as on the timeline. Nothing is decoded.">Export approved clips</button>
-          <label class="export-up" title="Decode each approved take again on its own and upscale it with RTX Super Resolution (scale and quality from Settings; the ProRes master setting adds a .mov of each)."><input type="checkbox" id="tl-export-up"> Upscale with RTX</label>
-        </div>
       </div>
       <div class="controls">
         <button class="ctl icon-ctl" id="play" data-action="play" aria-label="Play">
@@ -177,6 +177,10 @@
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M1.5 4.5v8h13v-6.5h-7l-1.5-1.5z"/></svg>
           Open output folder
         </button>
+        <div class="ctl export-ctl" id="tl-export" hidden>
+          <button class="export-go" data-action="export-approved" id="tl-export-btn" title="Copy each approved Shot's own clip (whole, with sound) into output/longshot/&lt;project&gt;/Approved_Clips, numbered as on the timeline. Nothing is decoded.">Export approved clips</button>
+          <label class="export-up" title="Decode each approved take again on its own and upscale it with RTX Super Resolution (scale and quality from Settings; the ProRes master setting adds a .mov of each)."><input type="checkbox" id="tl-export-up"> RTX</label>
+        </div>
         <a class="ctl remote-only" id="download" download hidden>Download video</a>
         <span class="mono muted small push" id="tc-label">00:00.00 / 00:00.00</span>
         <div class="volume">
@@ -200,10 +204,13 @@
     </div>
 
     <div class="panel" id="audio-panel">
-      <button class="fold" data-action="toggle" data-key="audioOpen">
-        <span class="head-left"><span class="h2">Audio</span><span class="muted small" id="audio-summary"></span></span>
-        <span class="muted chev" id="audio-chev">Show ▾</span>
-      </button>
+      <div class="fold-row">
+        <button class="fold" data-action="toggle" data-key="audioOpen" id="audio-toggle" aria-controls="audio">
+          <span class="head-left"><span class="h2">Audio</span><span class="muted small" id="audio-summary"></span></span>
+        </button>
+        <div class="fold-quick" id="audio-quick" hidden></div>
+        <button class="fold chev-btn" data-action="toggle" data-key="audioOpen" aria-controls="audio" tabindex="-1"><span class="muted chev" id="audio-chev">Show ▾</span></button>
+      </div>
       <div id="audio" hidden></div>
     </div>
 
@@ -243,6 +250,16 @@
         <button class="fold chev-btn" data-action="toggle" data-key="advOpen" aria-controls="advanced" tabindex="-1"><span class="muted chev" id="adv-chev">Show ▾</span></button>
       </div>
       <div id="advanced" hidden></div>
+    </div>
+
+    <div class="panel" id="lora-panel">
+      <div class="fold-row">
+        <button class="fold" data-action="toggle" data-key="loraOpen" id="lora-toggle" aria-expanded="false" aria-controls="loras-box">
+          <span class="head-left"><span class="h2">LoRAs</span><span class="warn-tag">⚠ all shots</span><span class="muted small" id="lora-summary"></span></span>
+        </button>
+        <button class="fold chev-btn" data-action="toggle" data-key="loraOpen" aria-controls="loras-box" tabindex="-1"><span class="muted chev" id="lora-chev">Show ▾</span></button>
+      </div>
+      <div id="loras-box" hidden></div>
     </div>
 
     <div class="panel" id="plan-panel">

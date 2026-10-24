@@ -566,9 +566,6 @@ kbd { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 @container (max-width: 64px) { .tl-takes span { display: none; } }
 @container (max-width: 40px) { .tl-takes { display: none; } }
 .tl-approx { margin-top: 6px; font-size: 11px; color: var(--muted); }
-.tl-export { display: flex; gap: 12px; align-items: center; }
-.tl-export .export-up { display: inline-flex; gap: 5px; align-items: center; cursor: pointer; white-space: nowrap; }
-.tl-export .linkbtn { white-space: nowrap; }
 .linkbtn { background: none; border: 0; padding: 0; color: var(--amber-lt); font-size: 11px; cursor: pointer; text-decoration: underline; }
 .linkbtn:disabled { opacity: .5; cursor: default; }
 .missing-tag { display: inline-block; margin-top: 3px; font-size: 11px; color: var(--red, #FFB4A8); border: 1px solid #6B2E2E;
@@ -880,14 +877,6 @@ body.trimming, body.trimming * { cursor: ew-resize !important; user-select: none
 
 /* 0.11.0 */
 .hold-tag { color: var(--dim); font-style: italic; }
-.ph-mark { position: absolute; top: 0; bottom: 0; width: 9px; margin-left: -4px; cursor: ew-resize; z-index: 2; }
-.ph-mark::after { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 1px; background: var(--green); }
-.ph-mark::before { content: ""; position: absolute; left: 1px; top: 0; border: 4px solid transparent; border-top-color: var(--green); }
-.ph-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
-.ph-btns { display: flex; gap: 6px; }
-.ph-opts { margin-top: 6px; }
-.tl-ph { position: absolute; bottom: 0; width: 0; height: 8px; border-left: 1px solid var(--green); pointer-events: auto; }
-.tl-ph::before { content: ""; position: absolute; left: -4px; top: -4px; border: 3.5px solid transparent; border-top-color: var(--green); }
 .sync-ok { color: var(--ok); }
 .sync-off { color: var(--warn); }
 
@@ -1086,3 +1075,20 @@ body.moving-block, body.moving-block * { cursor: grabbing !important; user-selec
 .fold-quick .seed-field input { width: 104px; }
 .fold-quick .seg button { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 640px) { .fold-row { flex-wrap: wrap; } .fold-quick { order: 3; flex-basis: 100%; } }
+.quick-switch { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.fold-quick .quick-switch + .quick-switch { margin-left: 8px; }
+
+/* 0.17.15: Export approved clips is a button next to Open output folder, with the RTX upscale
+   checkbox in it (its right-hand part) */
+.export-ctl { display: inline-flex; align-items: stretch; padding: 0; overflow: hidden; }
+.export-ctl[hidden] { display: none; }
+.export-ctl .export-go { background: none; border: 0; color: inherit; font: inherit; padding: 0 10px 0 12px; cursor: pointer; white-space: nowrap; }
+.export-ctl .export-go:hover:not(:disabled) { color: var(--amber-lt); }
+.export-ctl .export-go:disabled { opacity: .45; cursor: default; }
+.export-ctl .export-up { display: inline-flex; align-items: center; gap: 5px; padding: 0 10px; border-left: 1px solid var(--field-line);
+  cursor: pointer; white-space: nowrap; color: var(--muted); margin: 0; }
+.export-ctl .export-up:has(input:checked) { color: var(--amber-lt); }
+.export-ctl .export-up input { margin: 0; }
+.undo-btns { display: inline-flex; gap: 2px; margin-left: 4px; }
+.undo-btns button { min-width: 26px; font-size: 14px; line-height: 1; padding: 3px 6px; }
+.undo-btns button:disabled { opacity: .35; cursor: default; }

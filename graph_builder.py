@@ -854,7 +854,7 @@ def _refine_nodes(g, project, r, env, sage):
 # Face refine (0.14.0, Long Shot 1.8.0): small faces redrawn by H3 as close-ups
 # ---------------------------------------------------------------------------
 
-FACE_DEFAULTS = {"on": False, "model": None, "steps": 10, "denoise": 0.3, "shift_video": 4.0,
+FACE_DEFAULTS = {"on": True, "model": None, "steps": 10, "denoise": 0.3, "shift_video": 4.0,
                  "turbo": {"on": False, "lora": None, "strength": 1.0},
                  "max_face": 150, "which": "all", "work": 640, "padding": 0.8, "follow": "auto",
                  "mask": 1.0, "feather": 0.3, "color": 1.0, "hold_audio": True, "seed": 0,
@@ -912,13 +912,14 @@ def face_rows(f: dict) -> list:
 
 
 def face_settings(project: dict, env: "Env | None" = None, strict: bool = True):
-    """0.14.0: the Face refine panel's settings when it applies (on, a model chosen, H3 Long
-    Shot 1.8.0 with its Face Refine node), with `key` naming the redraw model and settings,
-    `sig` all of what the result depends on and `text` the prompt; else None."""
+    """0.14.0: the Face refine panel's settings when it applies (a model chosen, H3 Long Shot
+    1.8.0 with its Face Refine node), with `key` naming the redraw model and settings, `sig`
+    all of what the result depends on and `text` the prompt; else None. 0.17.15: manual only
+    (Refine this Shot), so there's no on / off switch any more."""
     s = project.get("settings") or {}
     f = dict(FACE_DEFAULTS, **(s.get("face") or {}))
     f["turbo"] = dict(FACE_DEFAULTS["turbo"], **(f.get("turbo") or {}))
-    if not f.get("on") or not f.get("model"):
+    if not f.get("model"):
         return None
     if env is not None and (not env.longshot_at_least(1, 8, 0) or not env.has("MiniMaxH3FaceRefine")):
         if strict:
@@ -1091,7 +1092,7 @@ def build_face_try(project: dict, item: dict, env: Env | None = None) -> Build:
     s = project.get("settings") or {}
     f = face_settings(project, env)
     if f is None:
-        raise BuildError("Turn Face refine on and choose its model first.")
+        raise BuildError("Choose the face model first (Face refine panel).")
     need = ["MiniMaxH3Take", "VAELoader", "VAEDecode", "VAEDecodeAudio", "MiniMaxH3SaveVideo",
             "MiniMaxH3FaceRefine", "UNETLoader", "MiniMaxH3SigmaShift", "CLIPLoader", "BasicScheduler",
             "KSamplerSelect", "RandomNoise"]
