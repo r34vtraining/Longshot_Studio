@@ -35,11 +35,12 @@ thrown away.
 - Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
 
-## What's new in 0.17.12
+## What's new in 0.17.16
 
 1. Minor timeline UI adjustments for ease of use (see above UI image for stacking timeline for creating overlapping handles for clips)
 2. Blank shots in timeline can now be stretched in the timeline itself to adjust shot length.  Move the blank shots to overlap previous shots.  
-3. Minor shot box UI adjustments for alignment 
+3. Minor shot box UI adjustments for alignment
+4. Minor overall UI adjustments 
 
 ## What's new in 0.17.0
 
