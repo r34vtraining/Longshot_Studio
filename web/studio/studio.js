@@ -170,6 +170,7 @@ function normalize(p) {
   p.style = Object.assign({ summary: "", retention: "", style_line: "", soundscape: "", music: "N/A",
     task_types: ["reference generation"] }, p.style || {});
   p.shots = (p.shots || []).map((s) => ({ id: s.id || uid("s"), text: s.text || "",
+    group: typeof s.group === "string" && s.group ? s.group : null,      // 0.17.19: its group (folder)
     seconds: Number(s.seconds) || 5, shot_seed: s.shot_seed ?? -1, bypassed: !!s.bypassed,
     // a Shot on auto stays on auto: the seed its take used, and a one-off seed for its next render
     seed_used: hasSeed(s.seed_used) ? Number(s.seed_used) : null,
@@ -212,6 +213,7 @@ function normalize(p) {
       size_bytes: null, trim_in: 0, frames: 0, duration: null, fps: null, width: null, height: null,
       has_audio: false, audio: "mute" }, s.clip || {}) : null }));
   for (const s of p.shots) if (s.kind === "clip") s.status = "approved";   // clips are never sampled
+  normalizeGroups(p);
   p.audio = Object.assign({ file: null, subfolder: "", type: "input", size_bytes: null, sha256: null,
     original_name: null, start: 0, length: 0, lip_sync: false, voice_ref: false,
     final_override: false, melband_model: "Infinite Talk\\MelBandRoformer_fp16.safetensors" }, p.audio || {});
@@ -1927,7 +1929,7 @@ function jobTitle(spec, pass, of, ids) {
     : spec.kind === "reroll" ? " · reroll" : "";
   switch (spec.type) {
     case "shot": { const t = takeNo(spec.target); return `${pad(spec.target)}${mode}${t ? " · " + t : ""}${ofTxt}`; }
-    case "all": return `Render all · ${ids.length} Shot${ids.length > 1 ? "s" : ""} (${numOf(ids[0])}–${numOf(ids[ids.length - 1])})${of > 1 ? ` · take ${pass} of ${of}` : ""}`;
+    case "all": return `${spec.what || "Render all"}${spec.again ? " again" : ""} · ${ids.length} Shot${ids.length > 1 ? "s" : ""} (${numOf(ids[0])}–${numOf(ids[ids.length - 1])})${of > 1 ? ` · take ${pass} of ${of}` : ""}`;
     case "through": return `Re-render through ${pad(spec.target)}`;
     case "final": return "Upscale final video";
     case "preview": return "Update preview";
@@ -2311,6 +2313,7 @@ function splitAtContext(job) {
 /** "Another take" queued while the Shot rendered or waited: when it starts, a
  *  Shot that has a take by then rerolls with the next seed. */
 function prepareAgain(job) {
+  if (job.spec.type === "all") return prepareAgainAll(job);
   const s = P().shots.find((x) => x.id === job.spec.target);
   if (!s || s.bypassed || s.kind === "clip" || s.status === "queued" || !s.take) return;
   const used = new Set([...(s.prev_seeds || []), effSeed(s)].map(Number));
@@ -2328,6 +2331,27 @@ function prepareAgain(job) {
   s.status = "queued";
   s.was_approved = s.was_rendered = false;
   s.edit_from = null;
+  S.dry = null;
+}
+
+/** 0.17.18, Render all again: another take of each of its Shots, with a new seed. Shots
+ *  approved (or locked) since it was queued are left out: they keep their takes. */
+function prepareAgainAll(job) {
+  const ids = [];
+  for (const id of job.ids || []) {
+    const s = P().shots.find((x) => x.id === id);
+    if (!s || s.bypassed || s.kind === "clip" || s.lock || s.status === "approved") continue;
+    ids.push(id);
+    if (s.status === "queued" || !s.take) continue;     // never rendered (or it failed): renders as is
+    rememberTake(s);
+    reseed(s);
+    s.status = "queued";
+    s.was_approved = s.was_rendered = false;
+    s.edit_from = null;
+  }
+  if (ids.length !== (job.ids || []).length) job.skipWhy = "Its Shots were approved, removed or bypassed.";
+  job.ids = ids;
+  job.spec = Object.assign({}, job.spec, { ids: ids.slice() });
   S.dry = null;
 }
 
@@ -2445,7 +2469,7 @@ async function queueNext() {
         }
       }
       const o = jobOpts(job);
-      if (!o) { outcome = ["skipped", "Its Shots were removed or bypassed."]; return; }
+      if (!o) { outcome = ["skipped", job.skipWhy || "Its Shots were removed or bypassed."]; return; }
       o.jobId = job.id;
       S.error = null;
       if (job.spec.type === "final" || job.spec.type === "preview") await wholeQueue(o);
@@ -3005,12 +3029,21 @@ const oddToRender = () => toRender().filter((s) => numOf(s.id) % 2 === 1);
 /** ▶ Render all: one run through every Shot not rendered yet, each continued
  *  from the Shot before it (the standard workflow). Rendered Shots keep their
  *  takes, so gaps between them render as bridges. All land under review. */
-async function renderAll() {
-  const list = toRender().filter((x) => !jobFor(x.id));
-  if (!list.length) { toast(toRender().length ? "Those Shots are already in the queue." : "Every Shot is rendered."); return; }
-  const takes = await askMulti(`Render all (${list.length} Shot${list.length > 1 ? "s" : ""})`);
+async function renderAll(only = null, what = "Render all") {
+  const pool = only ? toRender().filter((x) => only.has(x.id)) : toRender();
+  const list = pool.filter((x) => !jobFor(x.id));
+  if (!list.length) {
+    // 0.17.18: they're in the queue already: one more set, a new take of each after it
+    const again = pool.filter((x) => jobFor(x.id));
+    if (!again.length) { toast(only ? "Every Shot in this group is rendered." : "Every Shot is rendered."); return; }
+    const takes = await askMulti(`${what} again (${again.length} Shot${again.length > 1 ? "s" : ""})`);
+    if (!takes) return;
+    enqueue({ type: "all", ids: again.map((x) => x.id), again: true, what: only ? what : undefined }, takes);
+    return;
+  }
+  const takes = await askMulti(`${what} (${list.length} Shot${list.length > 1 ? "s" : ""})`);
   if (!takes) return;
-  enqueue({ type: "all", ids: list.map((x) => x.id) }, takes);
+  enqueue({ type: "all", ids: list.map((x) => x.id), what: only ? what : undefined }, takes);
 }
 
 /** ▶ Render odd Shots: Shots 1, 3, 5… not rendered yet, each on its own, one
@@ -5869,6 +5902,277 @@ function anchorPick(key) {
   inp.click();
 }
 
+// ---------------------------------------------------------------------------
+// Shot groups (0.17.19): named, collapsible folders of Shots next to each other (an act or a
+// scene). One level. Only for organizing: they change nothing about how Shots render or join.
+// p.groups [{id, name}] in order of use; each Shot's `group` names its folder.
+// ---------------------------------------------------------------------------
+
+/** A Shot put between two Shots of one group is in that group. */
+function inGroupAt(p, s) {
+  const i = p.shots.indexOf(s), a = p.shots[i - 1], b = p.shots[i + 1];
+  return a && b && a.group && a.group === b.group ? a.group : null;
+}
+
+/** Groups stay runs of neighbouring Shots: a Shot cut off from the rest of its group leaves it;
+ *  a group with no Shots is gone. */
+function normalizeGroups(p) {
+  p.groups = (Array.isArray(p.groups) ? p.groups : []).filter((g) => g && g.id)
+    .map((g) => ({ id: String(g.id), name: String(g.name || "Group").slice(0, 80) }));
+  const known = new Set(p.groups.map((g) => g.id)), seen = new Set();
+  let prev = null;
+  for (const s of p.shots) {
+    if (s.group && !known.has(s.group)) s.group = null;
+    if (s.group) {
+      if (seen.has(s.group) && prev !== s.group) s.group = null;
+      else seen.add(s.group);
+    }
+    prev = s.group || null;
+  }
+  p.groups = p.groups.filter((g) => seen.has(g.id));
+}
+
+const groupById = (id) => (P().groups || []).find((g) => g.id === id) || null;
+const groupShots = (id) => P().shots.filter((x) => x.group === id);
+
+/** Folded groups: a view setting, kept per project in this browser. */
+function closedGroups() {
+  try { return new Set(JSON.parse(store("h3studio.groupsClosed." + P().slug) || "[]")); } catch (e) { return new Set(); }
+}
+function setGroupOpen(id, open) {
+  const c = closedGroups();
+  if (open) c.delete(id); else c.add(id);
+  store("h3studio.groupsClosed." + P().slug, JSON.stringify([...c].filter((x) => groupById(x))));
+}
+
+function nextGroupName() {
+  const used = new Set((P().groups || []).map((g) => g.name));
+  let n = (P().groups || []).length + 1;
+  while (used.has(`Group ${n}`)) n++;
+  return `Group ${n}`;
+}
+
+/** Shift-click: the Shots from the last one clicked to this one (in list order). */
+function selectRange(s) {
+  const list = P().shots, i = list.indexOf(s);
+  const a = list.findIndex((x) => x.id === (S.selAnchor || S.open));
+  if (a < 0 || i < 0) { S.sel = new Set([s.id]); S.selAnchor = s.id; return; }
+  const [lo, hi] = a < i ? [a, i] : [i, a];
+  S.sel = new Set(list.slice(lo, hi + 1).map((x) => x.id));
+}
+
+/** A new group of these Shots (taken out of any group they were in). */
+function makeGroup(ids) {
+  const p = P(), want = new Set(ids);
+  const list = p.shots.filter((x) => want.has(x.id));
+  if (!list.length) return;
+  const g = { id: uid("g"), name: nextGroupName() };
+  p.groups = (p.groups || []).concat([g]);
+  // a run of neighbours: from the first to the last chosen
+  const lo = p.shots.indexOf(list[0]), hi = p.shots.indexOf(list[list.length - 1]);
+  for (const x of p.shots.slice(lo, hi + 1)) x.group = g.id;
+  normalizeGroups(p);
+  S.sel = new Set(); S.selAnchor = null;
+  S.renameGroup = g.id;                              // straight into naming it
+  S.renameDraft = undefined;
+  commit();
+}
+
+function groupSummary(id) {
+  const all = groupShots(id), act = all.filter((x) => !x.bypassed);
+  const secs = act.reduce((t, x) => t + (Number(x.seconds) || 0), 0);
+  const ok = act.filter((x) => x.kind === "clip" || x.status === "approved").length;
+  const rv = act.filter((x) => x.kind !== "clip" && x.status === "review").length;
+  const q = act.filter((x) => x.kind !== "clip" && x.status === "queued").length;
+  const mm = Math.floor(secs / 60), ss = Math.round(secs % 60);
+  return `${act.length} Shot${act.length === 1 ? "" : "s"} · ${mm}:${String(ss).padStart(2, "0")}` +
+    (ok ? ` · ${ok} approved` : "") + (rv ? ` · ${rv} in review` : "") + (q ? ` · ${q} to render` : "");
+}
+
+function groupHeadHTML(g, open) {
+  const rnd = toRender().filter((x) => x.group === g.id);
+  const nNew = rnd.filter((x) => !jobFor(x.id)).length, nAgain = nNew ? 0 : rnd.length;
+  const off = S.conn !== "ok" || missingRefs().length > 0;
+  const name = S.renameGroup === g.id
+    ? `<input class="field group-name-in" data-group-name="${esc(g.id)}" value="${esc(S.renameDraft ?? g.name)}" maxlength="80" aria-label="Group name">`
+    : `<span class="group-name" title="Double-click to rename">${esc(g.name)}</span>`;
+  return `<div class="group-head${open ? " open" : ""}" data-group="${esc(g.id)}">
+    <button class="group-fold" data-action="group-fold" aria-expanded="${open}" title="${open ? "Fold" : "Unfold"} this group">${open ? "▾" : "▸"}</button>
+    ${name}
+    <span class="muted small group-sum">${esc(groupSummary(g.id))}</span>
+    <span class="push"></span>
+    <button class="ghost sm" data-action="group-render"${off || !(nNew || nAgain) ? " disabled" : ""}
+      title="${nAgain ? "Queue one more set: these Shots render again after the set that's queued, each with a new seed" : "Render the Shots in this group that aren't rendered yet, each continued from the Shot before it"}">▶ Render group${nNew ? ` (${nNew})` : nAgain ? ` again (${nAgain})` : ""}</button>
+    ${(() => { const src = groupRefSource(g.id); return `<button class="ghost sm" data-action="group-restore"${src ? "" : " disabled"}
+      title="${src ? `Put back the Style & Sound text and the Cast & Scenes references this group was rendered with (from ${esc(titleOf(src))}'s take)` : "Render a Shot in this group first: its take records the prompt and references it was made with"}">Restore prompt & references</button>`; })()}
+    <button class="ghost sm" data-action="group-rename" title="Rename this group">✎</button>
+    <button class="ghost sm" data-action="group-ungroup" title="Remove the folder; the Shots stay as they are">Ungroup</button>
+    <button class="ghost sm danger" data-action="group-delete" title="Delete this group, with or without its Shots">✕</button>
+  </div>`;
+}
+
+/** The take a group's prompt and references come back from: the Shot looked at (if it's in the
+ *  group), else the group's last approved Shot, else its last rendered one, with a record. */
+function groupRefSource(id) {
+  const list = groupShots(id).filter((x) => !x.bypassed && x.kind !== "clip" && x.take && refSetFor(x));
+  if (!list.length) return null;
+  const f = list.find((x) => x.id === S.focus);
+  return f || [...list].reverse().find((x) => x.status === "approved") || list[list.length - 1];
+}
+
+/** 0.17.22: drag a Shot into a group (or anywhere in the list). A Shot not rendered yet moves
+ *  there; a rendered Shot keeps its place (its take joins the Shots around it), so it can only
+ *  join or leave a group it's next to. */
+const canMoveShot = (s) => s && s.kind !== "clip" && !s.take && s.status === "queued" && !inRender(s) && !jobFor(s.id);
+
+function dropShot(s, target) {
+  const p = P();
+  if (!s || !target) return;
+  const from = p.shots.indexOf(s);
+  let to, g;
+  if (target.group) {                               // onto a group's bar: the end of that group
+    const mem = groupShots(target.group);
+    if (!mem.length) return;
+    g = target.group;
+    const i0 = p.shots.indexOf(mem[0]), i1 = p.shots.indexOf(mem[mem.length - 1]);
+    if (s.group === g) return;
+    if (from === i0 - 1 || from === i1 + 1) { s.group = g; normalizeGroups(p); commit(); toast(`${titleOf(s)} is in ${groupById(g).name} now.`); return; }
+    to = i1 + 1;
+  } else {
+    const t = target.shot;
+    if (!t || t === s) return;
+    g = t.group || null;
+    to = p.shots.indexOf(t) + (target.after ? 1 : 0);
+  }
+  const stays = to === from || to === from + 1;      // dropped right where it is
+  if (stays) {
+    if ((s.group || null) === g) return;
+    s.group = g;
+    normalizeGroups(p);
+    if ((s.group || null) !== g) { toast(`${titleOf(s)} isn't next to that group.`); return; }
+    commit();
+    toast(g ? `${titleOf(s)} is in ${groupById(g).name} now.` : `${titleOf(s)} is out of its group.`);
+    return;
+  }
+  if (!canMoveShot(s)) {
+    toast(s.kind === "clip" || s.take || s.status !== "queued"
+      ? `${titleOf(s)} is rendered, so it keeps its place: its take joins the Shots around it. Only Shots not rendered yet can move.`
+      : `${titleOf(s)} is rendering or in the queue. Move it when that's done.`);
+    return;
+  }
+  if (listGuard(Math.min(from, to))) return;
+  if (!s.bypassed) syncAfter(s, "Moving a Shot");
+  p.shots.splice(from, 1);
+  if (to > from) to--;
+  p.shots.splice(to, 0, s);
+  s.group = g;
+  s.pin = null; s.ov_cut = null; s.place = null;     // a new place on the film
+  if (!s.bypassed) syncAfter(s, "Moving a Shot");
+  S.dry = null;
+  normalizeGroups(p);
+  S.open = s.id;
+  commit();
+}
+
+const DND = { id: null };
+function dndClear() { document.querySelectorAll(".drop-before, .drop-after, .drop-into").forEach((x) => x.classList.remove("drop-before", "drop-after", "drop-into")); }
+function dndTarget(e) {
+  const head = e.target.closest && e.target.closest(".group-head");
+  if (head) return { el: head, group: head.dataset.group };
+  const card = e.target.closest && e.target.closest("#shots .shot, #shots .clip-card");
+  if (!card) return null;
+  const t = shotById(card.dataset.shot);
+  if (!t || t.id === DND.id) return null;
+  const r = card.getBoundingClientRect();
+  const flip = $("shots-panel").classList.contains("flipped");
+  const lower = e.clientY > r.top + r.height / 2;
+  return { el: card, shot: t, after: flip ? !lower : lower };
+}
+document.addEventListener("dragstart", (e) => {
+  const row = e.target.closest && e.target.closest("[data-drag-shot]");
+  if (!row || e.target.closest("input, textarea, select")) return;
+  DND.id = row.dataset.dragShot;
+  e.dataTransfer.effectAllowed = "move";
+  try { e.dataTransfer.setData("text/plain", "h3shot:" + DND.id); } catch (err) { /* ignore */ }
+  row.closest(".shot, .clip-card")?.classList.add("dragging");
+});
+document.addEventListener("dragover", (e) => {
+  if (!DND.id) return;
+  const t = dndTarget(e);
+  dndClear();
+  if (!t) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  t.el.classList.add(t.group ? "drop-into" : t.after ? "drop-after" : "drop-before");
+});
+document.addEventListener("drop", (e) => {
+  if (!DND.id) return;
+  const t = dndTarget(e);
+  const s = shotById(DND.id);
+  dndClear();
+  DND.id = null;
+  if (!t) return;
+  e.preventDefault();
+  dropShot(s, t);
+});
+document.addEventListener("dragend", () => {
+  DND.id = null;
+  dndClear();
+  document.querySelectorAll(".dragging").forEach((x) => x.classList.remove("dragging"));
+});
+
+async function groupDelete(g) {
+  const list = groupShots(g.id);
+  const ans = await confirmBox({ title: `Delete ${g.name}?`,
+    body: `Delete its ${list.length} Shot${list.length === 1 ? "" : "s"} too, or just remove the folder and keep the Shots?`,
+    yes: `Delete ${list.length} Shot${list.length === 1 ? "" : "s"}`, alt: "Just ungroup", no: "Cancel" });
+  if (!ans) return;
+  const p = P();
+  if (ans === "alt") { for (const x of list) x.group = null; normalizeGroups(p); commit(); return; }
+  const i0 = p.shots.indexOf(list[0]);
+  if (listGuard(i0)) return;
+  if (list.some((x) => inRender(x) || jobFor(x.id))) { toast(`Some of its Shots are rendering or in the queue. Stop or remove those first.`); return; }
+  for (const x of list) if (!x.bypassed) syncAfter(x, "Removing Shots");
+  const gone = new Set(list.map((x) => x.id));
+  p.shots = p.shots.filter((x) => !gone.has(x.id));
+  if (gone.has(S.open)) S.open = null;
+  if (gone.has(S.focus)) S.focus = null;
+  S.dry = null;
+  normalizeGroups(p);
+  commit();
+}
+
+function renameGroupDone(input, keep = true) {
+  if (S.renameGroup !== input.dataset.groupName) return;
+  const g = groupById(input.dataset.groupName);
+  S.renameGroup = null;
+  S.renameDraft = undefined;
+  if (g && keep) {
+    const v = input.value.trim().slice(0, 80);
+    if (v && v !== g.name) { g.name = v; commit(); return; }
+  }
+  renderShots();
+}
+
+document.addEventListener("input", (e) => { if (e.target.matches && e.target.matches(".group-name-in")) S.renameDraft = e.target.value; });
+document.addEventListener("keydown", (e) => {
+  const t = e.target;
+  if (!t.matches || !t.matches(".group-name-in")) return;
+  if (e.key === "Enter") { e.preventDefault(); renameGroupDone(t, true); }
+  else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); renameGroupDone(t, false); }
+}, true);
+document.addEventListener("focusout", (e) => {
+  const t = e.target;
+  // (a redraw replacing the field also blurs it: only a real move elsewhere ends the rename)
+  if (t.matches && t.matches(".group-name-in") && t.isConnected) setTimeout(() => { if (t.isConnected && document.activeElement !== t) renameGroupDone(t, true); }, 0);
+});
+document.addEventListener("dblclick", (e) => {
+  const n = e.target.closest && e.target.closest(".group-name");
+  if (!n) return;
+  S.renameGroup = n.closest("[data-group]").dataset.group;
+  renderShots();
+});
+
 function renderShots() {
   requestLayout();
   if (deferIfHeld("shots")) return;
@@ -5890,7 +6194,47 @@ function renderShots() {
   $("flip-shots").setAttribute("aria-pressed", String(flip));
   $("flip-shots").title = flip ? "Shot 1 on top again" : "Flip the list: newest Shot on top, Shot 1 at the bottom";
   $("shots-panel").classList.toggle("anchor-end", slots.has("end"));
+  // 0.17.19: groups. A Shot opened from elsewhere (timeline, review) unfolds its group.
+  const closed = closedGroups();
+  if (S.open && S.open !== S.openSeen) {
+    const os = shotById(S.open);
+    if (os && os.group && closed.has(os.group)) { setGroupOpen(os.group, true); closed.delete(os.group); }
+  }
+  S.openSeen = S.open;
+  if (S.sel && S.sel.size && [...S.sel].some((id) => !shotById(id))) S.sel = new Set();
+  const gEnds = new Map();                              // group id → [first, last] Shot ids
+  for (const s of P().shots) if (s.group) { const e = gEnds.get(s.group); if (e) e[1] = s.id; else gEnds.set(s.group, [s.id, s.id]); }
   $("shots").innerHTML = P().shots.map((s) => {
+    const g = s.group ? groupById(s.group) : null;
+    const ends = g ? gEnds.get(g.id) : null;
+    const gOpen = g ? !closed.has(g.id) : true;
+    // the folder's header sits above its first Shot (below its last when the list is flipped)
+    const head = g && ends[flip ? 1 : 0] === s.id ? groupHeadHTML(g, gOpen) : "";
+    const card = shotCardHTML(s, g, ends, gOpen);
+    return flip ? card + head : head + card;
+  }).join("");
+  $("shots").querySelectorAll(".shot").forEach((el) => el.classList.toggle("sel", !!(S.sel && S.sel.has(el.dataset.shot))));
+  const nSel = S.sel ? S.sel.size : 0;
+  $("group-sel").hidden = nSel < 2;
+  $("group-sel").textContent = `▣ Group ${nSel} Shots`;
+  const anyG = (P().groups || []).length > 0;
+  $("groups-fold").hidden = !anyG;
+  if (anyG) {
+    const allClosed = P().groups.every((x) => closed.has(x.id));
+    $("groups-fold").textContent = allClosed ? "▾ Unfold groups" : "▸ Fold groups";
+  }
+  const nameIn = $("shots").querySelector(".group-name-in");
+  if (nameIn && document.activeElement !== nameIn) {
+    nameIn.focus();
+    if (S.renameDraft === undefined) nameIn.select();           // a redraw while typing keeps the caret
+    else nameIn.setSelectionRange(nameIn.value.length, nameIn.value.length);
+  }
+  function shotCardHTML(s, g, ends, gOpen) {
+    const html = shotCardInner(s);                  // (always: it keeps track of the joins between cards)
+    if (!gOpen) return "";
+    return g ? `<div class="g-member${ends[0] === s.id ? " g-first" : ""}${ends[1] === s.id ? " g-last" : ""}">${html}</div>` : html;
+  }
+  function shotCardInner(s) {
     let mark = "";
     if (!s.bypassed) {
       if (prevActive && (prevActive.kind === "clip" || s.kind === "clip")) mark = joinMark(prevActive, s);
@@ -5922,6 +6266,7 @@ function renderShots() {
             title="${refSetFor(s) ? (refSetFor(s).style ? "Put the project back the way it was for this take: Cast & Scenes become its references (others bypassed) and Style & Sound its text."
                 : "Put back the references this take was made with (others bypassed). Its Style & Sound text wasn't recorded (made before 0.16.0).")
               : "This take was made before 0.8.13, so what it was made with wasn't recorded."}">Restore all</button>` : ""}
+          <button class="ghost sm" data-action="group-one" title="${s.group ? "Start a new group with this Shot (Shift-click Shot headers to choose several)" : "Put this Shot in a group of its own, or Shift-click Shot headers to choose several first"}">▣ Group</button>
           <button class="ghost sm" data-action="insert-before" title="Insert a new Shot before this one">⊕ Shot before</button>
           <button class="ghost sm" data-action="insert-after" title="Insert a new Shot after this one">⊕ Shot after</button>
           <button class="ghost sm" data-action="insert-clip-after" title="Insert a video clip after this Shot">⊕ Clip after</button>
@@ -5929,13 +6274,16 @@ function renderShots() {
         </div>
         </div>` : "";
     return mark + `<div class="shot${state === "review" ? " review" : ""}${s.bypassed ? " off" : ""}" data-shot="${esc(s.id)}">${tiles(s)}
-      <div class="shot-row">${shotRowHTML(s)}</div>${body}</div>`;
-  }).join("");
+      <div class="shot-row" draggable="true" data-drag-shot="${esc(s.id)}">${shotRowHTML(s)}</div>${body}</div>`;
+  }
   $("add-shot").innerHTML = `${PLUS} Add Shot ${active().length + 1}`;
   const off = S.conn !== "ok" || missingRefs().length > 0;
   const nAll = toRender().filter((x) => !jobFor(x.id)).length, nOdd = oddToRender().filter((x) => !jobFor(x.id)).length;
-  $("render-all").textContent = `▶ Render all${nAll ? ` (${nAll})` : ""}`;
-  $("render-all").disabled = off || !nAll;
+  const nAgain = nAll ? 0 : toRender().filter((x) => jobFor(x.id)).length;
+  $("render-all").textContent = nAgain ? `▶ Render all again (${nAgain})` : `▶ Render all${nAll ? ` (${nAll})` : ""}`;
+  $("render-all").title = nAgain ? "Queue one more set: after the render that's queued, each of these Shots renders again with a new seed. Every take is kept (◀ ▶ on the timeline); Shots you approve meanwhile are left out." :
+    "Render every Shot not rendered yet in one go, each continued from the Shot before it. Rendered Shots keep their takes, so gaps render as bridges.";
+  $("render-all").disabled = off || !(nAll || nAgain);
   $("render-odd").textContent = `▶ Render odd Shots${nOdd ? ` (${nOdd})` : ""}`;
   $("render-odd").disabled = off || !nOdd;
   $("clear-all").disabled = busyHere() || !active().some((s) => s.kind !== "clip" && s.status !== "queued");
@@ -5959,7 +6307,7 @@ function clipCard(s) {
   const cut = !s.bypassed && row && row.seam === "mismatch"
     ? '<span class="flag cut" title="The Shot before this clip doesn\'t lead into it yet. Render it (or switch this join to Cut).">↯ not bridged</span>' : "";
   return `<div class="shot clip${s.bypassed ? " off" : ""}${missing ? " missing" : ""}" data-shot="${esc(s.id)}">
-    <div class="shot-row">
+    <div class="shot-row" draggable="true" data-drag-shot="${esc(s.id)}">
       <button class="shot-head" data-action="toggle-shot" aria-expanded="${open}">
         <span class="sdot" style="background:${L.dot};color:${L.fg}">${L.icon}</span>
         <span class="stitle">${title}</span>
@@ -6014,6 +6362,23 @@ function renderViewer() {
       ${hide}${nav}${trimHandles(sh)}</div>`;
   }).join("") + (TL.cuts || []).map((c) => `<div class="tl-cut" data-cut="${esc(c.id)}" style="left:${(c.at / total) * 100}%"
       title="Edit point: the film switches from ${esc(titleOf(shotById(c.prev)))} to ${esc(titleOf(shotById(c.id)))} here. Drag it anywhere in the overlap (nothing re-renders)."></div>`).join("") : "";
+  // 0.17.19: each group's name over its Shots
+  {
+    const spans = new Map();
+    for (const bl of total ? TL.blocks || [] : []) {
+      const sh = shotById(bl.id), g = sh && sh.group;
+      if (!g) continue;
+      const sp = spans.get(g) || { a: Infinity, b: -Infinity };
+      sp.a = Math.min(sp.a, bl.start); sp.b = Math.max(sp.b, bl.start + bl.dur);
+      spans.set(g, sp);
+    }
+    const gb = $("tl-groups");
+    gb.classList.toggle("on", spans.size > 0);
+    gb.innerHTML = [...spans].map(([id, sp]) => {
+      const g = groupById(id);
+      return g ? `<div class="tl-group" style="left:${(sp.a / total) * 100}%;width:${((sp.b - sp.a) / total) * 100}%" title="${esc(g.name)}"><span>${esc(g.name)}</span></div>` : "";
+    }).join("");
+  }
   const approx = !TL.exact && TL.entries.some((e) => e.rendered);
   $("tl-approx").hidden = !approx;
   const off = busyHere();
@@ -6635,7 +7000,9 @@ function renderSettings() {
   sq.hidden = !!S.settingsOpen;
   if (S.settingsOpen) sq.innerHTML = "";
   else if (!(sq.contains(document.activeElement) && document.activeElement.tagName === "INPUT")) {   // not while typing in it
-    sq.innerHTML = `<span class="lbl-q">Seed</span><span class="seed-field"><input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-label="Base seed" title="The base seed: drag left / right to change it (Shift: by 10), or click and type">${seedStepHTML("base-seed-step", false, "Shots on auto follow it")}</span>`;
+    sq.innerHTML = `<span class="lbl-q">Seed</span><span class="seed-field"><input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-label="Base seed" title="The base seed: drag left / right to change it (Shift: by 10), or click and type">${seedStepHTML("base-seed-step", false, "Shots on auto follow it")}</span>` +
+      // 0.17.20: and Multi-take (takes per render)
+      `<span class="lbl-q q-multi">Takes</span><input class="mono q-multi-in" type="number" min="1" max="${MULTI_MAX}" step="1" data-multi value="${esc(multiTakes())}" aria-label="Multi-take: takes per render" title="Multi-take: each render runs this many times, each with a new seed (like ComfyUI's batch count)">`;
   }
   if (!S.settingsOpen) return;
   const t2 = s.turbo;
@@ -6700,7 +7067,11 @@ function renderSettings() {
     <div class="seg-store">
       <span class="grow">Saved takes: ${S.segStats ? `${S.segStats.files} file${S.segStats.files === 1 ? "" : "s"} · ${(S.segStats.bytes / 1048576).toFixed(1)} MB` : "—"}
         <span class="muted"> · output/longshot/${esc(P().slug)}/takes</span></span>
-      <button class="ghost sm local-only" data-action="clear-segments"${S.segStats && S.segStats.files ? "" : " disabled"}>Delete all takes</button>
+      <span class="seg-btns">
+        <button class="ghost sm local-only" data-action="clear-segments"${S.segStats && S.segStats.files ? "" : " disabled"}>Delete all takes</button>
+        <button class="ghost sm local-only" data-action="clear-unapproved"${S.segStats && S.segStats.files ? "" : " disabled"}
+          title="Delete every take except the ones your approved Shots use">Delete unapproved takes</button>
+      </span>
     </div>`;
 }
 
@@ -6921,6 +7292,31 @@ function faceSummaryText() {
     ` · ${n ? `${n} Shot${n === 1 ? "" : "s"} refined` : "no Shot refined yet"}`;
 }
 
+/** 0.17.21: Face refine folded keeps its Shot controls: the Shot, Refine this Shot, Compare A/B
+ *  and which version it exports. */
+function renderFaceQuick() {
+  const q = $("face-quick");
+  const show = !S.faceOpen && faceNodeReady();
+  q.hidden = !show;
+  if (!show) { q.innerHTML = ""; return; }
+  if (q.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;   // not while choosing
+  const f = P().settings.face, o = S.opts || {};
+  const rendered = active().filter((x) => x.kind !== "clip" && x.take && isRendered(x));
+  const sh = faceShot();
+  if (!sh) { q.innerHTML = `<span class="muted small">No rendered Shot to refine yet.</span>`; return; }
+  const have = faceHasClip(sh), keep = faceRefined(sh) ? "refined" : "original";
+  const busy = Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "face" && j.spec.target === sh.id);
+  const why = !f.model ? "Choose the face model first (open the panel)" : !o.face_detector ? "Download the face detector first (open the panel)" : "";
+  q.innerHTML = `<select data-face-shot aria-label="Shot to refine">${rendered.map((x) =>
+      `<option value="${esc(x.id)}"${x.id === sh.id ? " selected" : ""}>${esc(titleOf(x))}${smallFaces(x).length ? " · small face" : ""}</option>`).join("")}</select>
+    <button class="ghost sm" data-action="face-try" data-shot="${esc(sh.id)}"${f.model && o.face_detector && !busy ? "" : " disabled"}${why ? ` title="${esc(why)}"` : ""}>${busy ? "In the queue…" : have ? "Refine again" : "Refine this Shot"}</button>
+    <button class="ghost sm" data-action="face-ab" data-shot="${esc(sh.id)}"${have && S.clips[takeStem(sh.take)] ? "" : " disabled"}>A/B</button>
+    <div class="seg seg-sm" role="group" aria-label="Which version ${esc(titleOf(sh))} exports">
+      <button data-action="face-keep" data-v="refined" data-shot="${esc(sh.id)}" aria-pressed="${keep === "refined"}"${have ? "" : ' disabled title="Refine this Shot first"'}>Refined</button>
+      <button data-action="face-keep" data-v="original" data-shot="${esc(sh.id)}" aria-pressed="${keep === "original"}">Original</button>
+    </div>`;
+}
+
 function renderFace() {
   if (!P()) return;
   const s = P().settings, f = s.face, o = S.opts || {}, t = f.turbo;
@@ -6929,6 +7325,7 @@ function renderFace() {
   $("face-chev").textContent = S.faceOpen ? "Hide ▴" : "Show ▾";
   $("face-toggle").setAttribute("aria-expanded", String(!!S.faceOpen));
   $("face").hidden = !S.faceOpen;
+  renderFaceQuick();
   if (!S.faceOpen) return;
   setTimeout(faceScanMore, 0);
   if (!faceNodeReady()) {
@@ -7666,7 +8063,46 @@ document.addEventListener("click", async (e) => {
       commit();
       break;
     }
-    case "toggle-shot": { const s = shotOf(el); S.open = S.open === s.id ? null : s.id; renderShots(); break; }
+    case "toggle-shot": {
+      const s = shotOf(el);
+      if (e.shiftKey) { selectRange(s); renderShots(); break; }     // 0.17.19: a run of Shots to group
+      if (S.sel && S.sel.size) S.sel = new Set();
+      S.selAnchor = s.id;
+      S.open = S.open === s.id ? null : s.id; renderShots(); break;
+    }
+    case "group-sel": if (S.sel && S.sel.size) makeGroup([...S.sel]); break;
+    case "group-one": { const s = shotOf(el); makeGroup(S.sel && S.sel.has(s.id) ? [...S.sel] : [s.id]); break; }
+    case "groups-fold": {
+      const c = closedGroups(), all = (p.groups || []).every((g) => c.has(g.id));
+      for (const g of p.groups || []) setGroupOpen(g.id, all);
+      if (!all && S.open && shotById(S.open) && shotById(S.open).group) S.open = null;
+      S.openSeen = S.open;
+      renderShots(); break;
+    }
+    case "group-fold": {
+      const id = el.closest("[data-group]").dataset.group, open = closedGroups().has(id);
+      setGroupOpen(id, open);
+      if (!open && S.open && shotById(S.open) && shotById(S.open).group === id) S.open = null;
+      S.openSeen = S.open;
+      renderShots(); break;
+    }
+    case "group-rename": S.renameGroup = el.closest("[data-group]").dataset.group; S.renameDraft = undefined; renderShots(); break;
+    case "group-ungroup": {
+      const id = el.closest("[data-group]").dataset.group;
+      for (const x of p.shots) if (x.group === id) x.group = null;
+      normalizeGroups(p); commit(); break;
+    }
+    case "group-restore": {
+      const g = groupById(el.closest("[data-group]").dataset.group), src = g && groupRefSource(g.id);
+      if (src) restoreRefs(src);
+      break;
+    }
+    case "group-delete": { const g = groupById(el.closest("[data-group]").dataset.group); if (g) groupDelete(g); break; }
+    case "group-render": {
+      const g = groupById(el.closest("[data-group]").dataset.group);
+      if (g) renderAll(new Set(groupShots(g.id).map((x) => x.id)), `Render ${g.name}`);
+      break;
+    }
     case "bypass-shot": {
       const s = shotOf(el);
       if (listGuard(p.shots.indexOf(s))) return;
@@ -7699,7 +8135,7 @@ document.addEventListener("click", async (e) => {
     case "context-redo": redoInPlace(shotOf(el)); break;
     case "insert-before": case "insert-after": {
       const s = shotOf(el);
-      insertShot(p.shots.indexOf(s) + (a === "insert-after" ? 1 : 0));
+      insertShot(p.shots.indexOf(s) + (a === "insert-after" ? 1 : 0), s.group || null);
       break;
     }
     case "take-step": { const s = shotOf(el) || reviewShot(); stepTake(s, +el.dataset.dir); break; }
@@ -8001,6 +8437,7 @@ document.addEventListener("click", async (e) => {
     case "conflict-keep": saveNow(true); break;
     case "relink": { const sel = el.closest("[data-cast]").querySelector("select[data-relink]"); if (sel) { sel.focus(); if (sel.showPicker) try { sel.showPicker(); } catch (e) { /* not allowed */ } } break; }
     case "clear-segments": clearSegments(); break;
+    case "clear-unapproved": clearUnapproved(); break;
     case "close-modal": $("modal").hidden = true; break;
     default: break;
   }
@@ -8984,6 +9421,48 @@ async function clearSegments() {
   S.dry = null;
   commit();
   toast("All takes deleted.");
+}
+
+/** 0.17.17: the takes an approved (or locked) Shot uses, including one kept while it's edited. */
+function approvedTakes() {
+  const keep = new Set();
+  for (const x of P().shots) {
+    if (x.kind === "clip") continue;
+    const ed = x.edit_from || {};
+    if (x.status === "approved" || x.was_approved || x.lock || ed.was_approved || ed.status === "approved") {
+      if (x.take) keep.add(x.take);
+      if (ed.take) keep.add(ed.take);
+    }
+  }
+  return keep;
+}
+
+/** 0.17.17: every take but the approved Shots' ones. Shots under review lose theirs. */
+async function clearUnapproved() {
+  if (busyGuard()) return;
+  const keep = approvedTakes();
+  const st = S.segStats || { files: 0, bytes: 0 };
+  const listed = Object.values(S.takes || {}).flat().map((t) => t && t.name);
+  const kept = listed.length ? [...keep].filter((n) => listed.includes(n)).length : keep.size;
+  const gone = Math.max(0, st.files - kept);
+  if (!gone) { toast("Every saved take belongs to an approved Shot: nothing to delete."); return; }
+  const losing = P().shots.filter((x) => x.kind !== "clip" && x.take && !keep.has(x.take));
+  if (!confirm(`Delete ${gone} unapproved take file${gone === 1 ? "" : "s"} for "${P().name}"? ` +
+      `The ${kept} take${kept === 1 ? "" : "s"} your approved Shots use stay.` +
+      (losing.length ? ` ${losing.map(titleOf).join(", ")} ${losing.length === 1 ? "loses its take and has" : "lose their takes and have"} to render again.` : ""))) return;
+  let res;
+  try { res = await api("/longshot/clear-takes", { method: "POST", body: { project: P().slug, keep: [...keep] } }); }
+  catch (e) { toast(e.message); return; }
+  S.segStats = { files: res.files, bytes: res.bytes };
+  for (const x of losing) {
+    x.take = null;
+    if (x.status === "review") { x.status = "queued"; x.was_rendered = true; }
+  }
+  S.takes = {};
+  S.dry = null;
+  commit();
+  fetchAllTakes().then(render).catch(() => {});
+  toast(`Deleted ${res.removed} unapproved take${res.removed === 1 ? "" : "s"}.`);
 }
 
 async function openFolder(which) {
@@ -10018,6 +10497,7 @@ async function insertClip(at, info, replacing) {
       size_bytes: info.size_bytes || null, trim_in: 0, frames, duration: pr.duration, fps: pr.fps,
       width: pr.width, height: pr.height, has_audio: pr.has_audio, audio: pr.has_audio ? "clip" : "mute" } };
   p.shots.splice(Math.max(0, Math.min(at, p.shots.length)), 0, s);
+  s.group = replacing ? replacing.group || null : ((p.shots[p.shots.indexOf(s) - 1] || {}).group || inGroupAt(p, s));
   S.refState["clip:" + s.id] = "ok";
   if (replacing) replacing.bypassed = true;
   const redo = bridgeAround(s);
@@ -10175,12 +10655,13 @@ function clipCardBody(s, title) {
 // Round 2: inserting Shots and take history
 // ---------------------------------------------------------------------------
 
-function insertShot(at) {
+function insertShot(at, group = null) {
   if (listGuard(at)) return;
   const p = P();
   const s = { id: uid("s"), text: "", seconds: 5, shot_seed: -1, bypassed: false, status: "queued",
     was_approved: false, join: "bridge", take: null, window: null, take_seconds: null, prev_seeds: [] };
   p.shots.splice(Math.max(0, Math.min(at, p.shots.length)), 0, s);
+  s.group = group || inGroupAt(p, s);
   S.open = s.id;
   S.dry = null;
   syncAfter(s, "Inserting a Shot");

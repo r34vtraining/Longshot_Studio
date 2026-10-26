@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.17.16"
+STUDIO_VERSION = "0.17.22"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -1326,6 +1326,41 @@ def clear_segments(output_dir, slug):
                 os.remove(p)
                 n += 1
     return n
+
+
+def clear_takes_except(output_dir, slug, keep):
+    """0.17.17, Delete unapproved takes: every take file of the project but the ones in `keep`
+    (the approved Shots' takes), plus any segments left from earlier versions."""
+    keep = {k for k in (keep or []) if isinstance(k, str)}
+    n = 0
+    if not is_slug(slug):
+        return 0
+    for folder in (takes_folder(output_dir, slug), segments_folder(output_dir, slug)):
+        if not os.path.isdir(folder):
+            continue
+        for f in os.listdir(folder):
+            p = os.path.join(folder, f)
+            if not os.path.isfile(p) or f in keep:
+                continue
+            if f.endswith(".safetensors") or f.endswith(".safetensors.tmp"):
+                os.remove(p)
+                n += 1
+    return n
+
+
+def approved_takes(project):
+    """The takes an approved (or locked) Shot uses, including one kept while it's edited."""
+    out = set()
+    for sh in (project or {}).get("shots") or []:
+        if sh.get("kind") == "clip":
+            continue
+        ed = sh.get("edit_from") or {}
+        if sh.get("status") == "approved" or sh.get("was_approved") or sh.get("lock") or ed.get("was_approved") \
+                or ed.get("status") == "approved":
+            for t in (sh.get("take"), ed.get("take")):
+                if isinstance(t, str) and t:
+                    out.add(t)
+    return out
 
 
 def delete_inputs(input_dir, slug):

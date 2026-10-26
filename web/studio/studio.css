@@ -1092,3 +1092,43 @@ body.moving-block, body.moving-block * { cursor: grabbing !important; user-selec
 .undo-btns { display: inline-flex; gap: 2px; margin-left: 4px; }
 .undo-btns button { min-width: 26px; font-size: 14px; line-height: 1; padding: 3px 6px; }
 .undo-btns button:disabled { opacity: .35; cursor: default; }
+
+.seg-store .seg-btns { display: inline-flex; flex-direction: column; gap: 6px; align-items: stretch; }
+
+/* 0.17.19: Shot groups (folders) */
+.group-head { display: flex; align-items: center; gap: 8px; margin: 14px 0 6px; padding: 7px 10px; border: 1px solid var(--line-2);
+  border-radius: 10px; background: rgba(255,255,255,.035); flex-wrap: wrap; }
+.group-head:not(.open) { margin-bottom: 8px; }
+.group-head .group-fold { background: none; border: 0; color: var(--amber-lt); font-size: 14px; cursor: pointer; padding: 0 2px; width: 20px; }
+.group-head .group-name { font-weight: 600; font-size: 13px; cursor: text; }
+.group-head .group-name-in { width: 220px; padding: 3px 7px; font-size: 13px; }
+.group-head .group-sum { white-space: nowrap; }
+.group-head .push { flex: 1; }
+.g-member { position: relative; }
+.g-member::before { content: ""; position: absolute; left: -7px; top: -6px; bottom: 0; width: 2px; background: rgba(232,170,72,.45); border-radius: 1px; }
+.g-member.g-last::before { bottom: 4px; }
+.g-member.g-last { margin-bottom: 14px; }
+.shot.sel { outline: 2px solid var(--amber); outline-offset: 1px; }
+.tl-groups { position: relative; height: 0; }
+.tl-groups.on { height: 15px; margin-top: 4px; }
+.tl-group { position: absolute; top: 0; height: 14px; border-top: 2px solid rgba(232,170,72,.7); box-sizing: border-box;
+  overflow: hidden; padding: 0 4px; }
+.tl-group span { display: block; font-size: 10px; line-height: 12px; color: var(--amber-lt); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#shots-panel.flipped .g-member.g-last { margin-bottom: 0; }
+#shots-panel.flipped .g-member.g-first { margin-bottom: 14px; }
+#shots-panel.flipped .g-member::before { top: 0; bottom: -6px; }
+#shots-panel.flipped .g-member.g-first::before { bottom: 4px; }
+.fold-quick .q-multi { margin-left: 10px; }
+.fold-quick .q-multi-in { width: 52px; padding: 3px 6px; margin-left: 4px; }
+
+/* 0.17.21: Face refine folded: its Shot controls under the header */
+.face-quick { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.face-quick[hidden] { display: none; }
+.face-quick select { max-width: 170px; padding: 4px 8px; font-size: 12px; background: var(--panel); border: 1px solid var(--field-line); border-radius: 6px; color: var(--text); }
+
+/* 0.17.22: dragging a Shot into a group / along the list */
+#shots .shot-row[draggable="true"] { cursor: grab; }
+#shots .dragging { opacity: .45; }
+#shots .drop-before { box-shadow: 0 -3px 0 0 var(--amber); }
+#shots .drop-after { box-shadow: 0 3px 0 0 var(--amber); }
+#shots .group-head.drop-into { border-color: var(--amber); background: var(--amber-bg); }

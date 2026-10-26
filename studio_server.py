@@ -16,6 +16,7 @@
     GET  /longshot/takes/<slug>?shot=<id>   takes, oldest first
     DELETE /longshot/takes/<slug>/<name>    delete one take (loopback only)
     POST /longshot/clear-segments  {project} (loopback only)
+    POST /longshot/clear-takes  {project, keep} delete all but the approved takes (loopback only)
     POST /longshot/open-folder     {"which": "output"|"input", "select", "project", "subfolder"} (loopback only)
     POST /longshot/install-pack    {pack}: clone an optional pack (loopback only)
     POST /longshot/install-preview the taeh3 live-preview decoder (loopback only)
@@ -1703,6 +1704,23 @@ def register(routes=None):
         if not pj.is_slug(slug):
             return error("Not a project slug.")
         removed = pj.clear_segments(folder_paths.get_output_directory(), slug)
+        return web.json_response({"removed": removed,
+                                  **pj.segment_stats(folder_paths.get_output_directory(), slug)})
+
+    @routes.post("/longshot/clear-takes")
+    async def clear_takes(request):
+        import folder_paths
+        if not local(request):
+            return error("Saved takes can only be deleted from the machine running ComfyUI.", 403)
+        body = await body_of(request) or {}
+        slug = body.get("project")
+        if not pj.is_slug(slug):
+            return error("Not a project slug.")
+        keep = {k for k in (body.get("keep") or []) if isinstance(k, str)}
+        store = project_store()
+        if store.exists(slug):                  # what the saved project has approved stays too
+            keep |= pj.approved_takes(store.load(slug))
+        removed = pj.clear_takes_except(folder_paths.get_output_directory(), slug, keep)
         return web.json_response({"removed": removed,
                                   **pj.segment_stats(folder_paths.get_output_directory(), slug)})
 
