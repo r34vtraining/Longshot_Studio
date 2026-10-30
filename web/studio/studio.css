@@ -631,7 +631,7 @@ body.seed-dragging, body.seed-dragging * { cursor: ew-resize !important; user-se
 
 /* Render queue */
 .q-btns { display: inline-flex; gap: 6px; }
-.queue { display: flex; flex-direction: column; gap: 4px; max-height: 420px; overflow: auto; }
+.queue { display: flex; flex-direction: column; gap: 4px; }
 .q-empty { color: var(--muted); font-size: 12px; }
 .q-row { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 8px; align-items: start; padding: 6px 4px;
   border-top: 1px solid #22242A; font-size: 12px; }
@@ -1132,3 +1132,22 @@ body.moving-block, body.moving-block * { cursor: grabbing !important; user-selec
 #shots .drop-before { box-shadow: 0 -3px 0 0 var(--amber); }
 #shots .drop-after { box-shadow: 0 3px 0 0 var(--amber); }
 #shots .group-head.drop-into { border-color: var(--amber); background: var(--amber-bg); }
+
+/* 0.17.23: saved takes in the Plan panel */
+.plan-takes .seg-store { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line-2); }
+.panel.folded .plan-takes { display: none; }
+.plan, .queue { scrollbar-width: thin; }
+.sysstats .stat.speed.live b { color: var(--amber-lt); }
+.sysstats .stat.speed.idle { opacity: .6; }
+@media (max-width: 900px) { #speedstat { display: none; } }
+.join-chip.j-cutaway { color: #C9B6F2; border-color: #4A3D6B; background: rgba(201,182,242,.07); }
+
+/* 0.17.27: Output final, two ways: native size | upscaled */
+.go-split { display: flex; gap: 6px; }
+.go-split > button { flex: 1 1 0; min-width: 0; white-space: normal; line-height: 1.2; }
+.dec-row3 .go-split .go { padding: 12px 6px; font-size: 13.5px; }
+
+/* 0.17.28: Stems checkbox (export button, final) */
+.dec-stems { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+.dec-stems input { margin: 0; }
+.export-ctl .export-up + .export-up { border-left: 1px solid var(--field-line); }

@@ -38,6 +38,7 @@
     </div>
   </div>
   <div class="top-right">
+    <div id="speedstat" class="sysstats mono" hidden></div>
     <div id="sysstats" class="sysstats mono" hidden></div>
     <div class="mem-btns" role="group" aria-label="Free memory">
       <button class="ghost xs" data-action="free-vram" id="free-vram" title="Free VRAM: move the models out of the GPU. ComfyUI keeps them in RAM, so the next render starts quickly.">Free VRAM</button>
@@ -183,6 +184,7 @@
         <div class="ctl export-ctl" id="tl-export" hidden>
           <button class="export-go" data-action="export-approved" id="tl-export-btn" title="Copy each approved Shot's own clip (whole, with sound) into output/longshot/&lt;project&gt;/Approved_Clips, numbered as on the timeline. Nothing is decoded.">Export approved clips</button>
           <label class="export-up" title="Decode each approved take again on its own and upscale it with RTX Super Resolution (scale and quality from Settings; the ProRes master setting adds a .mov of each)."><input type="checkbox" id="tl-export-up"> RTX</label>
+          <label class="export-up export-stems" title="Also split each exported clip's sound into its dialogue and the rest (sound effects, ambience): Approved_Audio/Dialogue/&lt;clip&gt;_dialogue.wav and Approved_Audio/SFX/&lt;clip&gt;_sfx.wav, same length (MelBand RoFormer)."><input type="checkbox" id="tl-export-stems"> Stems</label>
         </div>
         <a class="ctl remote-only" id="download" download hidden>Download video</a>
         <span class="mono muted small push" id="tc-label">00:00.00 / 00:00.00</span>
@@ -272,6 +274,7 @@
         <button class="ghost sm" data-action="dry-run" id="dry-btn">Dry run · full prompts</button>
       </div>
       <div id="plan" class="plan"></div>
+      <div id="plan-takes" class="plan-takes"></div>
     </div>
 
     <div class="panel" id="queue-panel">

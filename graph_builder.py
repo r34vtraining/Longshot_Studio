@@ -665,6 +665,61 @@ def build_take_audio(project: dict, take: str, env: Env | None = None) -> Build:
                  filename_prefix=prefix, video_format="", warnings=[])
 
 
+STEM_SOURCE_EXT = (".mp4", ".mov", ".wav", ".flac", ".mp3", ".m4a")
+
+
+def build_stems(project: dict, stems: dict, env: Env | None = None) -> Build:
+    """0.17.28, Stems: each exported clip / final video split into its dialogue and the rest
+    (sound effects, ambience, music) with MelBand RoFormer, as two WAVs. stems = {model,
+    items: [{source, dx, fx}]}: the source with its extension, the two stems without (0.17.30:
+    approved clips' stems go to Approved_Audio/Dialogue and Approved_Audio/SFX); {source, out}
+    puts them next to it as <out>_dialogue.wav and <out>_sfx.wav. All inside the project's
+    output folder."""
+    env = env or Env()
+    need = ["LoadAudio", "MelBandRoFormerModelLoader", "MelBandRoFormerSampler", "MiniMaxH3SaveAudio"]
+    missing = [c for c in need if not env.has(c)]
+    if missing:
+        raise BuildError("Stems need node(s) ComfyUI doesn't have:\n  " +
+                         "\n  ".join(f"{c} — from {PACKS.get(c, 'ComfyUI core')}" for c in missing))
+    stems = stems if isinstance(stems, dict) else {}
+    model = str(stems.get("model") or "").strip()
+    if not model:
+        raise BuildError("Stems need the MelBand RoFormer model (MelBandRoformer_fp16.safetensors) in "
+                         "models/diffusion_models.")
+    root = f"{OUTPUT_SUBFOLDER}/{project_slug(project)}/"
+    items = [x for x in (stems.get("items") or []) if isinstance(x, dict)]
+    if not items:
+        raise BuildError("Nothing to split into stems.")
+    if len(items) > 64:                 # 0.17.31: never cut short quietly (the Studio sends 32 a run)
+        raise BuildError(f"One run splits at most 64 files into stems ({len(items)} sent).")
+
+    def inside(p, what):
+        p = str(p or "").replace("\\", "/").strip("/")
+        if not p.startswith(root) or ".." in p.split("/") or len(p) > 400:
+            raise BuildError(f"{what} must be inside this project's output folder.")
+        return p
+
+    g = _Graph()
+    mel = g.add("melband", "MelBandRoFormerModelLoader", "MelBand RoFormer", model_name=model)
+    nodes = {}
+    for i, it in enumerate(items, 1):
+        src = inside(it.get("source"), "A stem's source")
+        if not src.lower().endswith(STEM_SOURCE_EXT):
+            raise BuildError(f"Can't read the sound of {src.rsplit('/', 1)[-1]}.")
+        if it.get("dx") or it.get("fx"):
+            dx, fx = inside(it.get("dx"), "A stem's file"), inside(it.get("fx"), "A stem's file")
+        else:
+            out = inside(it.get("out"), "A stem's file")
+            dx, fx = out + "_dialogue", out + "_sfx"
+        load = g.add(f"load{i}", "LoadAudio", f"Sound of {src.rsplit('/', 1)[-1]}", audio=f"{src} [output]")
+        sep = g.add(f"sep{i}", "MelBandRoFormerSampler", "Dialogue / the rest", model=mel, audio=load)
+        g.add(f"dx{i}", "MiniMaxH3SaveAudio", "Dialogue stem", audio=[sep[0], 0], filename_prefix=dx)
+        g.add(f"fx{i}", "MiniMaxH3SaveAudio", "SFX stem", audio=[sep[0], 1], filename_prefix=fx)
+        nodes[str(i)] = {"dialogue": f"dx{i}", "sfx": f"fx{i}"}
+    return Build(prompt=g.nodes, width=0, height=0, chain=[], nodes={"stems": nodes},
+                 filename_prefix=root, video_format="", warnings=[])
+
+
 def build_clip_export(project: dict, items: list, env: Env | None = None) -> Build:
     """Export approved clips, upscaled: [{take, n}] -> one branch each. The take
     is decoded on its own, whole (MiniMax H3 Take -> VAE Decode), upscaled a
@@ -758,7 +813,7 @@ def build_clip_export(project: dict, items: list, env: Env | None = None) -> Bui
                  filename_prefix=work, video_format=fmt, warnings=warnings)
 
 
-def required_classes(project: dict, dry_run: bool = False, final: bool = False) -> list:
+def required_classes(project: dict, dry_run: bool = False, final: bool = False, final_upscale: bool = True) -> list:
     """Node classes the build will use, given the project's toggles."""
     s = project.get("settings") or {}
     a = project.get("audio") or {}
@@ -778,7 +833,7 @@ def required_classes(project: dict, dry_run: bool = False, final: bool = False) 
         need.append("MiniMaxH3TurboLoRA")
     if any(l.get("on") and l.get("name") for l in s.get("loras") or []):
         need.append("LoraLoaderModelOnly")
-    if final or (s.get("rtx_vsr") or {}).get("on"):
+    if (final and final_upscale) or (not final and (s.get("rtx_vsr") or {}).get("on")):
         need.append("RTXVideoSuperResolution")
     if any(sh.get("kind") == "clip" for sh in active_shots(project)):
         need += ["MiniMaxH3LoadVideo", "MiniMaxH3Clip", "MiniMaxH3ClipShot"]
@@ -1128,7 +1183,7 @@ def build_face_try(project: dict, item: dict, env: Env | None = None) -> Build:
 def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                  env: Env | None = None, final: bool = False, standalone: bool = False,
                  clips_for=None, chunk=None, refine_export: bool = False,
-                 long_shot_only: bool = False) -> Build:
+                 long_shot_only: bool = False, final_upscale: bool = True) -> Build:
     """Turn a Studio project into an API prompt rendering the chain of active
     Shots up to and including `upto` (all active Shots when None).
 
@@ -1136,6 +1191,9 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
     (with the project's scale and quality) and the file is saved as
     <project>_final_#####.mp4 (plus a ProRes master .mov when the project asks
     for one). The Long Shot part is identical, so every segment is reused.
+    0.17.27: final_upscale=False is "Output final" at the film's own size: everything the
+    final does (refined faces, clip pixels, ProRes master) without RTX, saved as
+    <project>_final_native_#####.mp4.
 
     standalone=True renders the Shot `upto` on its own: a one-Shot timeline, so
     it starts fresh from the references with no pin to the Shots around it. Its
@@ -1162,8 +1220,9 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
     warnings = []
 
     upscale_final = bool(final)      # (`final` is reused below for the song route)
+    final_up = upscale_final and bool(final_upscale)     # 0.17.27: the final at native size: no RTX
     clip_ids = [str(x) for x in (clips_for or [])] if not dry_run and not upscale_final else []
-    need_classes = required_classes(project, dry_run, upscale_final)
+    need_classes = required_classes(project, dry_run, upscale_final, final_up)
     if clip_ids:
         need_classes = need_classes + ["MiniMaxH3Take", "VAEDecodeAudio"]
     if chunk is not None:
@@ -1178,7 +1237,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             raise BuildError("A chunk needs a start of 0 or more and a length of 1 or more.")
         # a chunk upscales only when the render does; otherwise it's a piece of a film
         # decoded run by run (Upscale Chunk at scale 1: frames encoded, no RTX)
-        chunk_up = upscale_final or bool((s.get("rtx_vsr") or {}).get("on"))
+        chunk_up = final_up or (not upscale_final and bool((s.get("rtx_vsr") or {}).get("on")))
         need_classes = [c for c in need_classes if c not in ("RTXVideoSuperResolution", "MiniMaxH3SaveVideo")] + \
             ["MiniMaxH3UpscaleChunk"] + (["RTXVideoSuperResolution"] if chunk_up else []) + \
             (["MiniMaxH3SaveAudio"] if chunk["audio"] else [])
@@ -1700,7 +1759,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                 images = g.add("faces", "MiniMaxH3PasteFaces", "Refined faces", images=images, items=json.dumps(rows))
                 ids["faces"] = "faces"
     vsr = s.get("rtx_vsr") or {}
-    upscales = bool(vsr.get("on") or upscale_final)
+    upscales = final_up or (not upscale_final and bool(vsr.get("on")))
     if upscales:
         vsr_quality = vsr.get("quality", "ULTRA")
         if vsr_quality not in VSR_QUALITIES:
@@ -1720,7 +1779,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
     # Renders go into the project's own folder, next to its takes:
     # output/longshot/<slug>/videos/<Name>_00001-audio.mp4
     prefix = f"{videos_subfolder(project)}/{safe_name(project.get('name'))}" + \
-        ("_final" if upscale_final else "")
+        (("_final" if final_up else "_final_native") if upscale_final else "")
     out_audio = loader if final else decoded_audio
     if chunk is not None:
         # A chunk: frames start .. start+length-1, upscaled a few at a time and
@@ -1730,7 +1789,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         if not upscales:
             vsr_scale, vsr_quality = 1.0, "ULTRA"     # Long Shot 1.6.10: encode only
         name = safe_name(project.get("name"))
-        cprefix = f"{videos_subfolder(project)}/_chunks/{name}" + ("_final" if upscale_final else "") + \
+        cprefix = f"{videos_subfolder(project)}/_chunks/{name}" + (("_final" if final_up else "_final_native") if upscale_final else "") + \
             f"_c{chunk['index']:03d}"
         master = upscale_final and bool(s.get("prores_master"))
         g.add("upscale_chunk", "MiniMaxH3UpscaleChunk", "Upscale chunk → file", images=images,

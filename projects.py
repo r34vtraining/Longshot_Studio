@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.17.22"
+STUDIO_VERSION = "0.17.32"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -984,6 +984,159 @@ def _pad_to(seconds):
     return ["-af", "apad", "-shortest"]
 
 
+# ---------------------------------------------------------------------------
+# Stems (0.17.28-0.17.30): each exported clip / final video split into its dialogue and the rest.
+# Approved clips' stems go to Approved_Audio/Dialogue and Approved_Audio/SFX; a final's sit next
+# to it. One manifest per project (longshot/<slug>/.stems.json) remembers which file each pair
+# was split from (its SHA-256) and where the pair is, so an export only splits what changed,
+# and the stems of a file that's gone are removed.
+# ---------------------------------------------------------------------------
+
+_STEMS_MANIFEST = ".stems.json"
+STEM_SUFFIXES = ("_dialogue.wav", "_sfx.wav")
+APPROVED_AUDIO_DIR = "Approved_Audio"
+
+
+def _inside_project(output_dir, slug, rel, ext=""):
+    """The absolute path of a file inside the project's output folder (rel + ext), or ValueError."""
+    if not is_slug(slug):
+        raise ValueError("Not a project slug.")
+    rel = str(rel or "").replace("\\", "/").strip("/")
+    root = os.path.realpath(os.path.join(output_dir, "longshot", slug))
+    path = os.path.realpath(os.path.join(output_dir, *rel.split("/"))) + ext
+    if not path.startswith(root + os.sep):
+        raise ValueError("Stems stay inside the project's output folder.")
+    return path
+
+
+def _stem_item(it):
+    """{source, dx, fx} from an item ({source, dx, fx}, {source, out} or a bare source path)."""
+    if isinstance(it, str):
+        it = {"source": it}
+    if not isinstance(it, dict):
+        return None
+    src = str(it.get("source") or "").replace("\\", "/").strip("/")
+    if not src:
+        return None
+    if it.get("dx") and it.get("fx"):
+        return {"source": src, "dx": str(it["dx"]).strip("/"), "fx": str(it["fx"]).strip("/")}
+    out = str(it.get("out") or re.sub(r"(-audio)?\.(mp4|mov|wav)$", "", src, flags=re.I)).strip("/")
+    return {"source": src, "dx": out + "_dialogue", "fx": out + "_sfx"}
+
+
+def _file_sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _stems_manifest_path(output_dir, slug):
+    return os.path.join(output_dir, "longshot", slug, _STEMS_MANIFEST)
+
+
+def _stems_manifest(output_dir, slug):
+    try:
+        with open(_stems_manifest_path(output_dir, slug), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_stems_manifest(output_dir, slug, man):
+    path = _stems_manifest_path(output_dir, slug)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump(man, fh, indent=1)
+    os.replace(path + ".tmp", path)
+
+
+def _rm(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def stems_todo(output_dir, slug, items):
+    """The items (as {source, dx, fx}) whose stems are missing, elsewhere, or were split from
+    another version of the file. Removes the stems of files that are gone, and of a file
+    whose stems now go somewhere else."""
+    man = _stems_manifest(output_dir, slug)
+    todo, changed = [], False
+    for raw in items or []:
+        it = _stem_item(raw)
+        if not it:
+            continue
+        try:
+            src = _inside_project(output_dir, slug, it["source"])
+            dx = _inside_project(output_dir, slug, it["dx"], ".wav")
+            fx = _inside_project(output_dir, slug, it["fx"], ".wav")
+        except ValueError:
+            continue
+        if not os.path.isfile(src):
+            continue
+        rec = man.get(it["source"]) or {}
+        if rec and (rec.get("dx"), rec.get("fx")) != (it["dx"], it["fx"]):
+            for k in ("dx", "fx"):           # they move: the old pair goes
+                try:
+                    _rm(_inside_project(output_dir, slug, rec.get(k), ".wav"))
+                except ValueError:
+                    pass
+            man.pop(it["source"], None)
+            changed, rec = True, {}
+        if not (os.path.isfile(dx) and os.path.isfile(fx)) or rec.get("sha") != _file_sha(src):
+            todo.append(it)
+    # stems of files that aren't there any more
+    for source, rec in list(man.items()):
+        try:
+            gone = not os.path.isfile(_inside_project(output_dir, slug, source))
+        except ValueError:
+            gone = True
+        if gone:
+            for k in ("dx", "fx"):
+                try:
+                    _rm(_inside_project(output_dir, slug, (rec or {}).get(k), ".wav"))
+                except ValueError:
+                    pass
+            del man[source]
+            changed = True
+    # 0.17.28 put approved clips' stems next to them: they live in Approved_Audio now
+    legacy = approved_folder(output_dir, slug)
+    if os.path.isdir(legacy):
+        for f in os.listdir(legacy):
+            if f.endswith(STEM_SUFFIXES):
+                _rm(os.path.join(legacy, f))
+        _rm(os.path.join(legacy, _STEMS_MANIFEST))
+    if changed:
+        _write_stems_manifest(output_dir, slug, man)
+    return todo
+
+
+def stems_done(output_dir, slug, items):
+    """Remember what each new pair of stems was split from, and where it is."""
+    man = _stems_manifest(output_dir, slug)
+    n = 0
+    for raw in items or []:
+        it = _stem_item(raw)
+        if not it:
+            continue
+        try:
+            src = _inside_project(output_dir, slug, it["source"])
+            dx = _inside_project(output_dir, slug, it["dx"], ".wav")
+            fx = _inside_project(output_dir, slug, it["fx"], ".wav")
+        except ValueError:
+            continue
+        if not (os.path.isfile(src) and os.path.isfile(dx) and os.path.isfile(fx)):
+            continue
+        man[it["source"]] = {"sha": _file_sha(src), "dx": it["dx"], "fx": it["fx"]}
+        n += 1
+    _write_stems_manifest(output_dir, slug, man)
+    return n
+
+
 def clear_approved(output_dir, slug, keep_work=False):
     """Empty Approved_Clips of its videos (and the upscale's work files)."""
     folder = approved_folder(output_dir, slug)
@@ -993,6 +1146,7 @@ def clear_approved(output_dir, slug, keep_work=False):
     n = 0
     for f in os.listdir(folder):
         path = os.path.join(folder, f)
+        # (0.17.29: the stems stay: stems_todo keeps the ones whose clip came back the same)
         if os.path.isfile(path) and f.lower().endswith((".mp4", ".mov")):
             os.remove(path)
             n += 1

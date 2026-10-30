@@ -64,6 +64,7 @@ function toggleFold(k) {
   applyFolds();
   if (k === "vsr") renderSettings();
   if (k.startsWith("face-")) renderFace();        // 0.15.1: the Face refine cards fold too
+  if (k === "plan" || k === "queue") capRows($(k));
 }
 /** Is this zone folded in this browser? (Plan, Queue, the Upscale settings) */
 function folded(k) {
@@ -185,6 +186,12 @@ function normalize(p) {
     edit_from: s.edit_from && typeof s.edit_from === "object" ? Object.assign({}, s.edit_from, { gen: 0 }) : null,
     join: s.join === "cut" || s.join === "context" ? s.join : "bridge",
     free_end: !!s.free_end && s.join !== "cut" && s.join !== "context",   // 0.17.14: Continuous, its end not pinned to the Shot after
+    // 0.17.24 / 0.17.25: pins its end into the Shot after: with join "cut", a fresh start that
+    // leads in (Lead in); with join "bridge", a Bridge into a Shot after that starts with a Cut
+    lead_in: !!s.lead_in && (s.join === "bridge" || s.join === "cut") && !s.free_end,
+    // 0.17.26: a cutaway (B-roll): rendered like a Context Shot; the Shot after it continues from
+    // the Shot before it, as if it weren't there
+    cutaway: !!s.cutaway && s.join === "context",
     context_from: s.context_from || null,     // Context: the take of the Shot before it was rendered from
     context_at: Number.isFinite(Number(s.context_at)) && s.context_at !== null ? Number(s.context_at) : null,   // 0.17.11: its frame (back from the end)
     kind: s.kind === "clip" ? "clip" : "shot",
@@ -324,9 +331,26 @@ const isEmptyShot = (s) => !!s && s.kind !== "clip" && !String(s.text || "").tri
  *  s.join ("cut" | "context" | "bridge"; Continuous is the default). Render all
  *  and the main button read it as the join with the Shot before; ▶ on one Shot
  *  applies it to the rendered Shots next to it at that moment (chipPlan). */
+/** 0.17.26: the Shots a Shot joins on the film's story: cutaways (B-roll) in between are skipped.
+ *  A cutaway itself joins only the Shot right before it, and nothing after it. */
+function mainPrev(act, i) {
+  if (i <= 0) return null;
+  if (act[i] && act[i].cutaway) return act[i - 1];
+  let k = i - 1;
+  while (k >= 0 && act[k].cutaway) k--;
+  return k >= 0 ? act[k] : null;
+}
+function mainNext(act, i) {
+  if (i < 0 || (act[i] && act[i].cutaway)) return null;
+  let k = i + 1;
+  while (k < act.length && act[k].cutaway) k++;
+  return act[k] || null;
+}
+/** The Shot after a cutaway (or a run of them): it picks up from the Shot before the cutaway. */
+const afterCutaway = (s) => { const act = active(), i = act.indexOf(s); return i > 0 && !s.cutaway && !!act[i - 1].cutaway; };
 function chipNear(s) {
   const act = active(), i = act.indexOf(s);
-  return { prev: i > 0 ? act[i - 1] : null, next: i >= 0 ? act[i + 1] || null : null };
+  return { prev: mainPrev(act, i), next: mainNext(act, i) };
 }
 function chipSides(s) {
   const act = active(), i = act.indexOf(s);
@@ -336,26 +360,40 @@ function chipSides(s) {
   // 0.17.14: the Shot after only pins this one's end when it carries on from it (its own
   // join is Continuous); after a Cut or Context it starts fresh, so there's nothing to meet
   const joined = (x) => x.kind === "clip" ? x.join !== "cut" : !["cut", "context"].includes(x.join);
-  const nx = i >= 0 ? act[i + 1] : null;
-  return { prev: i > 0 && ok(act[i - 1]) ? act[i - 1] : null, next: ok(nx) && joined(nx) ? nx : null };
+  const nx = mainNext(act, i), pv = mainPrev(act, i);
+  return { prev: pv && ok(pv) ? pv : null, next: ok(nx) && joined(nx) ? nx : null,
+    // 0.17.24: a rendered Shot after that starts fresh (Cut / Context): this one can still lead into it
+    lead: ok(nx) && !joined(nx) ? nx : null };
 }
 /** The chip's choices. 0.17.14: "from" is Continuous with its end left free, offered when
  *  the Shot after is rendered and carries on from this one (Bridge would pin into it). */
 function chipOptions(s) {
   const { prev, next } = chipNear(s);
-  if (prev) return chipSides(s).next ? ["bridge", "from", "context", "cut"] : ["bridge", "context", "cut"];
-  if (next) return ["bridge", "cut"];
+  const sd = chipSides(s);
+  // 0.17.25: Lead in (a fresh start whose end flows into the Shot after) whenever that Shot is rendered
+  if (prev) return sd.next ? ["bridge", "from", "lead", "context", "cutaway", "cut"] : sd.lead ? ["bridge", "bridgeIn", "lead", "context", "cutaway", "cut"] : ["bridge", "context", "cutaway", "cut"];
+  if (next) return sd.lead ? ["lead", "cut"] : ["bridge", "cut"];
   return ["cut"];
 }
 function chipJoin(s) {
   let j = s.join || "bridge";
   if (j === "bridge" && s.free_end) j = "from";
+  if (j === "context" && s.cutaway) j = "cutaway";
+  if (s.lead_in) {
+    const sd = chipSides(s);
+    if (j === "cut" && (sd.next || sd.lead)) j = "lead";
+    else if (j === "bridge" && sd.lead) j = "bridgeIn";
+  }
   const opts = chipOptions(s);
   return opts.includes(j) ? j : j === "from" ? "bridge" : "cut";
 }
 function chipName(s, j = chipJoin(s)) {
   if (j === "from") return "Continuous";
-  if (j === "bridge") { const { prev, next } = chipSides(s); return prev && next ? "Bridge" : "Continuous"; }
+  if (j === "lead") return "Lead in";
+  if (j === "cutaway") return "Cutaway";
+  if (j === "bridgeIn") return "Bridge";
+  // 0.17.24: a fresh start that flows into the Shot after is a Lead in
+  if (j === "bridge") { const { prev, next } = chipSides(s); return prev && next ? "Bridge" : !prev && next ? "Lead in" : "Continuous"; }
   return j === "context" ? "Context" : "Cut";
 }
 /** What ▶ does for Shot s, worked out when the render starts:
@@ -377,14 +415,21 @@ function editOf(s) {
   return { in: Math.max(0, Math.round(Number(e.in) || 0)), out: Math.max(0, Math.round(Number(e.out) || 0)),
     shift: Math.round(Number(e.shift) || 0) };
 }
-const hasEdit = (s) => { const e = effEdit(s); return !!(e.in || e.out || e.shift); };
+const hasEdit = (s) => { const e = effEdit(s); return !!((e.in > e.auto ? e.in : 0) || e.out || e.shift); };
 
 /** Does the i-th active Shot start a run on the film (0.9.2)? The film's start, a Cut or
  *  Context join, or a clip right after a clip. Shots joined Continuous make one run. */
 function runStartAt(act, i) {
   if (i <= 0) return true;
   const s = act[i], pv = act[i - 1];
-  return isCut(s) || (s.kind === "clip" && pv.kind === "clip") || isEmptyShot(s) || isEmptyShot(pv);
+  return isCut(s) || (s.kind === "clip" && pv.kind === "clip") || isEmptyShot(s) || isEmptyShot(pv) || !!pv.cutaway;
+}
+
+/** 0.17.26: frames hidden at the start of a Shot that continues across a cutaway: the ones it
+ *  shares with the Shot before the cutaway (they'd repeat its end after the B-roll). Film only. */
+function autoIn(s) {
+  if (!s || s.kind === "clip" || isCut(s) || !afterCutaway(s) || !isRendered(s)) return 0;
+  return Number(P().settings.overlap) || 22;
 }
 
 /** The Continuous run a Shot is part of: [first … last]. */
@@ -410,8 +455,8 @@ function freeEdges(s) {
  *  set aside. A move belongs to the Shot's run (0.9.2): its first Shot carries it and
  *  the whole run moves. */
 function effEdit(s) {
-  const e = editOf(s), f = freeEdges(s), r = runOf(s);
-  return { in: f.left ? e.in : 0, out: f.right ? e.out : 0, shift: editOf(r[0]).shift };
+  const e = editOf(s), f = freeEdges(s), r = runOf(s), auto = f.left ? autoIn(s) : 0;
+  return { in: f.left ? Math.max(e.in, auto) : 0, out: f.right ? e.out : 0, shift: editOf(r[0]).shift, auto };
 }
 
 const fmtSec = (frames) => `${(frames / FPS).toFixed(2)} s`;
@@ -624,11 +669,13 @@ function songGaps(project, drop) {
 
 function chipPlan(s) {
   const j = chipJoin(s);
-  if (j !== "bridge" && j !== "from") return { alone: true, name: chipName(s, j) };
-  const { prev, next: pin } = chipSides(s);
-  const next = j === "from" ? null : pin;            // 0.17.14: Continuous leaves its end free
+  if (j !== "bridge" && j !== "from" && j !== "lead" && j !== "bridgeIn") return { alone: true, name: chipName(s, j) };
+  const sd = chipSides(s);
+  // Lead in: nothing from the Shot before (a fresh start), its end pinned into the Shot after
+  const prev = j === "lead" ? null : sd.prev;
+  const next = j === "from" ? null : j === "lead" ? (sd.next || sd.lead) : j === "bridgeIn" ? sd.lead : sd.next;   // 0.17.14: Continuous leaves its end free
   if (!prev && !next) return { alone: true, name: "Continuous", pending: true };   // nothing approved to pin to yet
-  const act = active(), i = act.indexOf(s), nx = act[i + 1];
+  const act = active(), i = act.indexOf(s), nx = mainNext(act, i);
   const joins = { [s.id]: prev ? "bridge" : "cut" };
   if (nx && isRendered(nx)) joins[nx.id] = next ? "bridge" : "cut";
   return { alone: false, joins, prev, next, name: chipName(s, j) };
@@ -651,6 +698,7 @@ function cutBefore(s) {
   if (!s || s.bypassed || s.status === "queued") return false;
   const act = active(), prev = act[act.indexOf(s) - 1];
   if (!prev || isCut(s) || prev.kind === "clip" || s.kind === "clip" || prev.status === "queued") return false;
+  if (prev.cutaway) return false;                   // 0.17.26: the cut back from a cutaway is meant
   const row = lastRowFor(s.id), lo = last();
   if (row && lo && lo.chain.includes(prev.id) && row.seam) return row.seam === "mismatch";
   return s.seam === "mismatch";
@@ -1196,6 +1244,25 @@ function adoptCurrentFiles() {
   }
 }
 
+/** 0.17.23: Plan and Queue show up to 10 rows, then scroll. */
+function capRows(box) {
+  if (!box) return;
+  const panel = box.closest(".panel");
+  const rows = [...box.children].filter((x) => x.offsetParent !== null);
+  const keep = box.scrollTop;
+  if (panel && panel.classList.contains("folded") || rows.length <= 10) { box.style.maxHeight = ""; box.style.overflowY = ""; return; }
+  box.style.maxHeight = "none";
+  const top = box.getBoundingClientRect().top;
+  const h = Math.ceil(rows[9].getBoundingClientRect().bottom - top);
+  box.style.maxHeight = h + "px";
+  box.style.overflowY = "auto";
+  box.scrollTop = keep;
+}
+for (const id of ["plan", "queue"]) {
+  const box = document.getElementById(id);
+  if (box) new MutationObserver(() => capRows(box)).observe(box, { childList: true });
+}
+
 async function loadSegStats() {
   try { S.segStats = await api("/longshot/segments/" + P().slug); } catch (e) { S.segStats = null; }
 }
@@ -1523,7 +1590,7 @@ function decodeRuns(omit) {
   let prevIn = false;
   for (const s of active()) {
     if (skip.has(s.id)) { prevIn = false; continue; }
-    if (!runs.length || !prevIn || isCut(s)) runs.push([]);
+    if (!runs.length || !prevIn || isCut(s) || afterCutaway(s)) runs.push([]);   // 0.17.26: the Shot after a cutaway too
     runs[runs.length - 1].push(s.id);
     prevIn = true;
   }
@@ -1569,7 +1636,7 @@ function decodeGB(ids) {
  *  upscales; one file at the end. A film with no cuts and no upscale: one go. */
 async function wholeQueue(opts) {
   const v = P().settings.rtx_vsr || {};
-  const upscales = opts.kind === "final" || !!v.on;
+  const upscales = opts.kind === "final" ? opts.finalUp !== false : !!v.on;    // 0.17.27: Output final: native size
   const J = S.joinPending;
   if (J && J.slug === P().slug && J.opts.kind === opts.kind) {
     // the chunks of the last run are all saved; only the join failed: join again
@@ -1703,7 +1770,7 @@ async function chunkJoin(C, inCtx = false) {
     C.opts.onDone({ rows, text, outputs, built, sent });
   } catch (e) {
     S.error = `Joining the film's pieces failed: ${e.message} The ${C.n} pieces are kept: ` +
-      `click ${C.opts.kind === "final" ? "Upscale final video" : "Update preview"} again to retry the join (nothing is decoded again).`;
+      `click ${C.opts.kind === "final" ? "Output final" : "Update preview"} again to retry the join (nothing is decoded again).`;
     if (S.chunking === C) S.chunking = null;
     C.joining = false;
     S.joinPending = C;
@@ -1931,7 +1998,8 @@ function jobTitle(spec, pass, of, ids) {
     case "shot": { const t = takeNo(spec.target); return `${pad(spec.target)}${mode}${t ? " · " + t : ""}${ofTxt}`; }
     case "all": return `${spec.what || "Render all"}${spec.again ? " again" : ""} · ${ids.length} Shot${ids.length > 1 ? "s" : ""} (${numOf(ids[0])}–${numOf(ids[ids.length - 1])})${of > 1 ? ` · take ${pass} of ${of}` : ""}`;
     case "through": return `Re-render through ${pad(spec.target)}`;
-    case "final": return "Upscale final video";
+    case "stems": return `Stems · ${spec.what || "dialogue and SFX"}`;
+    case "final": { const v = (P() && P().settings.rtx_vsr) || {}; return spec.up === false ? "Output final" : `Output final ${v.scale || 2}× upscale`; }
     case "preview": return "Update preview";
     case "export": return "Export approved clips · upscaled";
     case "face": return `Face refine · ${pad(spec.target)}`;
@@ -2030,7 +2098,7 @@ function jobOpts(job) {
       if (plan.alone) {
         const nbs = chipNear(s), odd = [nbs.prev, nbs.next].filter(otherSize);
         return { upto: s.id, kind: sp.kind, standalone: true, label: `${verb} Shot ${n} · ${plan.pending ? "on its own" : plan.name}${seed}${take}`,
-          note: plan.name === "Context" ? "A hard cut · the last frame of the Shot before as a reference"
+          note: plan.name === "Context" || plan.name === "Cutaway" ? "A hard cut · the last frame of the Shot before as a reference"
             : plan.pending && odd.length ? `On its own · ${odd.map(titleOf).join(" and ")} ${odd.length > 1 ? "are" : "is"} another size, so not pinned`
             : plan.pending ? "On its own · no rendered Shot next to it to continue from yet" : "A fresh start from the references",
           onDone: onRendered(s.id, true) };
@@ -2073,7 +2141,13 @@ function jobOpts(job) {
         loadVideo(undefined, ids[0]);
       } };
   }
-  if (sp.type === "final") return finalOpts();
+  if (sp.type === "final") return finalOpts(sp.up !== false);
+  if (sp.type === "stems") {
+    const model = stemsModel();
+    if (!model) { S.error = "Stems need the MelBand RoFormer model (MelBandRoformer_fp16.safetensors, from Kijai) in models/diffusion_models."; return null; }
+    return { kind: "stems", stems: { model, items: sp.items || [] }, extra: { what: sp.what || "", items: sp.items || [] },
+      label: `Stems · ${sp.what || "dialogue and SFX"}`, note: "Each file's sound split into dialogue and the rest (MelBand RoFormer)", onDone: () => {} };
+  }
   if (sp.type === "preview") return previewOpts(sp.focus);
   if (sp.type === "face") {
     const s = shot(sp.target);
@@ -2294,6 +2368,7 @@ function splitAtContext(job) {
   for (let k = 1; k < ids.length; k++) {
     const i = act.findIndex((x) => x.id === ids[k]), pv = act[i - 1];
     if (act[i].join === "context" && pv && ids.slice(0, k).includes(pv.id)) { brk = k; break; }
+    if (pv && pv.cutaway && ids.slice(0, k).includes(pv.id)) { brk = k; break; }   // 0.17.26: after a cutaway
   }
   if (brk < 0) return;
   const before = ids.slice(0, brk), after = ids.slice(brk);
@@ -2460,11 +2535,28 @@ async function queueNext() {
       preparePass(job);
       splitAtContext(job);
       if (job.spec.type === "export") {
-        await exportPrepare(job);
+        if (!job.spec.part) await exportPrepare(job);          // a later part is prepared already
+        // 0.17.32: 16 clips a run (one ComfyUI run holds every decoded take until it ends); the
+        // rest go in parts right after this one
+        const EXP_PER = 16;
+        if (job.exportTodo.length > EXP_PER) {
+          const rest = job.exportTodo.slice(EXP_PER), parts = Math.ceil(job.exportTodo.length / EXP_PER);
+          job.exportTodo = job.exportTodo.slice(0, EXP_PER);
+          job.title = `Export approved clips · part 1 of ${parts}`;
+          const add = [];
+          for (let k = 0; k < rest.length; k += EXP_PER) {
+            add.push({ id: uid("j"), slug: job.slug, name: job.name, spec: Object.assign({}, job.spec, { part: true }), ids: [],
+              pass: 1, of: 1, title: `Export approved clips · part ${k / EXP_PER + 2} of ${parts}`, state: "waiting", added: Date.now(),
+              exportTodo: rest.slice(k, k + EXP_PER), exportKept: 0, exportRemixed: 0 });
+          }
+          Q.jobs.splice(Q.jobs.indexOf(job) + 1, 0, ...add);
+          saveQueue();
+        }
         if (!job.exportTodo.length) {
           outcome = ["done", null];
           toast(`All ${job.exportKept} approved clip${job.exportKept === 1 ? " is" : "s are"} already upscaled in Approved_Clips` +
             (job.exportRemixed ? `; the sound of ${job.exportRemixed} was mixed again (the song switched on or off, or moved).` : "; nothing to do."));
+          stemsForExport();
           return;
         }
       }
@@ -2504,22 +2596,22 @@ function pickFields(o, keys) {
   return r;
 }
 
-async function queueJob({ upto, dry, kind, label, note, onDone, final = false, standalone = false, batch = null,
+async function queueJob({ upto, dry, kind, label, note, onDone, final = false, finalUp = true, standalone = false, batch = null,
   omit = null, trimLeft = false, takeClips = null, chunk = null, exportClips = null, extra = null, jobId = null,
-  joins = null, takeAudio = null, faceTry = null, refineTry = null }) {
+  joins = null, takeAudio = null, faceTry = null, refineTry = null, stems = null }) {
   if (S.busy) return;
   if (Object.keys(S.uploading).length) { toast("Wait for the image upload to finish."); return; }
   S.error = null;
   const dryBox = () => { if (kind === "dry") showModal("Dry run · it stopped with an error", S.error); };
   if (comfyTooOld()) { S.error = comfyTooOldText(); dryBox(); render(); return; }
-  const missing = kind === "clips" || kind === "export" || kind === "align" || kind === "face" ? [] : missingRefs();
+  const missing = kind === "clips" || kind === "export" || kind === "align" || kind === "face" || kind === "stems" ? [] : missingRefs();
   if (missing.length) {
     S.error = `${missing.length} reference${missing.length > 1 ? "s are" : " is"} missing — relink or bypass ${missing.length > 1 ? "them" : "it"}.`;
     dryBox();
     render();
     return;
   }
-  const lost = kind === "face" ? missingFaceModels(P()) : missingModels(P());
+  const lost = kind === "stems" ? [] : kind === "face" ? missingFaceModels(P()) : missingModels(P());
   if (kind === "refine" && S.opts && !matchModel(P().settings.refine.model, S.opts.models)) lost.push(`Refine model (${P().settings.refine.model || "none"})`);
   if (lost.length) {
     S.error = `Model file${lost.length > 1 ? "s" : ""} not found in ComfyUI's model folders: ${lost.join(", ")}. ` +
@@ -2547,8 +2639,16 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
   let project = sendable(P(), claimed);          // seeds are settled on the whole timeline first
   // 0.9.2: the film's own joins, for where each Shot sits on the film (a render may override them)
   project.shots.forEach((x) => { x.film_join = x.join || "bridge"; });
+  // 0.17.26: on the film, the Shot after a cutaway starts right after the cutaway (a cut)
+  { const av = project.shots.filter((x) => !x.bypassed); av.forEach((x, i) => { if (i > 0 && av[i - 1].cutaway && !x.cutaway) x.film_join = "cut"; }); }
   // 0.17.0: a Context Shot that starts inside the Shot before takes the frame before its start
   project.shots.forEach((x) => { const b = contextBack(x); if (b) x.context_back = b; });
+  // 0.17.24: a Shot on Lead in pins its end into the rendered Shot after, even one that starts with a Cut
+  project.shots.forEach((x, i) => {
+    if (!x.lead_in || x.bypassed) return;
+    const nx = project.shots.slice(i + 1).find((y) => !y.bypassed), real = nx && shotById(nx.id);
+    if (real && isRendered(real) && (nx.join === "cut" || nx.join === "context")) nx.join = "bridge";
+  });
   // the join chip: the joins this render uses (the project keeps its own)
   if (joins) project.shots.forEach((x) => { if (joins[x.id]) x.join = joins[x.id]; });
   // Shots left out of this render (sent bypassed; the project itself is untouched):
@@ -2572,6 +2672,22 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
     active().filter((x) => x.id !== target && otherSize(x)).forEach((x) => empties.add(x.id));
   }
   empties.forEach((id) => drop.add(id));
+  // 0.17.26: a rendered cutaway before a Shot that continues is left out of this render (its time
+  // kept), so that Shot sits right after the Shot before the cutaway; one rendering now stays, and
+  // the Shot after it starts fresh in this render
+  {
+    const act = active();
+    const sampling = kind === "render" || kind === "reroll" || kind === "dry" || kind === "check";
+    act.forEach((x, i) => {
+      if (!sampling || !x.cutaway || !isRendered(x) || x.id === target || drop.has(x.id)) return;
+      let k = i + 1;
+      while (k < act.length && act[k].cutaway) k++;
+      const y = act[k];
+      if (y && !isCut(y)) drop.add(x.id);
+    });
+    const live = project.shots.filter((x) => !x.bypassed && !drop.has(x.id));
+    live.forEach((x, i) => { if (i > 0 && live[i - 1].cutaway && !x.cutaway && x.kind !== "clip") x.join = "cut"; });
+  }
   if (empties.size) {
     const act = project.shots.filter((x) => !x.bypassed);
     act.forEach((x, i) => { if (i > 0 && empties.has(act[i - 1].id) && !empties.has(x.id)) x.join = "cut"; });
@@ -2604,7 +2720,8 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
     const body = takeAudio ? { project, take_audio: takeAudio } : takeClips ? { project, take_clips: takeClips } : exportClips ? { project, export_clips: exportClips }
       : faceTry ? { project, face_try: faceTry }
       : refineTry ? { project, refine_try: refineTry }
-      : { project, upto, dry_run: !!dry, final, standalone, clips_for: clipsFor, chunk };
+      : stems ? { project, stems }
+      : { project, upto, dry_run: !!dry, final, final_upscale: finalUp !== false, standalone, clips_for: clipsFor, chunk };
     built = await api("/longshot/build", { method: "POST", body });
   } catch (e) {
     undoSeeds();
@@ -2631,7 +2748,8 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
   if (kind === "render" || kind === "reroll" || kind === "final" || kind === "refresh") saveNow();   // approvals / new seed survive a closed tab
   // what each Shot is rendered with, so an edit back to exactly this can bring the take back
   const sent = {};
-  for (const sh of project.shots) sent[sh.id] = { text: sh.text || "", seconds: Number(sh.seconds), back: Number(sh.context_back) || 0 };
+  for (const sh of project.shots) sent[sh.id] = { text: sh.text || "", seconds: Number(sh.seconds), back: Number(sh.context_back) || 0,
+    seed: Number((P().shots.find((x) => x.id === sh.id) || sh).shot_seed) };
   S.busy = {
     promptId: res.prompt_id, kind, target, label, note, baseNote: note, built, onDone, sent, batch, standalone, extra,
     jobId, slug: P().slug, project: P().name,
@@ -2679,6 +2797,7 @@ async function finish(promptId, entry) {
   const b = S.busy;
   if (!b || b.promptId !== promptId || b.finishing) return;
   b.finishing = true;
+  speedDone(b);
   clearTimeout(pollTimer);
   if (!entry) {
     for (let i = 0; i < 5 && !entry; i++) {
@@ -2733,6 +2852,14 @@ async function finishIn(b, promptId, entry) {
     await refineDone(b, entry.outputs || {});
   } else if (b.kind === "align") {
     await alignDone(b, entry.outputs || {});
+  } else if (b.kind === "stems") {
+    const n = Object.keys((b.built.nodes || {}).stems || {}).length;
+    try { await api(`/longshot/stems/${encodeURIComponent(b.slug || P().slug)}`, { method: "POST", body: { mode: "done", items: (b.extra && b.extra.items) || [] } }); }
+    catch (e) { /* the next export splits them again */ }
+    const where = ((b.extra && b.extra.items) || []).some((x) => /\/Approved_Audio\//.test(x.dx || "")) ? "in Approved_Audio (Dialogue, SFX)" : "next to the video";
+    toast(`Stems saved: ${n} file${n === 1 ? "" : "s"} split into dialogue and SFX ${where}${b.extra && b.extra.what ? ` (${b.extra.what})` : ""}.`,
+      S.local ? { label: "Open folder", fn: () => api("/longshot/open-folder", { method: "POST",
+        body: { which: "output", project: P().slug, subfolder: where.startsWith("in") ? `longshot/${P().slug}/Approved_Audio` : `longshot/${P().slug}/videos` } }).catch((e) => toast(e.message)) } : undefined);
   } else {
     const outputs = entry.outputs || {};
     let ls = outputs[b.built.nodes.longshot] || {};
@@ -2779,7 +2906,7 @@ async function finishIn(b, promptId, entry) {
       }
       renderViewer();
     }
-    loadSegStats().then(renderSettings);
+    loadSegStats().then(() => { renderSettings(); renderTakeStore(); });
     saveNow();                       // save right after every finished render
   } else scheduleSave();
   const ok = !failed && !stopped && !b.stopped && !S.error && !!entry;
@@ -2879,7 +3006,7 @@ function adoptRows(rows, sent, standalone = false) {
     sh.take = r.take;
     if (r.status !== "locked") sh.render_model = P().settings.model || null;   // 0.10.0: what made it
     sh.window = r.window_frames;
-    sh.take_seconds = Number(sh.seconds);
+    sh.take_seconds = Number(((sent || {})[sh.id] || {}).seconds ?? sh.seconds);   // 0.17.23: what it was rendered at
     // a Shot on auto stays on auto; the seed its take used is kept beside it
     sh.seed_used = r.seed !== null && r.seed !== undefined ? Number(r.seed) : effSeed(sh);
     if (r.status !== "locked") {
@@ -2889,7 +3016,7 @@ function adoptRows(rows, sent, standalone = false) {
       sh.context_at = sh.context_from ? Number(((sent || {})[sh.id] || {}).back) || 0 : null;   // 0.17.11: which frame of it
     }
     const was = (sent || {})[sh.id] || { text: sh.text, seconds: Number(sh.seconds) };
-    sh.rendered = { text: was.text, seconds: was.seconds, seed: Number(sh.shot_seed) };
+    sh.rendered = { text: was.text, seconds: was.seconds, seed: Number(was.seed ?? sh.shot_seed) };
     sh.edit_from = null;
     // a new take: standalone or continued (the first Shot has nothing before it either way)
     if (r.status !== "locked") sh.standalone = !!standalone && active()[0] !== sh;
@@ -2906,6 +3033,14 @@ function onRendered(targetId, standalone = false, opts = {}) {
     const video = combine ? (combine.gifs || combine.videos || [])[0] : null;
     if (combine && !video) throw new Error("Video Combine saved no file.");
     adoptRows(rows, sent, standalone);
+    // 0.17.24: a Shot that led into the Shot after: that one now carries on from it (its take stays)
+    for (const id of built.chain) {
+      const sh = shotById(id);
+      if (!sh || !sh.lead_in || !rows.some((r) => r.id === id && r.take)) continue;
+      const act = active(), nx = act[act.indexOf(sh) + 1];
+      if (nx && isRendered(nx) && (nx.join === "cut" || nx.join === "context")) { nx.join = "bridge"; nx.free_end = false; }
+      if (sh.join === "bridge") sh.lead_in = false;        // a Bridge now (a Lead in stays a Lead in)
+    }
 
     if (!opts.gaps) noteSeams(rows, built.chain, standalone);    // joins next to a left-out gap aren't real
     for (const s of P().shots) {
@@ -2983,36 +3118,25 @@ const refreshPreview = () => updatePreview();
 async function primary() {
   const rv0 = reviewShot(), nx0 = nextToRender();
   if (nx0 && jobFor(nx0.id)) { toast(`${titleOf(nx0)} is already in the queue.`); return; }
-  let alone = false;
-  if (nx0 && nx0.standalone) {
-    const mode = await askStandalone(nx0, "Render");
-    if (!mode) return;
-    alone = mode === "alone";
-  }
   const takes = nx0 ? await askMulti(titleOf(nx0)) : 1;
   if (!takes) return;
   const rv = reviewShot(), nx = nextToRender();
   if (rv !== rv0 || nx !== nx0) return;        // something changed while the dialog was open
   if (rv) { rv.status = "approved"; rv.was_approved = false; }
   if (!nx) { scheduleSave(); render(); return; }
-  enqueue({ type: "shot", target: nx.id, kind: "render", mode: nx.standalone ? (alone ? "alone" : "pinned") : "chain" }, takes);
+  // 0.17.23: every render button follows the Shot's chip (Bridge, Continuous, Context, Cut)
+  enqueue({ type: "shot", target: nx.id, kind: "render", mode: "chip" }, takes);
 }
 
 async function reroll() {
   const rv = reviewShot();
   if (!rv || inRenderGuard(rv)) return;
-  let alone = false;
-  if (rv.standalone) {
-    const mode = await askStandalone(rv, "Reroll");
-    if (!mode || reviewShot() !== rv) return;
-    alone = mode === "alone";
-  }
   const takes = await askMulti(titleOf(rv));
   if (!takes || reviewShot() !== rv || inRenderGuard(rv)) return;
   rememberTake(rv);
   reseed(rv);
   rv.status = "queued";
-  enqueue({ type: "shot", target: rv.id, kind: "reroll", mode: alone ? "alone" : "pinned" }, takes);
+  enqueue({ type: "shot", target: rv.id, kind: "reroll", mode: "chip" }, takes);      // 0.17.23: as its chip says
 }
 
 /** A Shot that's part of the run going now can't be changed until it ends. */
@@ -3184,6 +3308,7 @@ function onMessage(type, d) {
         b.step = d.max ? d.value / d.max : 0;
         b.stepV = d.value;
         b.stepMax = d.max;
+        noteSpeed(b, d);
         syncLive();
       }
       break;
@@ -3952,7 +4077,7 @@ function takeSong(name) {
  *  trim_in for length, and the song under it on the film (its move included). */
 function exportCut(s) {
   const L = LAYOUT.byId[s.id], w = takeWindow(s.id, s.take), out = {};
-  const e = effEdit(s);
+  const e0 = effEdit(s), e = Object.assign({}, e0, { in: e0.in > e0.auto ? e0.in : editOf(s).in });   // 0.17.26: not the film-only hide
   // 0.17.6: only a trim cuts the clip, and never the frames a Continuous Shot shares with
   // the Shot before (handy in an editor). A move cuts nothing: it places the song.
   if (L && w && (e.in || e.out)) {
@@ -4107,6 +4232,7 @@ async function exportApproved() {
           return it;
         }) } });
     exportedToast(r, skipped);
+    stemsForExport();
   } catch (e) { toast("Export failed: " + e.message); }
 }
 
@@ -4122,6 +4248,7 @@ async function exportDone(b, outputs) {
   try {
     const r = await api(`/longshot/approved/${encodeURIComponent(P().slug)}`, { method: "POST", body: { mode: "mux", items, sig: b.extra.sig || null } });
     exportedToast(r, b.extra.skipped, b.extra.kept);
+    stemsForExport();
   } catch (e) { S.error = "Finishing the export failed: " + e.message; }
 }
 
@@ -4171,7 +4298,7 @@ function buildTL() {
     // takes each gives up half of the shared frames, so the length matches the film.
     for (let i = 1; i < entries.length; i++) {
       const a = entries[i - 1], b = entries[i];
-      if (a.kind !== "take" || b.kind !== "take" || isCut(b)) continue;
+      if (a.kind !== "take" || b.kind !== "take" || isCut(b) || afterCutaway(shotById(b.id) || {})) continue;
       const h = Math.min(half, a.dur / 3, b.dur / 3);
       a.dur -= h;
       b.off += h;
@@ -4233,7 +4360,7 @@ function placeOnFilm(act, entries) {
     else off = e.off;                                 // a piece of the last stitched video, or a gap
     // two takes joined Continuous: switch halfway through the frames they share
     const pv = list.length ? list[list.length - 1] : null;
-    if (pv && pv.e.kind === "take" && e.kind === "take" && !isCut(s) && pv.s === act[i - 1]) {
+    if (pv && pv.e.kind === "take" && e.kind === "take" && !isCut(s) && !afterCutaway(s) && pv.s === act[i - 1]) {
       pv.fb -= half;
       fa -= half;
       off -= half / fps;
@@ -5089,6 +5216,7 @@ function render() {
   renderRefine();
   renderFace();
   renderPlan();
+  renderTakeStore();
   renderQueue();
 }
 
@@ -5690,15 +5818,26 @@ const CHIP_HELP = {
   context: "a hard cut; the last frame of the Shot before goes in as a reference picture (same characters, place and light).",
   from: "continues from the end of the Shot before; its end is free.",
   pending: "continues from the Shot before in Render all. ▶ on this Shot alone pins it to the rendered Shots next to it (approved or under review; one still rendering is waited for); with none rendered yet it renders on its own.",
-  into: "a fresh start that flows into the start of the Shot after.",
+  into: "a fresh start that leads into the start of the Shot after (its end is pinned to that Shot's first frames).",
+  lead: "a fresh start (nothing from the Shot before) that leads into the start of the Shot after: its end is pinned to that Shot's first frames. If that Shot starts with a Cut, it carries on from this one once it's rendered (its take stays).",
+  cutaway: "B-roll: a hard cut, with the last frame of the Shot before as a reference picture (like Context). The Shot after it continues from the Shot before the cutaway, as if it weren't there.",
+  bridgeIn: "pinned at both ends: flows from the Shot before into the Shot after, though that one starts with a Cut. Once it's rendered, the Shot after carries on from it (its take stays).",
   bridge: "pinned at both ends: flows from the Shot before into the Shot after.",
 };
 function chipKey(s) {
   const j = chipJoin(s);
   if (j === "from") return "from";
+  if (j === "lead" || j === "bridgeIn") return j;
   if (j !== "bridge") return j;
   const { prev, next } = chipSides(s);
   return prev && next ? "bridge" : prev ? "from" : next ? "into" : "pending";
+}
+
+/** 0.17.26: on the Shot after a cutaway: which Shot it picks up from. */
+function acrossFlag(s) {
+  if (!afterCutaway(s) || isCut(s)) return "";
+  const act = active(), pv = mainPrev(act, act.indexOf(s));
+  return pv ? `<span class="flag" title="Continues from ${esc(titleOf(pv))}, across the cutaway (B-roll) before it. Its first frames, the ones it shares with ${esc(titleOf(pv))}, are hidden on the film so the cut back is clean; exported clips keep them.">↺ from ${esc(titleOf(pv))}</span>` : "";
 }
 
 /** The always-visible row of a (generated) Shot card: status, title, preview, tools. */
@@ -5731,7 +5870,12 @@ function shotRowHTML(s) {
     ? `<span class="flag edited" title="Rendering with:\n${esc(sentText)}">✎ Prompt changed · not in this render</span>`
     : s.status !== "queued" && !s.bypassed && promptOnlyChanged(s)
       ? `<span class="flag edited" title="This take was rendered with:\n${esc(s.rendered.text)}\n\nChange the text back to that, or Re-render.">✎ Prompt changed since this take</span>` : "";
-  const promptBtn = sentText === null && s.status !== "queued" && !s.bypassed && promptOnlyChanged(s)
+  // 0.17.23: length or seed changed while it rendered: the take stays for review, flagged
+  const lsDiff = s.status !== "queued" && !s.bypassed && s.kind !== "clip" && s.rendered && !inRender(s) ? [
+    Number(s.seconds) !== Number(s.rendered.seconds) ? `length ${Number(s.rendered.seconds)} s → ${Number(s.seconds)} s` : "",
+    Number(s.shot_seed) !== Number(s.rendered.seed) ? `seed ${Number(s.rendered.seed) < 0 ? "auto" : s.rendered.seed} → ${Number(s.shot_seed) < 0 ? "auto" : s.shot_seed}` : ""].filter(Boolean) : [];
+  const lsFlag = lsDiff.length ? `<span class="flag edited" title="Changed while it rendered: ${esc(lsDiff.join(", "))}. This take was made with the old ${lsDiff.length > 1 ? "values" : "value"}; Re-render to use the new ${lsDiff.length > 1 ? "ones" : "one"}.">✎ ${lsDiff.map((x) => x.split(" ")[0]).join(" & ")} changed since this take</span>` : "";
+  const promptBtn = sentText === null && s.status !== "queued" && !s.bypassed && (promptOnlyChanged(s) || lsDiff.length)
     ? `<button class="ghost sm bridge" data-action="context-redo" title="Render ${title} again in place with the new prompt (the Shots around it keep their takes)">Re-render</button>` : "";
   const standaloneTag = !cut && s.standalone && s.status !== "queued" && !s.bypassed
     ? '<span class="flag standalone" title="Rendered on its own, from the references. The Shot before it bridges into it.">standalone</span>' : "";
@@ -5747,7 +5891,7 @@ function shotRowHTML(s) {
   // the join chip: how ▶ renders it, from the rendered Shots next to it
   const actR = active(), prevR = !s.bypassed ? actR[actR.indexOf(s) - 1] : null;
   const cj = chipJoin(s), opts = chipOptions(s);
-  const icon = { bridge: "↔", from: "→", context: "⧉", cut: "|" }[cj];
+  const icon = { bridge: chipSides(s).prev || !chipSides(s).next ? "↔" : "↘", lead: "↘", bridgeIn: "↔", cutaway: "⤵", from: "→", context: "⧉", cut: "|" }[cj];
   const joinChip = !s.bypassed && s.kind !== "clip"
     ? `<button class="join-chip j-${esc(cj)}${opts.length < 2 ? " only" : ""}" data-action="cycle-join" title="${esc(chipName(s) + ": " + CHIP_HELP[chipKey(s)])}${
       (() => { const nb = chipNear(s), odd = [nb.prev, nb.next].filter(otherSize);
@@ -5772,7 +5916,7 @@ function shotRowHTML(s) {
           <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span></span>
         </button>
         <div class="shot-tools">
-          ${promptFlag}${promptBtn}${joinChip}${ctxBtn}
+          ${promptFlag}${lsFlag}${acrossFlag(s)}${promptBtn}${joinChip}${ctxBtn}
           ${canReroll ? `<button class="icon lg reroll" data-action="reroll-shot" title="Reroll ${title} (new seed)" aria-label="Reroll ${title}">⟳</button>` : ""}
           <button class="icon lg${s.bypassed ? " on" : ""}" data-action="bypass-shot" aria-pressed="${s.bypassed}" title="${s.bypassed ? "Turn shot back on" : "Bypass shot"}">${POWER}</button>
           <button class="icon lg x" data-action="remove-shot" title="Remove" aria-label="Remove ${title}">${CROSS}</button>
@@ -6247,7 +6391,7 @@ function renderShots() {
     const open = S.open === s.id;
     const canReroll = !s.bypassed && s.status === "approved" && (!!s.take || !!lastRowFor(s.id));
     const takes = !s.bypassed && s.status !== "queued" ? takeNav(s) : "";
-    const ro = inRender(s) ? ' readonly title="Part of the render in progress; edit it when it finishes"' : "";
+    const ro = "";      // 0.17.23: length and seed can change mid-render (the render keeps what it started with)
     const body = open ? `<div class="shot-body">
         <textarea class="field fit" data-shot-field="text" rows="3" aria-label="${title} text">${esc(s.text)}</textarea>
         <div class="shot-opts">
@@ -6399,6 +6543,11 @@ function renderViewer() {
   const vsrOk = !S.opts || !S.opts.nodes || S.opts.nodes.RTXVideoSuperResolution !== false;
   $("tl-export-up").checked = vsrOk && !!P().settings.export_upscale;
   $("tl-export-up").disabled = !vsrOk;
+  // 0.17.28: Stems (dialogue + SFX) with the export and the final
+  const stOk = stemsReady();
+  $("tl-export-stems").checked = stOk && !!P().settings.stems;
+  $("tl-export-stems").disabled = !stOk;
+  $("tl-export-stems").closest("label").title = stOk ? "Also split each exported clip's sound into its dialogue and the rest (sound effects, ambience): Approved_Audio/Dialogue/<clip>_dialogue.wav and Approved_Audio/SFX/<clip>_sfx.wav, same length (MelBand RoFormer)." : stemsWhy();
   // loop band + note
   const L = loopRange();
   const band = $("loop-band"), note = $("loop-note");
@@ -6477,10 +6626,12 @@ function renderDecision() {
   const allDone = !rv && !nx && active().length > 0;
   const vsrOk = !S.opts || !S.opts.nodes || S.opts.nodes.RTXVideoSuperResolution !== false;
   const fin = finalState();
+  const finN = finalState(false);
   if (allDone) {
-    line = fin ? `All shots approved. Final video saved: ${fin.video.filename}`
-      : vsrOk ? "All shots approved. Upscale the final video, or add a shot to keep going."
-        : "All shots approved. Install ComfyUI-NVIDIA-RTX-VSR-Pro to upscale the final video.";
+    const saved = [finN, fin].filter(Boolean).map((x) => x.video.filename);
+    line = saved.length ? `All shots approved. Final video saved: ${saved.join(" · ")}`
+      : vsrOk ? "All shots approved. Output the final video (native size or upscaled), or add a shot to keep going."
+        : "All shots approved. Output the final video, or add a shot to keep going. (Install ComfyUI-NVIDIA-RTX-VSR-Pro to upscale it too.)";
   }
   const v = P().settings.rtx_vsr;
   // the timeline shows every take; the exact stitched video is Update preview's
@@ -6497,11 +6648,10 @@ function renderDecision() {
     mainAction = "approve-next";
   } else if (rv && nx) { mainLabel = `✓ Approve & render ${titleOf(nx)}`; mainAction = "primary"; }
   else if (rv && stale) { mainLabel = "✓ Approve & update preview"; mainAction = "primary"; }
-  else if (rv && vsrOk) { mainLabel = `✓ Approve & upscale final (${v.scale}×)`; mainAction = "approve-final"; }
-  else if (rv) { mainLabel = "✓ Approve & finish"; mainAction = "primary"; }
+  else if (rv) { mainLabel = "✓ Approve & output final"; mainAction = "approve-final"; }
   else if (nx) { mainLabel = "▶ Render " + titleOf(nx) + (nx.standalone && !pinnedNote(nx) ? " on its own" : ""); mainAction = "primary"; }
   else if (stale) { mainLabel = "▶ Update preview"; mainAction = "primary"; }
-  else if (allDone && vsrOk) { mainLabel = `⤢ Upscale final video (${v.scale}× ${v.quality})${fin ? " again" : ""}`; mainAction = "final"; }
+  else if (allDone) { mainLabel = `Output final${finN ? " again" : ""}`; mainAction = "final"; }
   else { mainLabel = "All done"; mainAction = "primary"; mainOff = true; }
   const off = missing.length > 0;
   const nxJob = nx && jobFor(nx.id), rvJob = rv && jobFor(rv.id);
@@ -6510,14 +6660,23 @@ function renderDecision() {
     if (mainAction === "primary" && nx) mainOff = true;
   }
   if (rvJob) line = `${titleOf(rv)} has more takes in the queue (${rvJob.state === "running" ? "rendering" : "#" + jobPos(rvJob)}). Review them when they're done.`;
-  if (mainAction === "final" && Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "final")) mainOff = true;
+  const finQueued = (up) => Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "final" && (j.spec.up !== false) === up);
+  if (mainAction === "final" && finQueued(false)) mainOff = true;
+  // 0.17.27: the final, two ways: native size (left) and upscaled with RTX (right)
+  const split = (mainAction === "final" || mainAction === "approve-final") && vsrOk;
+  const upLabel = mainAction === "approve-final" ? `✓ Approve & output ${v.scale}× upscale` : `Output final ${v.scale}× upscale${fin ? " again" : ""}`;
   if (S.conn !== "ok") line = "ComfyUI isn't connected. Renders you start wait in the queue until it's back.";
-  const sub = [rv ? takeNav(rv) : "",
+  const stemsBox = split || mainAction === "final" || mainAction === "approve-final"
+    ? `<label class="dec-stems" title="${esc(stemsReady() ? "Also split the final video's sound into its dialogue and the rest (sound effects, ambience): <name>_dialogue.wav and <name>_sfx.wav next to it (MelBand RoFormer)." : stemsWhy())}"><input type="checkbox" data-stems${stemsReady() && P().settings.stems ? " checked" : ""}${stemsReady() ? "" : " disabled"}> Stems <span class="muted">· dialogue + SFX WAVs</span></label>` : "";
+  const sub = [rv ? takeNav(rv) : "", stemsBox,
     thr ? `<button class="ghost sm through" data-action="render-through"${off ? " disabled" : ""}>⟳ Re-render through ${esc(titleOf(thr))}</button>` : ""].filter(Boolean).join("");
   el.innerHTML = `${errBox}<div class="dec-line">${esc(line)}</div>
     <div class="dec-row3">
       <button class="ghost approve" data-action="approve" title="Approve ${esc(titleOf(rv))} without rendering anything"${!rv || off ? " disabled" : ""}>✓ Approve</button>
-      <button class="primary go" data-action="${mainAction}"${mainOff || off ? " disabled" : ""}>${esc(mainLabel)}</button>
+      ${split ? `<span class="go-split">
+        <button class="primary go" data-action="${mainAction}" data-up="0"${mainOff || off ? " disabled" : ""} title="The joined film at its own size (no upscale), saved as the final${P().settings.prores_master ? ", with the ProRes master" : ""}">${esc(mainLabel)}</button>
+        <button class="primary go" data-action="${mainAction}" data-up="1"${(mainAction === "final" && finQueued(true)) || off ? " disabled" : ""} title="Upscaled with RTX Super Resolution (${esc(v.scale)}× ${esc(v.quality)}, from Settings)${P().settings.prores_master ? ", with the ProRes master" : ""}">${esc(upLabel)}</button>
+      </span>` : `<button class="primary go" data-action="${mainAction}"${mainAction === "approve-final" ? ' data-up="0"' : ""}${mainOff || off ? " disabled" : ""}>${esc(mainLabel)}</button>`}
       <button class="ghost" data-action="reroll" title="Reroll ${esc(titleOf(rv))}"${!rv || off || rvJob ? " disabled" : ""}>⟳ Reroll</button>
     </div>${sub ? `<div class="dec-sub">${sub}</div>` : ""}`;
   layoutStage();
@@ -7064,7 +7223,14 @@ function renderSettings() {
     <div class="out-files">
       <div class="muted small">Videos are saved in output/longshot/${esc(P().slug)}/videos.</div>
     </div>
-    <div class="seg-store">
+    `;
+}
+
+/** 0.17.23: the saved takes (and deleting them) sit in the Plan panel. */
+function renderTakeStore() {
+  const el = $("plan-takes");
+  if (!el || !P()) return;
+  el.innerHTML = `<div class="seg-store">
       <span class="grow">Saved takes: ${S.segStats ? `${S.segStats.files} file${S.segStats.files === 1 ? "" : "s"} · ${(S.segStats.bytes / 1048576).toFixed(1)} MB` : "—"}
         <span class="muted"> · output/longshot/${esc(P().slug)}/takes</span></span>
       <span class="seg-btns">
@@ -8012,7 +8178,7 @@ document.addEventListener("click", async (e) => {
       }
       break;
     }
-    case "approve-final": { const rv = reviewShot(); if (rv) { rv.status = "approved"; rv.was_approved = false; } upscaleFinal(); break; }
+    case "approve-final": { const rv = reviewShot(); if (rv) { rv.status = "approved"; rv.was_approved = false; } upscaleFinal(el.dataset.up !== "0"); break; }
     case "bridge": bridgeShot(shotOf(el)); break;
     case "render-alone": renderAloneAction(shotOf(el)); break;
     case "clear-render": clearRender(shotOf(el)); break;
@@ -8338,7 +8504,7 @@ document.addEventListener("click", async (e) => {
     case "mute": toggleMute(); break;
     case "vsr-on": p.settings.rtx_vsr.on = !p.settings.rtx_vsr.on; commit(); break;
     case "clip-pixels": p.settings.clip_pixels = !p.settings.clip_pixels; commit(); break;
-    case "final": upscaleFinal(); break;
+    case "final": upscaleFinal(el.dataset.up !== "0"); break;
     case "audio-route": {
       if (setupGuard()) return;
       const k = el.dataset.key;
@@ -8549,6 +8715,7 @@ document.addEventListener("change", async (e) => {
     return commit();
   }
   if (el.id === "tl-export-up") { p.settings.export_upscale = el.checked; return commit(); }
+  if (el.id === "tl-export-stems" || el.dataset.stems !== undefined) { p.settings.stems = el.checked; return commit(); }   // 0.17.28
   if (el.id === "live-preview") { setLive(el.checked); return; }
   if (el.dataset.anchorFile !== undefined) {
     const k = el.closest("[data-anchor]");
@@ -8596,7 +8763,25 @@ document.addEventListener("change", async (e) => {
   }
   if (el.dataset.shotField) {
     const s = shotOf(el);
-    if (inRender(s)) { scheduleSave(); return; }    // 0.17.7: the render keeps what it started with; the card flags the change
+    if (inRender(s)) {
+      // 0.17.7 / 0.17.23: the render keeps what it started with; the card flags the change when
+      // its take lands, and nothing renders again on its own
+      const k0 = el.dataset.shotField;
+      if (S.bad[s.id + ":" + k0]) {
+        delete S.bad[s.id + ":" + k0];
+        if (k0 === "seconds") el.value = s.seconds;
+        else if (k0 === "shot_seed") el.value = s.shot_seed < 0 ? "" : s.shot_seed;
+      }
+      if (k0 === "seconds" && S.lenBase && S.lenBase.id === s.id) {
+        const before = s.seconds, note = fitLength(s, S.lenBase.by);
+        S.lenBase = null;
+        if (s.seconds !== before) el.value = s.seconds;
+        if (note) toast(note);
+      }
+      scheduleSave();
+      renderShots();
+      return;
+    }
     // The value is already in the project (typing commits it, item 9). Leaving
     // the field only tidies an unfinished number; it never rebuilds the page,
     // so a click on Render right from the field lands the first time (item 10).
@@ -9621,7 +9806,9 @@ function stepShotSeed(s, d) {
   let cur = Number(s.shot_seed);
   if (!(cur >= 0)) cur = hasSeed(s.seed_used) ? Number(s.seed_used)
     : hasSeed(s.seed_pending) ? Number(s.seed_pending) : Number(P().settings.seed) || 0;
-  useSeed(s, Math.max(0, Math.min(SEED_MAX, cur + d)));
+  const v = Math.max(0, Math.min(SEED_MAX, cur + d));
+  if (inRender(s)) { s.shot_seed = v; commit(); return; }     // 0.17.23: flagged when its take lands
+  useSeed(s, v);
 }
 
 async function changeBaseSeed(el) {
@@ -10131,6 +10318,47 @@ async function pollStats() {
   statsTimer = setTimeout(pollStats, 2000);
 }
 
+// 0.17.23: inference speed (seconds per sampling step) in the top bar, left of RAM: live while
+// a render samples, the last render's when idle (greyed)
+const SPEED = { live: null, last: null, info: "", lastInfo: "" };
+function noteSpeed(b, d) {
+  const now = performance.now(), v = Number(d.value) || 0;
+  if (!b.spd) b.spd = { v: null, t: 0, all: [] };
+  const sp = b.spd;
+  if (sp.v !== null && v === sp.v + 1 && sp.t) {
+    const dt = (now - sp.t) / 1000;
+    if (dt > 0 && dt < 3600) {
+      sp.all.push(dt);
+      const recent = sp.all.slice(-5).sort((x, y) => x - y);
+      SPEED.live = recent[Math.floor(recent.length / 2)];
+    }
+  }
+  sp.v = v; sp.t = now;
+  const sh = b.target && shotById(b.target), m = P() ? shortModel(P().settings.model || "") : "";
+  SPEED.info = [sh ? titleOf(sh) : b.label, b.built && b.built.width ? `${b.built.width}×${b.built.height}` : "",
+    d.max ? `${d.max} steps` : "", m].filter(Boolean).join(" · ");
+  renderSpeed();
+}
+function speedDone(b) {
+  const all = b && b.spd ? b.spd.all : [];
+  if (all.length) {
+    const xs = all.slice().sort((x, y) => x - y);
+    SPEED.last = xs[Math.floor(xs.length / 2)];
+    SPEED.lastInfo = SPEED.info;
+  }
+  SPEED.live = null;
+  renderSpeed();
+}
+function renderSpeed() {
+  const el = $("speedstat");
+  if (!el) return;
+  const live = S.busy && SPEED.live !== null, v = live ? SPEED.live : SPEED.last;
+  el.hidden = v === null || v === undefined;
+  if (el.hidden) return;
+  const txt = v >= 1 ? `${v.toFixed(1)} s/it` : `${(1 / v).toFixed(2)} it/s`;
+  el.innerHTML = `<span class="stat speed${live ? " live" : " idle"}" title="${esc((live ? "Sampling speed now (median of the last steps)" : "The last render's sampling speed") + ((live ? SPEED.info : SPEED.lastInfo) ? " · " + (live ? SPEED.info : SPEED.lastInfo) : ""))}">${live ? "" : "last "}<b>${txt}</b></span>`;
+}
+
 function renderStats(d) {
   S.sys = d;
   const el = $("sysstats");
@@ -10574,8 +10802,10 @@ function cycleJoin(s) {
   }
   const wasJ = chipJoin(s), was = chipName(s, wasJ);
   const nextJ = order[(order.indexOf(wasJ) + 1) % order.length];
-  s.join = nextJ === "from" ? "bridge" : nextJ;      // 0.17.14: "from" is Continuous with a free end
+  s.join = nextJ === "from" || nextJ === "bridgeIn" ? "bridge" : nextJ === "lead" ? "cut" : nextJ === "cutaway" ? "context" : nextJ;   // 0.17.14: "from" is Continuous with a free end
+  s.cutaway = nextJ === "cutaway";                    // 0.17.26
   s.free_end = nextJ === "from";
+  s.lead_in = nextJ === "lead" || nextJ === "bridgeIn";    // 0.17.24 / 0.17.25
   const name = { [s.join]: chipName(s, nextJ) };
   P().preview_dirty = true;
   S.dry = null;
@@ -10801,15 +11031,9 @@ function bridgeShot(s) {
 async function rerollShot(s) {
   if (!s || inRenderGuard(s)) return;
   if (jobFor(s.id)) { toast(`${titleOf(s)} is already in the queue.`); return; }
-  let alone = false;
-  if (s.standalone) {
-    const mode = await askStandalone(s, "Reroll");
-    if (!mode) return;
-    alone = mode === "alone";
-  }
   const takes = await askMulti(titleOf(s));
   if (!takes || inRenderGuard(s)) return;
-  if (!s.standalone) {
+  if (chipSides(s).next && chipJoin(s) === "bridge") {
     const after = renderedAfter(s);
     if (after.length) {
       const a = numOf(after[0].id), z = numOf(after[after.length - 1].id);
@@ -10827,8 +11051,8 @@ async function rerollShot(s) {
   s.status = "queued";
   s.was_approved = false;
   S.dry = null;
-  // standalone pinned: in place, and it stops being standalone; on its own: a fresh start
-  enqueue({ type: "shot", target: s.id, kind: "reroll", mode: alone ? "alone" : "pinned" }, takes);
+  // 0.17.23: as its chip says (Bridge: pinned to both sides; Continuous: from the Shot before; Cut / Context: fresh)
+  enqueue({ type: "shot", target: s.id, kind: "reroll", mode: "chip" }, takes);
 }
 
 function useSeed(s, seed) {
@@ -10840,31 +11064,82 @@ function useSeed(s, seed) {
 }
 
 /** The saved final video, when it matches the current approved chain and settings. */
-function finalState() {
-  const f = P().final_output, lo = last();
+/** 0.17.28, Stems: the MelBand RoFormer model for splitting dialogue from the rest (the Audio
+ *  panel's choice when ComfyUI has it, else the one MelBand file in diffusion_models). */
+function stemsModel() {
+  const list = (S.opts && S.opts.melband) || [];
+  const want = P() && P().audio && P().audio.melband_model;
+  const hit = want && matchModel(want, list);
+  if (hit) return typeof hit === "string" ? hit : want;
+  return list.find((n) => /mel.?band.*roformer/i.test(n)) || list.find((n) => /roformer/i.test(n)) || null;
+}
+const stemsReady = () => !!stemsModel() && !(S.opts && S.opts.nodes && S.opts.nodes.MelBandRoFormerSampler === false);
+function stemsWhy() {
+  if (S.opts && S.opts.nodes && S.opts.nodes.MelBandRoFormerSampler === false) return "Stems need the ComfyUI-MelBandRoFormer nodes (Kijai).";
+  if (!stemsModel()) return "Stems need MelBandRoformer_fp16.safetensors (Kijai) in models/diffusion_models.";
+  return "";
+}
+/** Queue the stems of these files (paths inside the project's output folder). */
+/** items: [{source, dx, fx}] (stems without .wav), or bare source paths (stems next to them). */
+async function queueStems(items, what) {
+  if (!P() || !P().settings.stems || !items.length) return;
+  if (!stemsReady()) { toast(stemsWhy()); return; }
+  const all = items.map((x) => typeof x === "string"
+    ? { source: x, dx: x.replace(/(-audio)?\.(mp4|mov|wav)$/i, "") + "_dialogue", fx: x.replace(/(-audio)?\.(mp4|mov|wav)$/i, "") + "_sfx" } : x);
+  // 0.17.29: only the files whose stems are missing or came from another version of the clip
+  let todo = all;
+  try { todo = (await api(`/longshot/stems/${encodeURIComponent(P().slug)}`, { method: "POST", body: { mode: "todo", items: all } })).todo || []; }
+  catch (e) { /* older server: split them all */ }
+  if (!todo.length) { toast(`Stems are up to date (${all.length} file${all.length === 1 ? "" : "s"}).`); return; }
+  // 0.17.31: in jobs of up to 32 files (one run splits at most 64)
+  const label = todo.length < all.length ? `${what} · ${todo.length} of ${all.length} changed` : what;
+  const per = 32, parts = Math.ceil(todo.length / per);
+  const specs = [];
+  for (let k = 0; k < parts; k++) {
+    specs.push({ type: "stems", items: todo.slice(k * per, (k + 1) * per), what: parts > 1 ? `${label} · part ${k + 1} of ${parts}` : label });
+  }
+  enqueue(specs);
+}
+/** After an export of approved clips: their stems (every clip in Approved_Clips). */
+function stemsForExport() {
+  if (!P() || !P().settings.stems) return;
+  // 0.17.30: into Approved_Audio/Dialogue and Approved_Audio/SFX, named like their clips
+  const root = `longshot/${P().slug}`;
+  queueStems(approvedForExport().map((x) => ({ source: `${root}/Approved_Clips/${x.name}.mp4`,
+    dx: `${root}/Approved_Audio/Dialogue/${x.name}_dialogue`, fx: `${root}/Approved_Audio/SFX/${x.name}_sfx` })), "approved clips");
+}
+
+/** The saved final video, when it matches the current approved chain (and, upscaled, the
+ *  scale and quality). 0.17.27: up = the upscaled one; false = Output final at native size. */
+function finalState(up = true) {
+  const f0 = P().final_output, lo = last();
+  const f = f0 && (up ? (f0.up === false ? f0.other : f0) : (f0.up === false ? f0 : f0.other));
   if (!f || !f.video || !lo) return null;
   const v = P().settings.rtx_vsr;
   const chain = active().map((s) => s.id);
   return JSON.stringify(f.chain) === JSON.stringify(chain) && f.source_at === lo.source_at
-    && f.scale === v.scale && f.quality === v.quality ? f : null;
+    && (!up || (f.scale === v.scale && f.quality === v.quality)) ? f : null;
 }
 
-function upscaleFinal() {
+function upscaleFinal(up = true) {
   if (!active().length) return;
   if (mixedSizeGuard("The final video")) return;
-  if (Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "final")) { toast("Upscale final video is already in the queue."); return; }
+  if (Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "final" && (j.spec.up !== false) === up)) {
+    toast(`${up ? "Output final (upscaled)" : "Output final"} is already in the queue.`); return;
+  }
   scheduleSave();
-  enqueue({ type: "final" });
+  enqueue({ type: "final", up });
 }
 
 /** Upscale final video's run options, for the queue. */
-function finalOpts() {
+function finalOpts(up = true) {
   const act = active();
   if (!act.length) return null;
   const v = P().settings.rtx_vsr;
   const target = act[act.length - 1].id;
-  return { upto: target, kind: "final", final: true, label: `Upscaling final video · ${v.scale}× ${v.quality}`,
-    note: "Every Shot loads its saved take; decoding, upscaling and saving",
+  return { upto: target, kind: "final", final: true, finalUp: up,
+    label: up ? `Output final · ${v.scale}× ${v.quality} upscale` : "Output final · native size",
+    note: up ? "Every Shot loads its saved take; decoding, upscaling and saving" : "Every Shot loads its saved take; decoding and saving (no upscale)",
     onDone: ({ rows, text, outputs, built }) => {
       const combine = outputs[built.nodes.combine] || {};
       const video = (combine.gifs || combine.videos || [])[0];
@@ -10873,12 +11148,17 @@ function finalOpts() {
       const source_at = lo ? lo.source_at : null;
       const pr = built.nodes.prores ? outputs[built.nodes.prores] || {} : {};
       const master = (pr.gifs || pr.videos || [])[0] || null;
-      P().final_output = { video, master, chain: built.chain, scale: v.scale, quality: v.quality,
+      // 0.17.27: the native and the upscaled final are kept side by side (the other one in .other)
+      const rec = { video, master, chain: built.chain, up, scale: up ? v.scale : 1, quality: up ? v.quality : null,
         source_at, at: new Date().toISOString() };
+      const prev = P().final_output;
+      const other = prev ? ((prev.up !== false) !== up ? Object.assign({}, prev, { other: undefined }) : prev.other || null) : null;
+      P().final_output = Object.assign(rec, { other });
       P().last_output = Object.assign({}, lo || {}, { video, plan: rows, chain: built.chain, text,
         size: [built.width, built.height], source_at, video_plan: rows, video_chain: built.chain });
       loadVideo(0);
       toast(`Final video saved as ${video.filename}` + (master ? ` and the ProRes master as ${master.filename}.` : "."));
+      queueStems([`${video.subfolder ? video.subfolder + "/" : ""}${video.filename}`], "final video");
     } };
 }
 

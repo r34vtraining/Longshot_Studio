@@ -1330,12 +1330,15 @@ def register(routes=None):
                 built = gb.build_refine_try(project, body["refine_try"], env=current_env())
             elif isinstance(body.get("face_try"), dict):
                 built = gb.build_face_try(project, body["face_try"], env=current_env())
+            elif isinstance(body.get("stems"), dict):
+                built = gb.build_stems(project, body["stems"], env=current_env())
             elif isinstance(body.get("export_clips"), list):
-                built = gb.build_clip_export(project, body["export_clips"][:64], env=current_env())
+                built = gb.build_clip_export(project, body["export_clips"][:256], env=current_env())
             else:
                 built = gb.build_prompt(project, upto=body.get("upto"),
                                         dry_run=bool(body.get("dry_run")), env=current_env(),
                                         final=bool(body.get("final")),
+                                        final_upscale=body.get("final_upscale") is not False,
                                         standalone=bool(body.get("standalone")),
                                         clips_for=body.get("clips_for") if isinstance(body.get("clips_for"), list) else None,
                                         chunk=body.get("chunk") if isinstance(body.get("chunk"), dict) else None)
@@ -1835,6 +1838,26 @@ def register(routes=None):
             return error(str(err), 500)
         return web.json_response({"files": names, "subfolder": pj.approved_subfolder(slug)})
 
+    @routes.post("/longshot/stems/{slug}")
+    async def stems_route(request):
+        """0.17.29/0.17.30: {mode: "todo", items: [{source, dx, fx}]} → the items whose stems
+        need splitting (missing or split from another version); {mode: "done", items} records them."""
+        import folder_paths
+        slug, body = slug_of(request), await body_of(request)
+        raw = body.get("items") if isinstance(body, dict) and isinstance(body.get("items"), list) else \
+            (body.get("sources") if isinstance(body, dict) else None)
+        if not slug or not isinstance(raw, list):
+            return error("Send {mode, items}.")
+        out_dir, sources = folder_paths.get_output_directory(), [x for x in raw[:2000] if isinstance(x, (str, dict))]
+        loop = asyncio.get_running_loop()
+        if body.get("mode") == "todo":
+            todo = await loop.run_in_executor(None, lambda: pj.stems_todo(out_dir, slug, sources))
+            return web.json_response({"todo": todo})
+        if body.get("mode") == "done":
+            n = await loop.run_in_executor(None, lambda: pj.stems_done(out_dir, slug, sources))
+            return web.json_response({"recorded": n})
+        return error("mode must be todo or done.")
+
     @routes.post("/longshot/chunks/{slug}/discard")
     async def discard_chunks(request):
         """Remove the chunks of an upscale that was stopped or failed."""
@@ -1874,7 +1897,7 @@ def register(routes=None):
         try:
             index = await asyncio.get_running_loop().run_in_executor(
                 None, pj.cut_clips, folder_paths.get_output_directory(), slug, body.get("video") or {},
-                body["rows"][:64], run, ffmpeg)
+                body["rows"][:256], run, ffmpeg)
         except ValueError as err:
             return error(err)
         return web.json_response(index)
@@ -1902,7 +1925,7 @@ def register(routes=None):
             except (OSError, subprocess.SubprocessError):
                 return False
         index = await asyncio.get_running_loop().run_in_executor(
-            None, pj.adopt_clips, folder_paths.get_output_directory(), slug, body["items"][:64], probe, thumb)
+            None, pj.adopt_clips, folder_paths.get_output_directory(), slug, body["items"][:256], probe, thumb)
         return web.json_response(index)
 
     @routes.post("/longshot/clear-cache")
@@ -1983,7 +2006,7 @@ def register(routes=None):
 
         def work():
             out = {}
-            for key in [str(k) for k in body["keys"][:64]]:
+            for key in [str(k) for k in body["keys"][:256]]:
                 if not pj.CLIP_KEY_RE.fullmatch(key):
                     continue
                 path = os.path.join(clips_dir, key + ".mp4")
