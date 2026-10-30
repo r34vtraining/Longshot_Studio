@@ -8,7 +8,7 @@ ComfyUI at `/longshot`. Build a film from short Shots, review and approve each o
 Studio stitches them into one continuous take or a cut sequence. Approved work is never
 thrown away.
 
-<img width="1668" height="1315" alt="image" src="https://github.com/user-attachments/assets/bc06fc37-8c56-4195-be8a-67dc8fd175a0" />
+<img width="1664" height="1391" alt="image" src="https://github.com/user-attachments/assets/1bbec1f2-a77c-4f08-bf14-9012c3430b23" />
 
 ## Features
 
@@ -35,14 +35,17 @@ thrown away.
 - Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
 
-## What's new in 0.17.22
+## What's new in 0.17.32
 
-1. Added Grouping Folders for different scenes.  
-2. Minor timeline UI adjustments for ease of use (see above UI image for stacking timeline for creating overlapping handles for clips)
-3. Blank shots in timeline can now be stretched in the timeline itself to adjust shot length.  Move the blank shots to overlap previous shots.  
-4. Minor shot box UI adjustments for alignment
-5. Minor overall UI adjustments
-
+1. Group folders, you can now group your shots by scenes, act, etc.  One button to restore all the reference that was used for that group.  
+2. Audio separation.  Didn't matter too much with a music video, but with a short film the dialogue and sfx often clash, so a stems detector will output .wav files for both dialogue and sfx separately.  
+3. Added more options for consecutive shots.  
+Cut (a hard cut shot)
+Context (a shot that takes the last frame of the previous shot as a reference)
+Bridge (connect 2 shots together)
+Lead In (transition into a shot after it)
+Cutaway (a context shot that connects to the previous shot but is not seen by the following shot, mainly used for B-roll shots)
+Continuous (making longer and longer continuous shot)
 
 ## What's new in 0.17.0
 
