@@ -40,12 +40,12 @@ thrown away.
 1. Group folders, you can now group your shots by scenes, act, etc.  One button to restore all the reference that was used for that group.  
 2. Audio separation.  Didn't matter too much with a music video, but with a short film the dialogue and sfx often clash, so a stems detector will output .wav files for both dialogue and sfx separately.  
 3. Added more options for consecutive shots.  
-Cut (a hard cut shot)
-Context (a shot that takes the last frame of the previous shot as a reference)
-Bridge (connect 2 shots together)
-Lead In (transition into a shot after it)
-Cutaway (a context shot that connects to the previous shot but is not seen by the following shot, mainly used for B-roll shots)
-Continuous (making longer and longer continuous shot)
+- Cut (a hard cut shot)
+- Context (a shot that takes the last frame of the previous shot as a reference)
+- Bridge (connect 2 shots together)
+- Lead In (transition into a shot after it)
+- Cutaway (a context shot that connects to the previous shot but is not seen by the following shot, mainly used for B-roll shots)
+- Continuous (making longer and longer continuous shot)
 
 ## What's new in 0.17.0
 
