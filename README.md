@@ -2,15 +2,16 @@
 
 Music video made by this API
 https://www.youtube.com/watch?v=rPmv9dpM0P8
-Short film 
+Short films 
 https://youtu.be/2flxMiXXGL8
+https://youtu.be/gq6I-muf1AY
 
 A browser studio for making long AI videos with MiniMax H3, shot by shot. It runs inside
 ComfyUI at `/longshot`. Build a film from short Shots, review and approve each one, and the
 Studio stitches them into one continuous take or a cut sequence. Approved work is never
 thrown away.
 
-<img width="1664" height="1391" alt="image" src="https://github.com/user-attachments/assets/1bbec1f2-a77c-4f08-bf14-9012c3430b23" />
+<img width="1696" height="1350" alt="image" src="https://github.com/user-attachments/assets/af2861fe-43ed-436d-a908-d954a6788a3d" />
 
 ## Features
 
