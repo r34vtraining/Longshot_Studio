@@ -103,7 +103,7 @@ const uid = (p) => p + Date.now().toString(36) + (uidN++).toString(36);
 
 const S = {
   project: null, projects: [], opts: null, local: false,
-  conn: "connecting", open: null, takes: {}, styleOpen: false, audioOpen: false, advOpen: false, refineOpen: false, faceOpen: false, faceScan: {}, faceScanning: false, settingsOpen: true, uploading: {},
+  conn: "connecting", open: null, takes: {}, styleOpen: false, audioOpen: false, advOpen: false, refineOpen: false, faceOpen: false, faceScan: {}, faceScanning: false, settingsOpen: store("h3studio.settingsOpen") !== "0", uploading: {},
   busy: null, error: null, loop: false, dry: null, saveState: "",
   refState: {}, refInfo: {}, inputs: null, segStats: null, conflict: null, checkedFor: null,
   clips: {},       // timeline clips of this project: key -> {dur, made, thumb}
@@ -212,6 +212,10 @@ function normalize(p) {
     aligned: s.aligned && typeof s.aligned === "object" && s.aligned.key ? { key: String(s.aligned.key) } : null,
     // 0.14.0: Face refine: its last try ({take, sig, treated, tracks…}) and which faces it exports with
     face: s.face && typeof s.face === "object" ? s.face : null,
+    // 0.17.38: Face refine on a region drawn by hand ({on, keys: [[frame, x, y, w, h]], text})
+    face_region: s.face_region && typeof s.face_region === "object" ? { on: !!s.face_region.on,
+      keys: (Array.isArray(s.face_region.keys) ? s.face_region.keys : []).filter((k) => Array.isArray(k) && k.length >= 5).slice(0, 64),
+      text: String(s.face_region.text || "").slice(0, 300) } : null,
     // 0.17.8: Refine this Shot: {take, key, sig, keep: "refined" | "original", made}
     refined: s.refined && typeof s.refined === "object" && s.refined.take ? s.refined : null,
     seam: ["ok", "mismatch"].includes(s.seam) ? s.seam : null,   // its left join, as last known
@@ -240,6 +244,13 @@ function normalize(p) {
   s.face = Object.assign({}, DEFAULT_SETTINGS.face, s.face || {});
   s.face.turbo = Object.assign({}, DEFAULT_SETTINGS.face.turbo, s.face.turbo || {});
   s.face.on = true;     // 0.17.16: always on; it only runs when you click Refine this Shot
+  // 0.18.0: Face swap (ref2va): a take or a video file, each face given a Cast picture's identity
+  s.face_swap = Object.assign({ model: null, steps: 12, denoise: 0.6, shift_video: 4, color: 0.4, mask: 1.15, seed: 0, work: 640 },
+    s.face_swap || {});
+  s.face_swap.source = Object.assign({ kind: "shot", shot: null, file: "", subfolder: "", label: "", frames: 0 }, s.face_swap.source || {});
+  s.face_swap.faces = (Array.isArray(s.face_swap.faces) && s.face_swap.faces.length ? s.face_swap.faces : [{}]).slice(0, 4)
+    .map((x) => ({ cast: (x && x.cast) || null, keys: (Array.isArray(x && x.keys) ? x.keys : []).filter((k) => Array.isArray(k) && k.length >= 5).slice(0, 64) }));
+  s.face_swap.results = (Array.isArray(s.face_swap.results) ? s.face_swap.results : []).filter((r) => r && r.filename).slice(0, 20);
   if (![1.5, 2].includes(Number(s.rtx_vsr.scale))) s.rtx_vsr.scale = 2;   // 1.5× or 2× only
   s.loras = [0, 1, 2].map((i) => Object.assign({ on: false, name: null, strength: 1.0 }, (s.loras || [])[i] || {}));
   p.settings = s;
@@ -456,7 +467,17 @@ function freeEdges(s) {
  *  the whole run moves. */
 function effEdit(s) {
   const e = editOf(s), f = freeEdges(s), r = runOf(s), auto = f.left ? autoIn(s) : 0;
-  return { in: f.left ? Math.max(e.in, auto) : 0, out: f.right ? e.out : 0, shift: editOf(r[0]).shift, auto };
+  return { in: f.left ? Math.max(e.in, auto) : 0, out: f.right ? e.out : 0, shift: lineUp() ? 0 : editOf(r[0]).shift, auto };
+}
+
+/** 0.17.44: Line up Shots: every Shot starts where the one before ends (no second track,
+ *  no moves). On by itself when no song is in use; the checkbox under the timeline sets it.
+ *  Overlaps and moves are kept, just not used, so turning it off brings them back. */
+function lineUp() {
+  const p = P();
+  if (!p) return false;
+  const v = p.settings.line_up;
+  return v === undefined || v === null ? !songOn() : !!v;
 }
 
 const fmtSec = (frames) => `${(frames / FPS).toFixed(2)} s`;
@@ -498,7 +519,7 @@ function layoutPieces() {
   return act.map((s, i) => ({ id: s.id, seconds: s.kind === "clip" ? (Number(s.clip && s.clip.frames) || 0) / FPS
     : Number(s.seconds) || 0, window: plannedWindow(s), cut: i > 0 && runStartAt(act, i),
     hold: isEmptyShot(s) ? Math.max(1, Math.round((Number(s.seconds) || 0) * FPS)) : 0,
-    pin: i > 0 && runStartAt(act, i) && s.pin !== null && s.pin !== undefined ? s.pin : null,
+    pin: !lineUp() && i > 0 && runStartAt(act, i) && s.pin !== null && s.pin !== undefined ? s.pin : null,
     shift: effEdit(s).shift }));                     // 0.17.3: a pin may reach a moved Shot's real end
 }
 
@@ -800,7 +821,10 @@ async function api(path, opts = {}) {
   let data = null;
   try { data = await res.json(); } catch (e) { /* not JSON */ }
   if (!res.ok) {
-    const msg = (data && (data.error && (data.error.message || data.error))) || res.statusText;
+    let msg = (data && (data.error && (data.error.message || data.error))) || res.statusText;
+    // 0.17.37: a Studio route ComfyUI doesn't know yet (files updated, ComfyUI not restarted)
+    if ((res.status === 405 || res.status === 404) && !data && String(path).startsWith("/longshot/"))
+      msg = "This part of Studio needs its updated server: restart ComfyUI to finish the update.";
     const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
     err.data = data;
     err.status = res.status;
@@ -1272,6 +1296,7 @@ async function loadSegStats() {
 async function autoCheck() {
   const p = P();
   if (!p || S.checkedFor === p.slug || S.busy || S.queuing || S.chunking || S.applying || waitingJobs().length || S.conn !== "ok") return;
+  if (Q.jobs.some((j) => j.state === "running")) return;       // 0.17.45: a run being picked up after a refresh
   const done = active().filter((s) => s.status !== "queued");
   if (!done.length || missingRefs().length) { S.checkedFor = p.slug; return; }
   try {
@@ -1852,6 +1877,7 @@ const TAKE_FIELDS = ["take", "shot_seed", "seed_used", "context_from", "window",
 // ---------------------------------------------------------------------------
 
 const Q = { jobs: [], groups: {}, paused: false, seq: 0 };
+const QD = { id: null, dirty: false };           // 0.18.4: the queue row being dragged
 // 0.13.0: one queue per tab (each tab runs its own); an inbox per tab takes jobs another
 // tab hands over (a job for the project open here); a closed tab's queue is picked up.
 const QPRE = "h3studio.queue.", IPRE = "h3studio.inbox.";
@@ -1969,8 +1995,9 @@ function loadQueue() {
     Q.groups = d.groups || {};
     Q.paused = !!d.paused;
     Q.seq = d.seq || 0;
-    // a job that was running when the page closed runs again (finished segments are reused)
-    for (const j of Q.jobs) if (j.state === "running") j.state = "waiting";
+    // a job that was running when the page closed runs again (finished segments are reused);
+    // 0.17.45: unless its ComfyUI run is still going or done: then it's picked up (resumeRun)
+    for (const j of Q.jobs) if (j.state === "running" && !(j.run && j.run.promptId)) j.state = "waiting";
   } catch (e) { /* a broken entry: start empty */ }
   takeInbox();
   adoptOrphans();
@@ -2003,15 +2030,17 @@ function jobTitle(spec, pass, of, ids) {
     case "preview": return "Update preview";
     case "export": return "Export approved clips · upscaled";
     case "face": return `Face refine · ${pad(spec.target)}`;
+    case "swap": return `Face swap · ${spec.what || "video"}`;
     default: return spec.type;
   }
 }
 
 /** Add jobs: `specs` (one or more) × `takes` passes. Several passes share a
  *  group: afterwards every Shot shows take 1 of the batch (Multi-take). */
-function enqueue(specs, takes = 1) {
+function enqueue(specs, takes = 1, checked = false) {
   specs = (Array.isArray(specs) ? specs : [specs]).filter(Boolean);
   if (!specs.length) return;
+  if (!checked && refCheck(specs, takes)) return;    // 0.17.46: asks first; enqueues after
   const idsOf = (sp) => sp.type === "all" ? sp.ids.slice() : sp.target ? [sp.target] : [];
   let group = null;
   if (takes > 1) {
@@ -2034,6 +2063,78 @@ function enqueue(specs, takes = 1) {
     toast(`${n === 1 ? "Added" : `Added ${n} jobs`} to the queue${Q.paused ? " (paused)" : ` · ${was} ahead`}.`);
   }
   queueNext();
+}
+
+// 0.17.46: before a render, the <tags> in the prompts of the Shots it renders are matched
+// with the reference cards: a tag whose card is bypassed (or that no card has) is asked about.
+const TAG_SKIP = new Set(["d"]);                       // <d>…</d> dialogue
+const tagOf = (label) => { const m = String(label || "").match(/<[^<>]+>/); return (m ? m[0] : "<" + String(label || "").trim() + ">").toLowerCase(); };
+function refCards() {
+  const p = P(), out = [];
+  for (const c of p.cast) out.push({ card: c, label: c.label, what: "Cast & Scenes" });
+  for (const v of p.videos || []) out.push({ card: v, label: v.label, what: "Video references" });
+  for (const v of p.voices || []) out.push({ card: v, label: v.label, what: "Voice references" });
+  for (const m of p.refmods || []) out.push({ card: m, label: m.label || m.name, what: "RefMods" });
+  return out;
+}
+/** [{tag, shots, card?, what?, why}] for the Shots `ids`. */
+function refProblems(ids, forced = new Set()) {
+  const cards = refCards(), byTag = new Map();
+  for (const x of cards) if (x.label) { const t = tagOf(x.label); if (!byTag.has(t) || byTag.get(t).card.bypassed) byTag.set(t, x); }
+  const counts = { picture: liveCast().length, video: liveVideos().length,
+    audio: videoAudioCount() + songSlot() + liveVoices().length };
+  const found = new Map();
+  for (const id of ids) {
+    const s = shotById(id);
+    if (!s || s.bypassed || s.kind === "clip" || (isRendered(s) && !forced.has(s.id))) continue;   // kept takes don't sample
+    for (const m of String(s.text || "").matchAll(/<\s*([^<>\/][^<>]*?)\s*>/g)) {
+      const inner = m[1], key = ("<" + inner + ">").toLowerCase();
+      if (TAG_SKIP.has(inner.toLowerCase())) continue;
+      let why = null, x = byTag.get(key);
+      const num = inner.match(/^(picture|video|audio)\s+(\d+)$/i);
+      if (x) { if (x.card.bypassed) why = "off"; }
+      else if (num) { if (Number(num[2]) > counts[num[1].toLowerCase()]) why = "count"; }
+      else why = "none";
+      if (!why) continue;
+      const f = found.get(key) || { tag: "<" + inner + ">", shots: [], card: x ? x.card : null, what: x ? x.what : "", why, kind: num ? num[1] : "" };
+      if (!f.shots.includes(s.id)) f.shots.push(s.id);
+      found.set(key, f);
+    }
+  }
+  return [...found.values()];
+}
+/** Ask about them; true while the question is open (the render is queued after it). */
+function refCheck(specs, takes) {
+  const ids = [], forced = new Set();
+  for (const sp of specs) {
+    if (!["shot", "all", "through"].includes(sp.type) || sp.kind === "dry") continue;
+    if (sp.type === "all") ids.push(...sp.ids);
+    else if (sp.type === "through") { const act = active(); ids.push(...act.slice(0, act.findIndex((x) => x.id === sp.target) + 1).map((x) => x.id)); }
+    else { ids.push(sp.target); forced.add(sp.target); }
+  }
+  if (!ids.length || !P()) return false;
+  const probs = refProblems([...new Set(ids)], forced);
+  if (!probs.length) return false;
+  const shotsTxt = (f) => f.shots.map((id) => titleOf(shotById(id))).join(", ");
+  const on = { picture: liveCast().length, video: liveVideos().length, audio: videoAudioCount() + songSlot() + liveVoices().length };
+  const lines = probs.map((f) => f.why === "off" ? `${f.tag} is bypassed (${f.what}) · in ${shotsTxt(f)}`
+    : f.why === "count" ? `${f.tag}: only ${on[f.kind.toLowerCase()]} ${f.kind.toLowerCase()} reference${on[f.kind.toLowerCase()] === 1 ? " is" : "s are"} on · in ${shotsTxt(f)}`
+      : `${f.tag}: no reference card has this label · in ${shotsTxt(f)}`);
+  const off = probs.filter((f) => f.why === "off");
+  confirmBox({ title: off.length ? `Turn on ${off.length === 1 ? off[0].tag : off.length + " references"} first?` : "Check the references",
+    body: "The prompts mention references that won't be in this render:\n\n" + lines.map((l) => "• " + l).join("\n") +
+      (off.length ? "\n\nTurn on turns the bypassed card" + (off.length > 1 ? "s" : "") + " back on, then renders." : ""),
+    yes: off.length ? "Turn on and render" : "Render anyway", alt: off.length ? "Render anyway" : null, no: "Cancel" }).then((ans) => {
+    if (!ans) return;
+    if (ans === true && off.length) {
+      const what = new Set();
+      for (const f of off) { f.card.bypassed = false; what.add(f.what); }
+      refChangedQuietly([...what].join(", "));
+      commit();
+    }
+    enqueue(specs, takes, true);
+  });
+  return true;
 }
 
 /** Run a function with `slug` as the open project. When it isn't the open one,
@@ -2152,10 +2253,13 @@ function jobOpts(job) {
   if (sp.type === "face") {
     const s = shot(sp.target);
     if (!s || s.kind === "clip" || !s.take) return null;
-    return { kind: "face", faceTry: Object.assign({ key: takeStem(s.take), take: s.take }, takeSong(s.take)),
-      label: `Face refine · ${titleOf(s)}`, note: "Its take decoded, small faces redrawn as close-ups, saved for A/B",
+    const rg = s.face_region && s.face_region.on && (s.face_region.keys || []).length ? s.face_region : null;
+    return { kind: "face", faceTry: Object.assign({ key: takeStem(s.take), take: s.take }, takeSong(s.take),
+        rg ? { regions: [{ keys: rg.keys }], region_text: rg.text || "" } : {}),
+      label: `Face refine · ${titleOf(s)}${rg ? " · region" : ""}`, note: rg ? "Its take decoded, the region you drew redrawn as a close-up, saved for A/B" : "Its take decoded, small faces redrawn as close-ups, saved for A/B",
       extra: { shot: s.id, take: s.take, sig: faceSig() }, onDone: () => {} };
   }
+  if (sp.type === "swap") return swapOpts(sp);          // 0.18.0
   if (sp.type === "refine") {
     const s = shot(sp.target);
     if (!s || s.kind === "clip" || !s.take) return null;
@@ -2223,6 +2327,7 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 function renderQueue() {
   setTimeout(syncAwake, 0);
   if (S.swapped || !$("queue")) return;
+  if (QD.id) { QD.dirty = true; return; }           // 0.18.4: not while a row is being dragged
   // 0.9.2 ⇅: latest on top (per browser); the run order stays the same
   const flip = store("h3studio.queueNewest") === "1";
   const fb = $("queue-flip");
@@ -2276,7 +2381,7 @@ function renderQueue() {
       : j.state === "running" ? `<button class="ghost sm" data-action="queue-stop" title="Stop this job; the queue goes on">Stop</button>`
       : `${j.state === "failed" || j.state === "stopped" ? '<button class="ghost sm" data-action="queue-retry" title="Run it again">↻</button>' : ""}
         <button class="ghost sm" data-action="queue-remove" aria-label="Remove from the list">${CROSS}</button>`;
-    return `<div class="q-row st-${j.state}${j === peek ? " peek" : ""}" data-job="${esc(j.id)}">
+    return `<div class="q-row st-${j.state}${j === peek ? " peek" : ""}${w ? " q-drag" : ""}" data-job="${esc(j.id)}"${w ? ' draggable="true" title="Drag to change its place in line"' : ""}>
       <span class="q-icon" aria-hidden="true">${Q_ICON[j.state] || "·"}</span>
       <span class="q-main"><button class="q-name${here ? " here" : ""}" data-action="queue-open" title="${here ? "The open project" : "Open this project"}">${esc(j.name)}</button>
         · ${esc(j.title)}<div class="q-sub">${esc(sub)}</div>${bar}</span>
@@ -2284,10 +2389,80 @@ function renderQueue() {
   }).join("") + otherRows;
 }
 
+// 0.18.4: drag a waiting job to its new place in line (the ▲ ▼ buttons still work)
+function qdClear() { document.querySelectorAll("#queue .q-before, #queue .q-after").forEach((x) => x.classList.remove("q-before", "q-after")); }
+function qdTarget(e) {
+  const row = e.target.closest && e.target.closest("#queue .q-row[data-job]");
+  if (!row || row.dataset.job === QD.id) return null;
+  const j = Q.jobs.find((x) => x.id === row.dataset.job);
+  if (!j || j.state !== "waiting") return null;
+  const r = row.getBoundingClientRect();
+  return { row, job: j, below: e.clientY > r.top + r.height / 2 };
+}
+document.addEventListener("dragstart", (e) => {
+  const row = e.target.closest && e.target.closest("#queue .q-row.q-drag");
+  if (!row || e.target.closest("button")) return;
+  QD.id = row.dataset.job;
+  QD.dirty = false;
+  e.dataTransfer.effectAllowed = "move";
+  try { e.dataTransfer.setData("text/plain", "h3job:" + QD.id); } catch (err) { /* ignore */ }
+  row.classList.add("dragging");
+});
+document.addEventListener("dragover", (e) => {
+  if (!QD.id) return;
+  const t = qdTarget(e);
+  qdClear();
+  if (!t) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  t.row.classList.add(t.below ? "q-after" : "q-before");
+});
+document.addEventListener("drop", (e) => {
+  if (!QD.id) return;
+  const t = qdTarget(e), job = Q.jobs.find((x) => x.id === QD.id);
+  qdClear();
+  if (!t || !job || job.state !== "waiting") return;
+  e.preventDefault();
+  // below on screen is later in line, unless the list shows the latest on top
+  const flip = store("h3studio.queueNewest") === "1";
+  const later = flip ? !t.below : t.below;
+  Q.jobs.splice(Q.jobs.indexOf(job), 1);
+  Q.jobs.splice(Q.jobs.indexOf(t.job) + (later ? 1 : 0), 0, job);
+  saveQueue();
+});
+document.addEventListener("dragend", () => {
+  if (!QD.id) return;
+  QD.id = null;
+  qdClear();
+  document.querySelectorAll("#queue .dragging").forEach((x) => x.classList.remove("dragging"));
+  QD.dirty = false;
+  renderQueue();
+});
+
 async function queueAction(action, el) {
   const row = el.closest("[data-job]");
   const job = row && Q.jobs.find((j) => j.id === row.dataset.job);
-  if (action === "queue-pause") { Q.paused = !Q.paused; saveQueue(); renderQueue(); if (!Q.paused) queueNext(); return; }
+  if (action === "queue-pause") {
+    const running = !Q.paused && Q.jobs.find((j) => j.state === "running");
+    if (running) {
+      // 0.18.3: pause now (the running job stops and goes back in line, first) or after it
+      const ans = await confirmBox({ title: "Pause the queue",
+        body: `“${running.title}” is running.\n\nPause now: it stops and goes back in line, first. On Resume it starts again, ` +
+          "picking up what it had finished (finished Shots come back from Long Shot's memory or saved takes).\n\n" +
+          "Pause after it: it finishes, then the queue holds.\n\nWhile paused, add jobs (Export approved clips…) and move them with ▲ ▼.",
+        yes: "Pause now", alt: "Pause after it", no: "Cancel" });
+      if (!ans) return;
+      Q.paused = true;
+      if (ans === true) {
+        running.requeue = true;
+        if ((S.busy && S.busy.jobId === running.id) || (S.chunking && S.chunking.jobId === running.id)) stop();
+        else { running.state = "waiting"; delete running.requeue; }
+      }
+      saveQueue(); renderQueue();
+      return;
+    }
+    Q.paused = !Q.paused; saveQueue(); renderQueue(); if (!Q.paused) queueNext(); return;
+  }
   if (action === "queue-flip") { store("h3studio.queueNewest", store("h3studio.queueNewest") === "1" ? "0" : "1"); renderQueue(); return; }
   if (action === "queue-stop-all") {
     // 0.16.0: stop the running job and every waiting one; they stay listed, stopped, to retry
@@ -2488,6 +2663,22 @@ const OOM_RE = /out of memory|outofmemory|not enough memory|cuda error: out of m
  *  restarted and the job runs once more. */
 function endJob(job, state, error) {
   if (!job || !liveJob(job)) return;
+  delete job.run;                                    // 0.17.45
+  if (job.requeue) {                                 // 0.18.3: Pause now: back in line, first
+    delete job.requeue;
+    if (state === "stopped") {
+      job.state = "waiting"; job.error = null; job.attempts = 0;
+      const w = Q.jobs.filter((j) => j.state === "waiting" && j !== job);
+      if (w.length && Q.jobs.indexOf(w[0]) < Q.jobs.indexOf(job)) {
+        Q.jobs.splice(Q.jobs.indexOf(job), 1);
+        Q.jobs.splice(Q.jobs.indexOf(w[0]), 0, job);
+      }
+      saveQueue();
+      renderQueue();
+      toast(`Paused. “${job.title}” is first in line; it picks up where it was on Resume.`);
+      return;
+    }
+  }
   if (state === "failed" && OOM_RE.test(error || "") && !(job.attempts >= 1)) {
     job.attempts = (job.attempts || 0) + 1;
     job.state = "waiting";
@@ -2598,13 +2789,13 @@ function pickFields(o, keys) {
 
 async function queueJob({ upto, dry, kind, label, note, onDone, final = false, finalUp = true, standalone = false, batch = null,
   omit = null, trimLeft = false, takeClips = null, chunk = null, exportClips = null, extra = null, jobId = null,
-  joins = null, takeAudio = null, faceTry = null, refineTry = null, stems = null }) {
+  joins = null, takeAudio = null, faceTry = null, refineTry = null, stems = null, faceSwap = null }) {
   if (S.busy) return;
   if (Object.keys(S.uploading).length) { toast("Wait for the image upload to finish."); return; }
   S.error = null;
   const dryBox = () => { if (kind === "dry") showModal("Dry run · it stopped with an error", S.error); };
   if (comfyTooOld()) { S.error = comfyTooOldText(); dryBox(); render(); return; }
-  const missing = kind === "clips" || kind === "export" || kind === "align" || kind === "face" || kind === "stems" ? [] : missingRefs();
+  const missing = kind === "clips" || kind === "export" || kind === "align" || kind === "face" || kind === "stems" || kind === "swap" ? [] : missingRefs();
   if (missing.length) {
     S.error = `${missing.length} reference${missing.length > 1 ? "s are" : " is"} missing — relink or bypass ${missing.length > 1 ? "them" : "it"}.`;
     dryBox();
@@ -2622,6 +2813,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, f
     else S.audioOpen = true;
     render();
     const first = document.querySelector(".pick.missing-file");
+    scrollIntent++;
     if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
     return;
   }
@@ -2720,6 +2912,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, f
     const body = takeAudio ? { project, take_audio: takeAudio } : takeClips ? { project, take_clips: takeClips } : exportClips ? { project, export_clips: exportClips }
       : faceTry ? { project, face_try: faceTry }
       : refineTry ? { project, refine_try: refineTry }
+      : faceSwap ? { project, face_swap: faceSwap }
       : stems ? { project, stems }
       : { project, upto, dry_run: !!dry, final, final_upscale: finalUp !== false, standalone, clips_for: clipsFor, chunk };
     built = await api("/longshot/build", { method: "POST", body });
@@ -2756,6 +2949,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, f
     of: built.chain.length, segs: {}, segT0: {}, step: 0, phase: "queued", started: Date.now(),
     refs: refSnapshot(),                             // the references these takes are made with
   };
+  keepRun(S.busy);                                   // 0.17.45: a page refresh picks this run up again
   if (kind === "render" || kind === "reroll") S.open = target;
   render();
   renderQueue();
@@ -2850,6 +3044,8 @@ async function finishIn(b, promptId, entry) {
     await faceDone(b, entry.outputs || {});
   } else if (b.kind === "refine") {
     await refineDone(b, entry.outputs || {});
+  } else if (b.kind === "swap") {
+    swapDone(b, entry.outputs || {});
   } else if (b.kind === "align") {
     await alignDone(b, entry.outputs || {});
   } else if (b.kind === "stems") {
@@ -3887,6 +4083,14 @@ tlView.addEventListener("wheel", (e) => {
   tlView.scrollLeft += d;
 }, { passive: false });
 
+// 0.18.2: Alt + wheel anywhere in the Studio never goes back a page (Firefox's default, some mouse
+// drivers): the page just doesn't move. (On the timeline it zooms, above.)
+window.addEventListener("wheel", (e) => {
+  if (!e.altKey || e.ctrlKey || e.metaKey) return;
+  e.preventDefault();
+  TLV.altWheel = true;                              // and releasing Alt doesn't open the menu
+}, { passive: false });
+
 // Alt + wheel: releasing Alt mustn't then focus the browser's menu (Windows).
 window.addEventListener("keydown", (e) => { if (e.key === "Alt" && !e.repeat) TLV.altWheel = false; }, true);
 window.addEventListener("keyup", (e) => {
@@ -3919,6 +4123,7 @@ function tlOpenPrompt(id) {
   setTimeout(() => {
     const card = document.querySelector(`.shot[data-shot="${CSS.escape(sh.id)}"]`);
     if (!card) return;
+    scrollIntent++;
     card.scrollIntoView({ block: "center", behavior: "smooth" });
     const box = sh.kind !== "clip" && card.querySelector('textarea[data-shot-field="text"]');
     if (box) { box.focus({ preventScroll: true }); box.setSelectionRange(box.value.length, box.value.length); }
@@ -4766,6 +4971,7 @@ function absorbMove(run, d) {
 /** Alt + ← / →: move a Shot one frame along the film, overwriting its neighbour. Shots
  *  joined Continuous move together as one run (0.9.2). */
 function moveShot(s, d) {
+  if (lineUp()) { toast("Line up Shots is on (under the timeline): every Shot starts where the one before ends. Turn it off to move Shots on the film."); return; }
   const run = runOf(s);
   const locked = run.find(isAligned);
   if (locked) {
@@ -4986,6 +5192,7 @@ function fitShotList() {
 }
 /** Scroll the Shot list (not the page) so a Shot's card is in view. */
 function revealShotCard(id) {
+  scrollIntent++;
   const box = $("shot-scroll");
   if (!box || !box.classList.contains("scrolls")) return;
   const card = $("shots").querySelector(`.shot[data-shot="${CSS.escape(id)}"]`);
@@ -5200,9 +5407,58 @@ function flushDeferred() {
   if (d.has("decision")) renderDecision();
 }
 
+/** 0.17.40: a redraw keeps the page and the Shot list where they were (no jump up
+ *  while a panel is rebuilt and the page is briefly shorter). */
+let scrollKeepDepth = 0, scrollIntent = 0;      // scrollIntent: bumped by a deliberate scroll
+// 0.18.1: the restore only undoes a jump the redraw itself made, and never one the user is making:
+// a wheel, touch, key or scrollbar drag in the last moment wins (redraws come many times a second
+// while a render saves, and used to pull the page back each time).
+let userScrollAt = 0;
+const SCROLL_KEYS = new Set(["PageUp", "PageDown", "ArrowUp", "ArrowDown", "Home", "End", " "]);
+const noteUserScroll = () => { userScrollAt = performance.now(); };
+window.addEventListener("wheel", noteUserScroll, { passive: true, capture: true });
+window.addEventListener("touchmove", noteUserScroll, { passive: true, capture: true });
+window.addEventListener("keydown", (e) => { if (SCROLL_KEYS.has(e.key)) noteUserScroll(); }, { passive: true, capture: true });
+// a press on the page's own scrollbar (not a click on a button: a chip click must still be kept in place)
+let userPress = false;
+window.addEventListener("pointerdown", (e) => {
+  userPress = e.target === document.documentElement || e.clientX >= document.documentElement.clientWidth;
+}, { passive: true, capture: true });
+window.addEventListener("pointerup", () => { if (userPress) noteUserScroll(); userPress = false; }, { passive: true, capture: true });
+window.addEventListener("pointercancel", () => { userPress = false; }, { passive: true, capture: true });
+const userScrolling = () => userPress || performance.now() - userScrollAt < 400;
+function keepScroll(fn) {
+  if (scrollKeepDepth++) { try { return fn(); } finally { scrollKeepDepth--; } }
+  const y = window.scrollY, box = $("shot-scroll"), bt = box ? box.scrollTop : 0;
+  const jumped = () => Math.abs(window.scrollY - y) > 1 || (box && box.isConnected && Math.abs(box.scrollTop - bt) > 1);
+  const back = () => {
+    if (userScrolling()) return;
+    if (Math.abs(window.scrollY - y) > 1) window.scrollTo(window.scrollX, y);
+    const b = $("shot-scroll");
+    if (b && b === box && Math.abs(b.scrollTop - bt) > 1) b.scrollTop = bt;
+  };
+  try { return fn(); } finally {
+    scrollKeepDepth--;
+    const moved = jumped();
+    if (moved) back();
+    const i0 = scrollIntent, y1 = window.scrollY;
+    // a jump that lands after layout: only when the page hasn't moved since (nobody scrolled it)
+    requestAnimationFrame(() => {
+      if (scrollIntent !== i0 || userScrolling()) return;
+      if (Math.abs(window.scrollY - y1) > 1 && Math.abs(window.scrollY - y) > 1 && !moved) {
+        // the page moved between the redraw and this frame without the user: a late jump
+        window.scrollTo(window.scrollX, y);
+      }
+    });
+  }
+}
+
 function render() {
   if (!P()) return;
   if (deferIfHeld("all")) return;
+  keepScroll(drawAll);
+}
+function drawAll() {
   renderHeader();
   renderCast();
   renderStyle();
@@ -5378,21 +5634,23 @@ function renderCast() {
         <button class="icon x" data-action="remove-cast" title="Remove" aria-label="Remove ${esc(c.label)}">${CROSS}</button>
       </div></div>`;
   });
-  // rows (0.8.6): pictures, then audio references, then RefMods, each starting its own row
-  cards.push(`<button class="addtile" data-action="add-cast" data-drop="add">${PLUS} <span>Add reference · ${esc(`<Picture ${n + 1}>`)}<br><span class="muted small">or drop images here</span></span></button>`);
-  cards.push('<div class="cast-break"></div>');
-  // 0.17.1: video references, a row of their own
-  for (const v of P().videos || []) cards.push(videoCard(v));
-  cards.push(`<button class="addtile video-add" data-action="add-video">${PLUS} <span>Add video reference · ${esc(`<Video ${liveVideos().length + 1}>`)}<br><span class="muted small">motion, a camera move, a look · or drop a video here</span></span></button>`);
-  cards.push('<div class="cast-break"></div>');
-  for (const v of P().voices || []) cards.push(voiceCard(v));
+  // rows (0.8.6): pictures, then videos, then audio references, then RefMods, each starting its own row.
+  // 0.17.43: no empty Add card per kind: one drop bar at the end takes them all and sorts them.
+  const videos = (P().videos || []).map(videoCard), voices = (P().voices || []).map(voiceCard);
+  const mods = (P().refmods || []).map(refmodCard);
+  for (const row of [videos, voices, mods]) if (row.length) cards.push('<div class="cast-break"></div>', ...row);
   const nextA = videoAudioCount() + songSlot() + liveVoices().length + 1;
-  cards.push(`<button class="addtile voice-add" data-action="add-voice">${PLUS} <span>Add audio reference · ${esc(`<Audio ${nextA}>`)}<br><span class="muted small">a voice or a sound · or drop audio here</span></span></button>`);
-  cards.push('<div class="cast-break"></div>');
-  for (const m of P().refmods || []) cards.push(refmodCard(m));
-  cards.push(hasPack("refmod")
-    ? `<button class="addtile refmod-add" data-action="add-refmod">${PLUS} <span>Add RefMod<br><span class="muted small">a saved character, style or motion</span></span></button>`
-    : `<div class="addtile refmod-add install"><span><b>RefMods</b> · reusable characters, styles and motions saved as RefMods<br>${installBtn("refmod", "(Load H3 RefMods)")}</span></div>`);
+  const refmodBtn = hasPack("refmod")
+    ? `<button class="refmod-btn" data-action="add-refmod" title="Add a saved character, style or motion">${PLUS} RefMod</button>`
+    : `<span class="refmod-btn install" title="Reusable characters, styles and motions">RefMods · ${installBtn("refmod", "(Load H3 RefMods)")}</span>`;
+  cards.push('<div class="cast-break"></div>',
+    `<div class="add-all" data-drop="add">
+      <button class="add-all-pick" data-action="add-refs" title="Choose pictures, videos or audio files">${PLUS}
+        <span>Add references<br><span class="muted small">drop pictures, videos or audio anywhere here · each goes to its own row ` +
+        `(next: ${esc(`<Picture ${n + 1}>`)} · ${esc(`<Video ${liveVideos().length + 1}>`)} · ${esc(`<Audio ${nextA}>`)})</span></span></button>
+      <button class="add-blank" data-action="add-cast" title="An empty picture card, to fill in later">＋ Empty card</button>
+      ${refmodBtn}
+    </div>`);
   $("cast").innerHTML = cards.join("");
 }
 
@@ -5668,6 +5926,30 @@ async function addVoices(fileList, targetId) {
   if (notes.length) toast(notes.join(" "));
 }
 
+/** 0.17.43: one picker for every kind of reference; each file goes to its own row. */
+function pickRefs() {
+  if (setupGuard()) return;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "image/*,video/*,audio/*";
+  inp.multiple = true;
+  inp.addEventListener("change", () => { if (inp.files.length) addRefFiles(inp.files); });
+  inp.click();
+}
+/** Pictures, videos and audio dropped together: each kind to its own add. */
+async function addRefFiles(fileList) {
+  const fl = [...fileList];
+  const imgs = fl.filter(isImageFile), vids = fl.filter((x) => VIDEO_RE.test(x.name || "")),
+    auds = fl.filter((x) => AUDIO_RE.test(x.name || ""));
+  if (!imgs.length && !vids.length && !auds.length) {
+    toast("References can be pictures (PNG, JPG, WebP…), videos (MP4, MOV, WebM…) or audio (WAV, MP3, FLAC…).");
+    return;
+  }
+  if (imgs.length) await addImages(imgs, null);
+  if (vids.length) await addVideos(vids, null);
+  if (auds.length) await addVoices(auds, null);
+}
+
 function pickVoices(targetId) {
   if (setupGuard()) return;
   const inp = document.createElement("input");
@@ -5791,7 +6073,7 @@ const LOOK = {
   review: { icon: "●", label: "Reviewing", dot: "#6B4A12", fg: "#FFD08A", chipBg: "#3D2C10", chipFg: "#FFD08A" },
   rendering: { icon: "◌", label: "Rendering…", dot: "#3A3D44", fg: "#E9E7E2", chipBg: "#2A2C31", chipFg: "#E9E7E2" },
   queued: { icon: "○", label: "Queued", dot: "#24262B", fg: "#8E9198", chipBg: "transparent", chipFg: "#A3A6AD" },
-  bypassed: { icon: "⏻", label: "Bypassed", dot: "#2B2240", fg: "#C9B6FF", chipBg: "#2B2240", chipFg: "#C9B6FF" },
+  bypassed: { icon: POWER, label: "Bypassed", dot: "#2B2240", fg: "#C9B6FF", chipBg: "#2B2240", chipFg: "#C9B6FF" },
   clip: { icon: "▶", label: "Clip", dot: "#1E3A4A", fg: "#8FD3F0", chipBg: "#16303D", chipFg: "#8FD3F0" },
 };
 
@@ -5891,7 +6173,7 @@ function shotRowHTML(s) {
   // the join chip: how ▶ renders it, from the rendered Shots next to it
   const actR = active(), prevR = !s.bypassed ? actR[actR.indexOf(s) - 1] : null;
   const cj = chipJoin(s), opts = chipOptions(s);
-  const icon = { bridge: chipSides(s).prev || !chipSides(s).next ? "↔" : "↘", lead: "↘", bridgeIn: "↔", cutaway: "⤵", from: "→", context: "⧉", cut: "|" }[cj];
+  const icon = { bridge: chipSides(s).prev || !chipSides(s).next ? "↔" : "↘", lead: "↘", bridgeIn: "↔", cutaway: "↪", from: "→", context: "⧉", cut: "|" }[cj];
   const joinChip = !s.bypassed && s.kind !== "clip"
     ? `<button class="join-chip j-${esc(cj)}${opts.length < 2 ? " only" : ""}" data-action="cycle-join" title="${esc(chipName(s) + ": " + CHIP_HELP[chipKey(s)])}${
       (() => { const nb = chipNear(s), odd = [nb.prev, nb.next].filter(otherSize);
@@ -6134,22 +6416,24 @@ function groupSummary(id) {
 }
 
 function groupHeadHTML(g, open) {
+  const mem = groupShots(g.id), gOff = mem.length > 0 && mem.every((x) => x.bypassed);   // 0.17.33
   const rnd = toRender().filter((x) => x.group === g.id);
   const nNew = rnd.filter((x) => !jobFor(x.id)).length, nAgain = nNew ? 0 : rnd.length;
   const off = S.conn !== "ok" || missingRefs().length > 0;
   const name = S.renameGroup === g.id
     ? `<input class="field group-name-in" data-group-name="${esc(g.id)}" value="${esc(S.renameDraft ?? g.name)}" maxlength="80" aria-label="Group name">`
     : `<span class="group-name" title="Double-click to rename">${esc(g.name)}</span>`;
-  return `<div class="group-head${open ? " open" : ""}" data-group="${esc(g.id)}">
+  return `<div class="group-head${open ? " open" : ""}${gOff ? " off" : ""}" data-group="${esc(g.id)}">
     <button class="group-fold" data-action="group-fold" aria-expanded="${open}" title="${open ? "Fold" : "Unfold"} this group">${open ? "▾" : "▸"}</button>
     ${name}
-    <span class="muted small group-sum">${esc(groupSummary(g.id))}</span>
+    <span class="muted small group-sum">${gOff ? `Bypassed · ${mem.length} Shot${mem.length === 1 ? "" : "s"}` : esc(groupSummary(g.id))}</span>
     <span class="push"></span>
     <button class="ghost sm" data-action="group-render"${off || !(nNew || nAgain) ? " disabled" : ""}
       title="${nAgain ? "Queue one more set: these Shots render again after the set that's queued, each with a new seed" : "Render the Shots in this group that aren't rendered yet, each continued from the Shot before it"}">▶ Render group${nNew ? ` (${nNew})` : nAgain ? ` again (${nAgain})` : ""}</button>
     ${(() => { const src = groupRefSource(g.id); return `<button class="ghost sm" data-action="group-restore"${src ? "" : " disabled"}
       title="${src ? `Put back the Style & Sound text and the Cast & Scenes references this group was rendered with (from ${esc(titleOf(src))}'s take)` : "Render a Shot in this group first: its take records the prompt and references it was made with"}">Restore prompt & references</button>`; })()}
     <button class="ghost sm" data-action="group-rename" title="Rename this group">✎</button>
+    <button class="ghost sm group-bypass${gOff ? " on" : ""}" data-action="group-bypass" aria-pressed="${gOff}" title="${gOff ? "Turn this group's Shots back on" : "Bypass every Shot in this group (they leave the film and the renders; nothing is deleted)"}" aria-label="${gOff ? "Turn the group back on" : "Bypass the group"}">${POWER}</button>
     <button class="ghost sm" data-action="group-ungroup" title="Remove the folder; the Shots stay as they are">Ungroup</button>
     <button class="ghost sm danger" data-action="group-delete" title="Delete this group, with or without its Shots">✕</button>
   </div>`;
@@ -6168,6 +6452,19 @@ function groupRefSource(id) {
  *  there; a rendered Shot keeps its place (its take joins the Shots around it), so it can only
  *  join or leave a group it's next to. */
 const canMoveShot = (s) => s && s.kind !== "clip" && !s.take && s.status === "queued" && !inRender(s) && !jobFor(s.id);
+/** 0.17.44: does this Shot's picture continue from the Shot before it (Continuous, Lead in)? */
+const continuesIn = (x) => !!x && x.kind !== "clip" && !x.bypassed && (x.join === "bridge" || !!x.lead_in);
+/** 0.17.44: a rendered Shot (or clip) can move when nothing continues into or out of it:
+ *  it's a Cut / Context, and the Shot after it doesn't continue from it. "" or why not. */
+function whyStuck(s) {
+  if (inRender(s) || jobFor(s.id)) return `${titleOf(s)} is rendering or in the queue. Move it when that's done.`;
+  const sh = P().shots, i = sh.indexOf(s);
+  const prevAct = sh.slice(0, i).reverse().find((x) => !x.bypassed);
+  const nextAct = sh.slice(i + 1).find((x) => !x.bypassed);
+  if (!s.bypassed && prevAct && continuesIn(s)) return `${titleOf(s)} continues from ${titleOf(prevAct)} (${chipName(s, chipJoin(s))}), so it keeps its place. Only Cut and Context Shots move once rendered.`;
+  if (!s.bypassed && nextAct && continuesIn(nextAct)) return `${titleOf(nextAct)} continues from ${titleOf(s)}, so ${titleOf(s)} keeps its place.`;
+  return "";
+}
 
 function dropShot(s, target) {
   const p = P();
@@ -6199,10 +6496,13 @@ function dropShot(s, target) {
     return;
   }
   if (!canMoveShot(s)) {
-    toast(s.kind === "clip" || s.take || s.status !== "queued"
-      ? `${titleOf(s)} is rendered, so it keeps its place: its take joins the Shots around it. Only Shots not rendered yet can move.`
-      : `${titleOf(s)} is rendering or in the queue. Move it when that's done.`);
-    return;
+    const why = whyStuck(s);                          // 0.17.44: rendered Cut / Context Shots move too
+    if (why) { toast(why); return; }
+    const after = p.shots.slice(to).find((x) => x !== s && !x.bypassed);
+    if (!s.bypassed && after && continuesIn(after)) {
+      toast(`${titleOf(after)} continues from the Shot before it, so ${titleOf(s)} can't go between them. Drop it at a Cut.`);
+      return;
+    }
   }
   if (listGuard(Math.min(from, to))) return;
   if (!s.bypassed) syncAfter(s, "Moving a Shot");
@@ -6211,6 +6511,7 @@ function dropShot(s, target) {
   p.shots.splice(to, 0, s);
   s.group = g;
   s.pin = null; s.ov_cut = null; s.place = null;     // a new place on the film
+  if (!canMoveShot(s) && continuesIn(s)) { s.join = "cut"; s.lead_in = false; s.free_end = false; }   // 0.17.44: a rendered first Shot lands as a Cut
   if (!s.bypassed) syncAfter(s, "Moving a Shot");
   S.dry = null;
   normalizeGroups(p);
@@ -6320,6 +6621,9 @@ document.addEventListener("dblclick", (e) => {
 function renderShots() {
   requestLayout();
   if (deferIfHeld("shots")) return;
+  keepScroll(renderShotsNow);
+}
+function renderShotsNow() {
   let prevActive = null;
   const slots = new Set(anchorKeys());
   const lastId = active().length ? active()[active().length - 1].id : null;
@@ -6469,6 +6773,7 @@ function clipCard(s) {
 
 function renderViewer() {
   if (!P()) return;
+  { const lu = $("line-up"); if (lu) lu.checked = lineUp(); }      // 0.17.44
   if (buildTL()) tlSeek(PL.t);                    // takes / renders changed: same time, new pieces
   const has = TL.entries.some((e) => e.src);
   const lo = last();
@@ -7475,7 +7780,7 @@ function renderFaceQuick() {
   const why = !f.model ? "Choose the face model first (open the panel)" : !o.face_detector ? "Download the face detector first (open the panel)" : "";
   q.innerHTML = `<select data-face-shot aria-label="Shot to refine">${rendered.map((x) =>
       `<option value="${esc(x.id)}"${x.id === sh.id ? " selected" : ""}>${esc(titleOf(x))}${smallFaces(x).length ? " · small face" : ""}</option>`).join("")}</select>
-    <button class="ghost sm" data-action="face-try" data-shot="${esc(sh.id)}"${f.model && o.face_detector && !busy ? "" : " disabled"}${why ? ` title="${esc(why)}"` : ""}>${busy ? "In the queue…" : have ? "Refine again" : "Refine this Shot"}</button>
+    <button class="ghost sm" data-action="face-try" data-shot="${esc(sh.id)}"${f.model && (o.face_detector || (sh.face_region && sh.face_region.on)) && !busy ? "" : " disabled"}${why ? ` title="${esc(why)}"` : ""}>${busy ? "In the queue…" : have ? "Refine again" : "Refine this Shot"}</button>
     <button class="ghost sm" data-action="face-ab" data-shot="${esc(sh.id)}"${have && S.clips[takeStem(sh.take)] ? "" : " disabled"}>A/B</button>
     <div class="seg seg-sm" role="group" aria-label="Which version ${esc(titleOf(sh))} exports">
       <button data-action="face-keep" data-v="refined" data-shot="${esc(sh.id)}" aria-pressed="${keep === "refined"}"${have ? "" : ' disabled title="Refine this Shot first"'}>Refined</button>
@@ -7538,15 +7843,24 @@ function renderFace() {
       (small.length ? ` · ${small.length} to redraw` : " · none under the size");
     const keep = faceRefined(sh) ? "refined" : "original";
     const busy = Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "face" && j.spec.target === sh.id);
+    const rg = sh.face_region || {}, rOn = !!rg.on, nk = (rg.keys || []).length;
     shotHTML = `<div class="box face-shot">
       <div class="box-row"><label class="face-pick"><span class="muted small">Shot</span>
         <select data-face-shot aria-label="Shot to try Face refine on">${rendered.map((x) =>
-          `<option value="${esc(x.id)}"${x.id === sh.id ? " selected" : ""}>${esc(titleOf(x))}${smallFaces(x).length ? " · small face" : ""}</option>`).join("")}</select></label>
-        <span class="muted small">${faces}</span></div>
+          `<option value="${esc(x.id)}"${x.id === sh.id ? " selected" : ""}>${esc(titleOf(x))}${x.face_region && x.face_region.on ? " · region" : smallFaces(x).length ? " · small face" : ""}</option>`).join("")}</select></label>
+        <div class="seg seg-sm" role="group" aria-label="What to redraw">
+          <button data-action="face-mode" data-v="auto" data-shot="${esc(sh.id)}" aria-pressed="${!rOn}" title="Human faces, found and followed by the detector">Faces</button>
+          <button data-action="face-mode" data-v="region" data-shot="${esc(sh.id)}" aria-pressed="${rOn}" title="A box you draw: for cartoon characters, creatures or anything the face detector doesn't see">Region</button>
+        </div>
+        ${rOn ? "" : `<span class="muted small">${faces}</span>`}</div>
+      ${rOn ? `<div class="box-row" style="margin-top:8px">
+        <button class="ghost sm" data-action="face-region-draw" data-shot="${esc(sh.id)}"${S.clips[takeStem(sh.take)] ? "" : ' disabled title="Make this take\'s clip first (Make missing clips under the timeline)"'}>${nk ? "Edit region" : "Draw region…"}</button>
+        <span class="muted small">${nk ? `${nk} key frame${nk === 1 ? "" : "s"} · the box moves in a straight line between them` : "Draw a box around what to redraw, on the first and last frame"}</span></div>
+        <label class="lbl" style="margin-top:8px">What's in the box <input class="field" data-face-region-text data-shot="${esc(sh.id)}" value="${esc(rg.text || "")}" placeholder="e.g. five small round cartoon creatures with big eyes riding in a wooden sleigh" maxlength="300"></label>` : ""}
       ${have ? `<div class="muted small" style="margin-top:6px">Refined: ${sh.face.treated || 0} face${sh.face.treated === 1 ? "" : "s"} redrawn${sh.face.cached ? " (kept from before)" : ""}.${stale ? " Made with other settings than these: Refine again to use them." : ""}</div>`
         : old ? `<div class="muted small" style="margin-top:6px">⚠ The refined version was made from an older take. Refine this Shot again.</div>` : ""}
       <div class="box-row" style="margin-top:10px">
-        <button class="ghost sm" data-action="face-try" data-shot="${esc(sh.id)}"${f.model && o.face_detector && !busy ? "" : " disabled"}>${busy ? "In the queue…" : have ? "Refine again" : "Refine this Shot"}</button>
+        <button class="ghost sm" data-action="face-try" data-shot="${esc(sh.id)}"${f.model && (o.face_detector || rOn) && !busy && (!rOn || nk) ? "" : " disabled"}>${busy ? "In the queue…" : have ? "Refine again" : "Refine this Shot"}</button>
         <button class="ghost sm" data-action="face-ab" data-shot="${esc(sh.id)}"${have && S.clips[takeStem(sh.take)] ? "" : " disabled"}>Compare A/B</button>
         <span class="push muted small">Export uses</span>
         <div class="seg seg-sm" role="group" aria-label="Which version this Shot exports">
@@ -7559,6 +7873,7 @@ function renderFace() {
     <div class="muted small" style="margin-top:12px">Pick a Shot and click Refine this Shot: H3 redraws each small face as a steady close-up and blends it back in. Nothing is refined on its own.</div>
     ${shotHTML}
     ${refinedList}
+    ${faceSwapHTML()}
     <div class="box face-card" style="margin-top:12px">
       <button class="fold" data-action="fold" data-fold="face-model" aria-expanded="${modelOpen}">
         <span>Face model and faces${modelOpen ? "" : `<span class="muted small"> · ${esc(f.model ? shortModel(f.model) : "no model")} · ${esc(f.steps)} steps · denoise ${Number(f.denoise).toFixed(2)} · under ${esc(f.max_face)} px</span>`}</span>
@@ -7621,10 +7936,294 @@ function renderFace() {
     ${S.faceScanError ? `<div class="muted small" style="margin-top:6px">Couldn't look for faces: ${esc(S.faceScanError)}</div>` : ""}`;
 }
 
+// ---------------------------------------------------------------------------
+// 0.18.0: Face swap (ref2va, Long Shot 1.9.0). A Shot's take or any video; each face gets the
+// identity of a picture card. One face: the largest face found. More: a box drawn for each.
+// The result goes to <project>/Face_Swap.
+// ---------------------------------------------------------------------------
+const isRef2vaName = (m) => { const n = String(m || "").toLowerCase(); return !!n && !n.includes("fl2v") && !n.includes("t2v"); };
+const swapCfg = () => P().settings.face_swap;
+function swapShot() {
+  const src = swapCfg().source, s = src.shot && shotById(src.shot);
+  return s && s.take && isRendered(s) ? s : null;
+}
+/** The swap source's player URL and length in frames, or null. */
+function swapMedia() {
+  const src = swapCfg().source;
+  if (src.kind === "file") {
+    if (!src.file) return null;
+    return { src: viewURL({ filename: src.file, subfolder: src.subfolder, type: "input" }), n: Number(src.frames) || 0,
+      name: src.label || src.file };
+  }
+  const s = swapShot();
+  if (!s) return null;
+  const key = takeStem(s.take);
+  return { src: S.clips[key] ? clipFile(key, ".mp4") : null, n: Number(s.window) || Math.round((Number(s.seconds) || 5) * FPS),
+    name: titleOf(s), shot: s };
+}
+function swapProblem() {
+  const sw = swapCfg(), m = swapMedia();
+  if (!lsAtLeast(1, 9, 0)) return "Update H3 Long Shot to 1.9.0 (and restart ComfyUI) for Face swap.";
+  if (!sw.model) return "Choose the ref2va model.";
+  if (!isRef2vaName(sw.model)) return "That's not a ref2va model: Face swap needs one (it takes the new face as a picture).";
+  if (!m) return sw.source.kind === "file" ? "Choose a video." : "Choose a rendered Shot.";
+  if (sw.faces.some((f) => !f.cast || !castById(f.cast))) return "Choose the new face's picture for every face.";
+  if (sw.faces.length > 1 && sw.faces.some((f) => !f.keys.length)) return "Draw a box for each face.";
+  if (sw.faces.length === 1 && !f0Detector() && !sw.faces[0].keys.length) return "Download the face detector, or draw a box around the face.";
+  return "";
+}
+const f0Detector = () => !!(S.opts || {}).face_detector;
+const castById = (id) => (P().cast || []).find((c) => c.id === id && c.image) || null;
+function faceSwapHTML() {
+  const sw = swapCfg(), src = sw.source, o = S.opts || {};
+  const open = !folded("face-swap");
+  const m = swapMedia(), why = swapProblem();
+  const busy = Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "swap");
+  const head = `<button class="fold" data-action="fold" data-fold="face-swap" aria-expanded="${open}">
+      <span>Face swap${open ? "" : `<span class="muted small"> · ${esc(sw.model ? shortModel(sw.model) : "no ref2va model")} · ${sw.faces.length} face${sw.faces.length === 1 ? "" : "s"}${m ? " · " + esc(m.name) : ""}</span>`}</span>
+      <span class="muted chev">${open ? "Hide ▴" : "Show ▾"}</span></button>`;
+  if (!open) return `<div class="box face-card" style="margin-top:12px">${head}</div>`;
+  const models = (o.models || []).filter(isRef2vaName);
+  const rendered = active().filter((x) => x.kind !== "clip" && x.take && isRendered(x));
+  const pics = (P().cast || []).filter((c) => c.image);
+  const rows = sw.faces.map((f, i) => {
+    const nk = f.keys.length;
+    return `<div class="swap-face">
+      <span class="muted small">Face ${i + 1}</span>
+      <select data-swap-cast data-i="${i}" aria-label="New face ${i + 1}"><option value="">Choose the new face…</option>${pics.map((c) =>
+        `<option value="${esc(c.id)}"${f.cast === c.id ? " selected" : ""}>${esc(c.label || "Picture")}${c.bypassed ? " (bypassed)" : ""}</option>`).join("")}</select>
+      <button class="ghost sm" data-action="swap-box" data-i="${i}"${m && m.src && m.n ? "" : ' disabled title="Choose the video first (a Shot needs its clip: Make missing clips under the timeline)"'}>${nk ? `Edit box · ${nk} key${nk === 1 ? "" : "s"}` : "Draw box…"}</button>
+      ${sw.faces.length > 1 ? `<button class="icon x" data-action="swap-del" data-i="${i}" title="Remove this face" aria-label="Remove face ${i + 1}">${CROSS}</button>` : ""}
+      ${sw.faces.length === 1 && !nk ? '<span class="muted small">no box: the largest face in the video</span>' : ""}
+    </div>`;
+  }).join("");
+  const results = sw.results.length ? `<div class="swap-results"><div class="muted small">Made (in ${esc(P().slug)}/Face_Swap)</div>${sw.results.map((r, i) =>
+    `<div class="swap-res"><button class="ghost xs" data-action="swap-play" data-i="${i}">▶ Play</button> <span class="mono small">${esc(r.filename)}</span></div>`).join("")}
+    ${S.local ? '<button class="ghost xs" data-action="swap-folder">Open folder</button>' : ""}</div>` : "";
+  return `<div class="box face-card" style="margin-top:12px">${head}
+    <div class="muted small" style="margin-top:8px">Each face in a video becomes the person of a picture card, redrawn by the ref2va model with the same head movement, expression and mouth. The result is saved in the project's Face_Swap folder.</div>
+    <div class="box-row" style="margin-top:10px">
+      <div class="seg seg-sm" role="group" aria-label="What to swap faces in">
+        <button data-action="swap-src" data-v="shot" aria-pressed="${src.kind !== "file"}">A Shot's take</button>
+        <button data-action="swap-src" data-v="file" aria-pressed="${src.kind === "file"}">A video file</button>
+      </div>
+      ${src.kind === "file"
+        ? `<button class="ghost sm" data-action="swap-pick-file">${src.file ? "Another video…" : "Choose video…"}</button>
+           <span class="muted small">${src.file ? `${esc(src.label || src.file)}${src.frames ? ` · ${(src.frames / FPS).toFixed(1)} s` : ""}` : "any video; it's read at 24 fps"}</span>`
+        : `<select data-swap-shot aria-label="Shot to swap faces in"><option value="">Choose a Shot…</option>${rendered.map((x) =>
+            `<option value="${esc(x.id)}"${x.id === src.shot ? " selected" : ""}>${esc(titleOf(x))}</option>`).join("")}</select>`}
+    </div>
+    ${src.kind === "file" && src.frames > 60 * FPS ? '<div class="muted small" style="margin-top:4px">⚠ Only the first 60 s is used (every frame is held in RAM).</div>' : ""}
+    <div style="margin-top:10px">${rows}</div>
+    ${sw.faces.length < 4 ? `<button class="ghost xs" data-action="swap-add" style="margin-top:6px" title="Two or more faces: draw a box for each, and give each its picture">＋ Another face</button>` : ""}
+    <div class="model-files" style="margin-top:10px">
+      ${modelField("ref2va model", "diffusion_models", "swap_model", `<select data-swap="model" aria-label="Face swap model">${fileOptions(models, sw.model, "Choose a ref2va model…")}</select>`)}
+    </div>
+    <div class="grid3" style="margin-top:10px">
+      <label class="lbl" title="How much of the face is redrawn. A new identity needs more than refine (0.5–0.7); higher follows the mouth less closely">Denoise <input type="number" min="0.2" max="1" step="0.05" data-swap="denoise" value="${esc(sw.denoise)}"></label>
+      <label class="lbl">Steps <input type="number" min="1" max="200" step="1" data-swap="steps" value="${esc(sw.steps)}"></label>
+      <label class="lbl" title="ModelSamplingMiniMaxH3 for the swap. Lower makes the same denoise lighter">Video shift <input type="number" min="0.5" max="100" step="0.5" data-swap="shift_video" value="${esc(sw.shift_video)}"></label>
+      <label class="lbl" title="Brings the new face's broad colour back toward the footage's light. Low (0.3–0.5) keeps the new person's skin tone">Colour match <input type="number" min="0" max="1" step="0.1" data-swap="color" value="${esc(sw.color)}"></label>
+      <label class="lbl" title="How much around the face is blended in (1: brow to chin)">Mask size <input type="number" min="0.5" max="2.5" step="0.05" data-swap="mask" value="${esc(sw.mask)}"></label>
+      <label class="lbl">Seed <input type="number" min="0" step="1" data-swap="seed" value="${esc(sw.seed)}"></label>
+    </div>
+    <div class="box-row" style="margin-top:10px">
+      <button class="primary sm" data-action="swap-run"${why || busy ? " disabled" : ""}${why ? ` title="${esc(why)}"` : ""}>${busy ? "In the queue…" : "Swap faces"}</button>
+      ${why ? `<span class="muted small">${esc(why)}</span>` : ""}
+    </div>
+    ${results}
+  </div>`;
+}
+function swapOpts(sp) {
+  const sw = swapCfg(), src = sw.source, m = swapMedia();
+  if (!m) { S.error = "Face swap: its video or Shot isn't there any more."; return null; }
+  const source = src.kind === "file" ? { kind: "file", file: src.file, subfolder: src.subfolder, max_seconds: 60 }
+    : { kind: "take", take: m.shot.take, key: takeStem(m.shot.take) };
+  const item = { source, name: src.kind === "file" ? "" : `shot${numOf(m.shot.id)}`,
+    faces: sw.faces.map((f) => ({ cast: f.cast, keys: f.keys })) };
+  return { kind: "swap", faceSwap: item, label: `Face swap · ${m.name}`,
+    note: `${sw.faces.length} face${sw.faces.length === 1 ? "" : "s"} · ${shortModel(sw.model)} · denoise ${Number(sw.denoise).toFixed(2)}`,
+    extra: { name: m.name }, onDone: () => {} };
+}
+function swapDone(b, outputs) {
+  const o = outputs[(b.built.nodes || {}).save] || {};
+  const file = (o.gifs || o.videos || [])[0];
+  let rep = {};
+  try { rep = JSON.parse(((outputs[(b.built.nodes || {}).face] || {}).face_report || [])[0] || "{}"); } catch (e) { rep = {}; }
+  if (!file) { S.error = "Face swap finished but no video came back."; return; }
+  const sw = swapCfg();
+  sw.results = [{ filename: file.filename, subfolder: file.subfolder, type: file.type || "output", made: Date.now(), from: (b.extra || {}).name || "" }]
+    .concat(sw.results.filter((r) => r.filename !== file.filename)).slice(0, 20);
+  scheduleSave();
+  if (rep.note === "no faces") toast("Face swap: no face found, so nothing changed. Draw a box around the face and try again.");
+  else toast(`Face swap saved: ${file.filename}`, { label: "Play", fn: () => swapPlay(0) });
+  if (!S.swapped) renderFace();
+}
+function swapPlay(i) {
+  const r = swapCfg().results[i];
+  if (!r) return;
+  showModal(r.filename, null, `<video src="${esc(viewURL(r))}" controls autoplay playsinline style="width:100%;max-height:70vh;background:#000"></video>`);
+}
+async function swapPickFile() {
+  if (setupGuard()) return;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "video/*";
+  inp.addEventListener("change", async () => {
+    const f = inp.files[0];
+    if (!f) return;
+    const frames = await new Promise((resolve) => {
+      const v = document.createElement("video"), url = URL.createObjectURL(f);
+      v.preload = "metadata";
+      v.onloadedmetadata = () => { resolve(Math.max(1, Math.round((v.duration || 0) * FPS))); URL.revokeObjectURL(url); };
+      v.onerror = () => { resolve(0); URL.revokeObjectURL(url); };
+      v.src = url;
+    });
+    toast(`Uploading ${f.name}…`);
+    let info;
+    try { info = await uploadFile(f, "video"); } catch (e) { toast(e.message); return; }
+    const sw = swapCfg();
+    sw.source = Object.assign(sw.source, { kind: "file", file: info.name, subfolder: info.subfolder, label: f.name, frames });
+    sw.faces.forEach((x) => { x.keys = []; });          // boxes were drawn on the other video
+    commit();
+  });
+  inp.click();
+}
+function swapBox(i) {
+  const sw = swapCfg(), m = swapMedia(), f = sw.faces[i];
+  if (!m || !m.src || !f) return;
+  const pic = castById(f.cast);
+  openRegionEditor({ target: { swap: i }, title: `Face ${i + 1}${pic ? " → " + (pic.label || "") : ""} · ${m.name}`, src: m.src, n: m.n || FPS * 5,
+    keys: f.keys, saveLabel: "Save box",
+    hint: "Drag a box around this face (forehead to chin, ear to ear) on the first and the last frame; add frames where it moves a lot. Between them the box moves in a straight line.",
+    save: (keys) => { f.keys = keys; commit(); } });
+}
+
 /** Try on this Shot: its take decoded, faces refined, saved as its own clip. */
+// ---------------------------------------------------------------------------
+// 0.17.38: Region editor: draw the box to redraw on key frames of the take (first and last at
+// least); Long Shot moves it in a straight line between them.
+// ---------------------------------------------------------------------------
+const RG = { s: null, save: null, keys: [], frame: 0, n: 1, drag: null };
+
+/** The box on frame f: a key, or between the keys around it (held outside them). */
+function rgBoxAt(keys, f) {
+  if (!keys.length) return null;
+  const ks = keys.slice().sort((a, b) => a[0] - b[0]);
+  if (f <= ks[0][0]) return ks[0].slice(1);
+  if (f >= ks[ks.length - 1][0]) return ks[ks.length - 1].slice(1);
+  for (let i = 1; i < ks.length; i++) {
+    if (f <= ks[i][0]) {
+      const a = ks[i - 1], b = ks[i], t = (f - a[0]) / Math.max(1, b[0] - a[0]);
+      return [1, 2, 3, 4].map((j) => a[j] + (b[j] - a[j]) * t);
+    }
+  }
+  return null;
+}
+
+function regionEditor(s) {
+  if (!s || !s.take) return;
+  const key = takeStem(s.take);
+  if (!S.clips[key]) { toast("Make this take's clip first (Make missing clips under the timeline)."); return; }
+  openRegionEditor({ target: s, title: `Region · ${titleOf(s)}`, src: clipFile(key, ".mp4"),
+    n: Math.max(1, Number(s.window) || Math.round((Number(s.take_seconds) || Number(s.seconds) || 5) * FPS)),
+    keys: (s.face_region && s.face_region.keys) || [], save: null });
+}
+/** 0.18.0: the editor for any video: target (truthy while open), src, n frames, keys, save(keys)
+ *  (null: the Shot's region). */
+function openRegionEditor({ target, title, src, n, keys, save, hint = "", saveLabel = "Save region" }) {
+  RG.s = target;
+  RG.save = save;
+  RG.keys = (keys || []).map((k) => k.slice(0, 5));
+  RG.n = Math.max(1, Math.round(n) || 1);
+  RG.frame = 0;
+  showModal(title, null, `
+    <div class="rg-stage" id="rg-stage">
+      <video id="rg-video" src="${esc(src)}" muted playsinline preload="auto"></video>
+      <div id="rg-box" class="rg-box" hidden></div>
+      <div id="rg-hit" class="rg-hit" title="Drag to draw the box on this frame"></div>
+    </div>
+    <div class="rg-bar">
+      <button class="ghost sm" data-action="rg-go" data-f="0">⏮ First</button>
+      <input type="range" id="rg-scrub" min="0" max="${RG.n - 1}" step="1" value="0" aria-label="Frame">
+      <button class="ghost sm" data-action="rg-go" data-f="last">Last ⏭</button>
+      <span id="rg-frame" class="mono small"></span>
+    </div>
+    <div class="rg-keys" id="rg-keys"></div>
+    <div class="muted small">${hint || "Drag on the picture to draw the box on this frame: snug around what to redraw (the characters in the sleigh, say). Draw it on the first and the last frame; add more frames where the path bends. Between them the box moves in a straight line."}</div>
+    <div class="rg-actions">
+      <button class="ghost sm" data-action="rg-del">Delete this key</button>
+      <button class="ghost sm" data-action="rg-clear">Clear all</button>
+      <span class="push"></span>
+      <button class="primary" data-action="rg-save">${esc(saveLabel)}</button>
+    </div>`);
+  const v = $("rg-video");
+  v.addEventListener("loadedmetadata", () => {
+    if (v.videoWidth && v.videoHeight) $("rg-stage").style.aspectRatio = `${v.videoWidth} / ${v.videoHeight}`;
+    rgFrame(0);
+  });
+  rgShow();
+}
+
+function rgFrame(f) {
+  RG.frame = Math.max(0, Math.min(RG.n - 1, Math.round(f)));
+  const v = $("rg-video");
+  if (v) { try { v.currentTime = (RG.frame + 0.5) / FPS; } catch (e) { /* not loaded yet */ } }
+  const sc = $("rg-scrub");
+  if (sc && Number(sc.value) !== RG.frame) sc.value = String(RG.frame);
+  rgShow();
+}
+
+function rgShow() {
+  const box = $("rg-box");
+  if (!box) return;
+  const isKey = RG.keys.some((k) => k[0] === RG.frame);
+  const b = RG.drag ? RG.drag.box : rgBoxAt(RG.keys, RG.frame);
+  box.hidden = !b;
+  if (b) {
+    Object.assign(box.style, { left: b[0] * 100 + "%", top: b[1] * 100 + "%", width: b[2] * 100 + "%", height: b[3] * 100 + "%" });
+    box.classList.toggle("key", isKey || !!RG.drag);
+  }
+  $("rg-frame").textContent = `frame ${RG.frame + 1} / ${RG.n}${isKey ? " · key" : b ? " · in between" : ""}`;
+  const ks = RG.keys.slice().sort((a, c) => a[0] - c[0]);
+  $("rg-keys").innerHTML = ks.length ? "Key frames: " + ks.map((k) =>
+    `<button class="ghost xs${k[0] === RG.frame ? " on" : ""}" data-action="rg-key" data-f="${k[0]}">${k[0] + 1}</button>`).join(" ")
+    : '<span class="muted small">No box yet.</span>';
+}
+
+document.addEventListener("input", (e) => { if (e.target && e.target.id === "rg-scrub") rgFrame(Number(e.target.value)); });
+document.addEventListener("pointerdown", (e) => {
+  if (!e.target || e.target.id !== "rg-hit" || !RG.s) return;
+  const r = e.target.getBoundingClientRect();
+  const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+  RG.drag = { x, y, r, box: [x, y, 0, 0] };
+  e.target.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+document.addEventListener("pointermove", (e) => {
+  const d = RG.drag;
+  if (!d) return;
+  const x = Math.min(1, Math.max(0, (e.clientX - d.r.left) / d.r.width)), y = Math.min(1, Math.max(0, (e.clientY - d.r.top) / d.r.height));
+  d.box = [Math.min(d.x, x), Math.min(d.y, y), Math.abs(x - d.x), Math.abs(y - d.y)];
+  rgShow();
+});
+document.addEventListener("pointerup", () => {
+  const d = RG.drag;
+  if (!d) return;
+  RG.drag = null;
+  if (d.box[2] > 0.01 && d.box[3] > 0.01) {
+    RG.keys = RG.keys.filter((k) => k[0] !== RG.frame).concat([[RG.frame, ...d.box]]);
+  }
+  rgShow();
+});
+
 function faceTry(s) {
   if (!s || !s.take) return;
-  if (!faceActive()) { toast(!(S.opts || {}).face_detector ? "Download the face detector first." : "Choose the face model first (Face refine panel)."); return; }
+  const region = s.face_region && s.face_region.on;
+  if (region && !(s.face_region.keys || []).length) { toast("Draw the region first (Face refine → Region → Draw region…)."); return; }
+  if (region && !lsAtLeast(1, 8, 2)) { toast("Region refine needs H3 Long Shot 1.8.2 or later. Update it, then restart ComfyUI."); return; }
+  const f0 = P().settings.face;
+  if (region ? !f0.model : !faceActive()) { toast(!region && !(S.opts || {}).face_detector ? "Download the face detector first." : "Choose the face model first (Face refine panel)."); return; }
   if (Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "face" && j.spec.target === s.id)) {
     toast("This Shot is already in the queue to be refined."); return;
   }
@@ -7989,14 +8588,14 @@ async function faceDone(b, outputs) {
   if (!s) return;
   let rep = {};
   try { rep = JSON.parse(((outputs[b.built.nodes.face] || {}).face_report || [])[0] || "{}"); } catch (e) { rep = {}; }
-  const tracks = (rep.tracks || []).slice(0, 6).map((t) => ({ id: t.id, size: t.size, boxes: t.boxes }));
+  const tracks = (rep.tracks || []).slice(0, 6).map((t) => ({ id: t.id, size: t.size, boxes: t.boxes, shape: t.shape || "oval" }));
   s.face = { take: b.extra.take, sig: b.extra.sig,
     keep: (s.face && s.face.take === b.extra.take && s.face.keep) || "original",
     treated: rep.treated || 0, cached: (rep.crops || []).length > 0 && (rep.crops || []).every((c) => c.cached),
     w: rep.width || 0, h: rep.height || 0, crops: (rep.crops || []).map((c) => ({ track: c.track, start: c.start, frames: c.frames, side: c.side })),
     tracks, note: rep.note || "", made: Date.now() };
   scheduleSave();
-  if (!rep.treated) toast(rep.note === "no small faces" ? `${titleOf(s)}: no faces under ${P().settings.face.max_face} px, nothing redrawn.` : `${titleOf(s)}: nothing redrawn.`);
+  if (!rep.treated) toast(rep.note === "no regions" ? `${titleOf(s)}: the region is empty, nothing redrawn.` : rep.note === "no small faces" ? `${titleOf(s)}: no faces under ${P().settings.face.max_face} px, nothing redrawn.` : `${titleOf(s)}: nothing redrawn.`);
   else if (!S.swapped && P().shots.includes(s)) { renderFace(); openAB(s); }
 }
 
@@ -8188,7 +8787,10 @@ document.addEventListener("click", async (e) => {
     case "stop": stop(); break;
     case "dry-run": dryRun(); break;
     case "dismiss-error": S.error = null; renderDecision(); break;
-    case "toggle": S[el.dataset.key] = !S[el.dataset.key]; render(); break;
+    case "toggle":
+      S[el.dataset.key] = !S[el.dataset.key];
+      if (el.dataset.key === "settingsOpen") store("h3studio.settingsOpen", S.settingsOpen ? "1" : "0");   // 0.17.42
+      render(); break;
     case "face-turbo-on": case "face-hold": {
       if (setupGuard()) return;
       const f = p.settings.face;
@@ -8200,6 +8802,49 @@ document.addEventListener("click", async (e) => {
     case "face-which": if (setupGuard()) return; p.settings.face.which = el.dataset.v === "largest" ? "largest" : "all"; commit(); break;
     case "face-detector": installFaceDetector(); break;
     case "face-try": faceTry(shotById(el.dataset.shot)); break;
+    case "swap-src": { const sw = swapCfg(); if (sw.source.kind !== el.dataset.v) { sw.source.kind = el.dataset.v; sw.faces.forEach((x) => { x.keys = []; }); commit(); } break; }
+    case "swap-pick-file": swapPickFile(); break;
+    case "swap-box": swapBox(Number(el.dataset.i)); break;
+    case "swap-add": { const sw = swapCfg(); if (sw.faces.length < 4) { sw.faces.push({ cast: null, keys: [] }); commit(); } break; }
+    case "swap-del": { const sw = swapCfg(); sw.faces.splice(Number(el.dataset.i), 1); if (!sw.faces.length) sw.faces.push({ cast: null, keys: [] }); commit(); break; }
+    case "swap-play": swapPlay(Number(el.dataset.i)); break;
+    case "swap-folder": api("/longshot/open-folder", { method: "POST", body: { which: "output", project: P().slug, subfolder: `longshot/${P().slug}/Face_Swap` } }).catch((e) => toast(e.message)); break;
+    case "swap-run": {
+      const why = swapProblem();
+      if (why) { toast(why); break; }
+      const m = swapMedia();
+      enqueue({ type: "swap", what: m ? m.name : "" });
+      break;
+    }
+    case "face-mode": {                              // 0.17.38: Faces (detector) or a Region drawn by hand
+      const sh = shotById(el.dataset.shot);
+      if (!sh) break;
+      sh.face_region = Object.assign({ keys: [], text: "" }, sh.face_region || {}, { on: el.dataset.v === "region" });
+      commit();
+      break;
+    }
+    case "face-region-draw": regionEditor(shotById(el.dataset.shot)); break;
+    case "rg-go": if (RG.s) rgFrame(el.dataset.f === "last" ? RG.n - 1 : Number(el.dataset.f) || 0); break;
+    case "rg-key": if (RG.s) rgFrame(Number(el.dataset.f) || 0); break;
+    case "rg-del": if (RG.s) { RG.keys = RG.keys.filter((k) => k[0] !== RG.frame); rgShow(); } break;
+    case "rg-clear": if (RG.s) { RG.keys = []; rgShow(); } break;
+    case "rg-save": {
+      if (!RG.s) break;
+      if (RG.save) {                                 // 0.18.0: a face swap box
+        const fn = RG.save;
+        RG.s = null; RG.save = null;
+        $("modal").hidden = true;
+        fn(RG.keys.slice().sort((a, b) => a[0] - b[0]).map((k) => k.map((v, i) => i ? Math.round(v * 10000) / 10000 : Math.round(v))));
+        break;
+      }
+      const sh = RG.s;
+      sh.face_region = Object.assign({ on: true, text: "" }, sh.face_region || {}, { on: true,
+        keys: RG.keys.slice().sort((a, b) => a[0] - b[0]).map((k) => k.map((v, i) => i ? Math.round(v * 10000) / 10000 : Math.round(v))) });
+      RG.s = null;
+      $("modal").hidden = true;
+      commit();
+      break;
+    }
     case "face-ab": openAB(shotById(el.dataset.shot)); break;
     case "face-keep": {
       const sh = shotById(el.dataset.shot);
@@ -8253,6 +8898,26 @@ document.addEventListener("click", async (e) => {
       renderShots(); break;
     }
     case "group-rename": S.renameGroup = el.closest("[data-group]").dataset.group; S.renameDraft = undefined; renderShots(); break;
+    case "group-bypass": {                         // 0.17.33: the whole group off / on
+      const id = el.closest("[data-group]").dataset.group, mem = groupShots(id);
+      if (!mem.length) break;
+      const turnOff = !mem.every((x) => x.bypassed);
+      const first = p.shots.indexOf(mem[0]);
+      if (listGuard(first)) return;
+      if (mem.some((x) => inRender(x) || jobFor(x.id))) { toast("Some of its Shots are rendering or in the queue. Stop or remove those first."); return; }
+      const change = mem.filter((x) => !!x.bypassed !== turnOff);
+      for (const x of change) x.bypassed = turnOff;
+      S.dry = null;
+      if (change.length) {
+        const g = groupById(id), name = g ? g.name : "The group";
+        if (!syncAfter(change[change.length - 1], `${turnOff ? "Bypassing" : "Turning on"} ${name}`) && renderedAfter(change[change.length - 1]).length) {
+          toast(`${name} is ${turnOff ? "bypassed" : "on again"}. The Shots after it keep their takes; if a join looks wrong, reroll the Shot after it to bridge it.`);
+        }
+      }
+      if (turnOff && S.open && change.some((x) => x.id === S.open)) S.open = null;
+      commit();
+      break;
+    }
     case "group-ungroup": {
       const id = el.closest("[data-group]").dataset.group;
       for (const x of p.shots) if (x.group === id) x.group = null;
@@ -8348,6 +9013,7 @@ document.addEventListener("click", async (e) => {
     case "ref-step": stepRef(castOf(el), +el.dataset.dir); break;
     case "flip-shots": store("h3studio.flipShots", store("h3studio.flipShots") === "1" ? "0" : "1"); renderShots(); break;
     case "add-voice": pickVoices(null); break;
+    case "add-refs": pickRefs(); break;
     case "install-pack": installPack(el.dataset.pack); break;
     case "install-preview": installPreview(); break;
     case "viewer-hide": setViewerHidden(true); break;
@@ -8590,6 +9256,24 @@ document.addEventListener("click", async (e) => {
     case "new-project": closeMenu(); newProject(); break;
     case "open-list": closeMenu(); openList(); break;
     case "open-project": $("modal").hidden = true; switchProject(el.dataset.slug); break;
+    case "proj-sort": store("h3studio.projSort", el.dataset.v === "name" ? "name" : "date"); renderOpenList(); break;
+    case "proj-folder": projectFolder(el.dataset.slug); break;
+    case "proj-new-folder": {                       // 0.17.37: an empty folder to drag projects into
+      const n = (prompt("Name of the new folder:") || "").replace(/\s+/g, " ").trim().slice(0, 60);
+      if (!n) break;
+      (S.newFolders = S.newFolders || new Set()).add(n);
+      renderOpenList();
+      break;
+    }
+    case "proj-folder-fold": {
+      let c = [];
+      try { c = JSON.parse(store("h3studio.projFoldersClosed") || "[]"); } catch (e) { c = []; }
+      const n = el.dataset.folder;
+      c = c.includes(n) ? c.filter((x) => x !== n) : c.concat([n]);
+      store("h3studio.projFoldersClosed", JSON.stringify(c));
+      renderOpenList();
+      break;
+    }
     case "save": closeMenu(); saveNow(); break;
     case "save-as": closeMenu(); saveAs(); break;
     case "rename": closeMenu(); renameProject(); break;
@@ -8717,6 +9401,15 @@ document.addEventListener("change", async (e) => {
   if (el.id === "tl-export-up") { p.settings.export_upscale = el.checked; return commit(); }
   if (el.id === "tl-export-stems" || el.dataset.stems !== undefined) { p.settings.stems = el.checked; return commit(); }   // 0.17.28
   if (el.id === "live-preview") { setLive(el.checked); return; }
+  if (el.id === "line-up") {                                       // 0.17.44
+    P().settings.line_up = el.checked;
+    P().preview_dirty = true;
+    S.dry = null;
+    commit();
+    toast(el.checked ? "Shots line up end to end: no overlaps, no moves (they're kept for when you turn this off)."
+      : "Overlaps and moves are back on the film.");
+    return;
+  }
   if (el.dataset.anchorFile !== undefined) {
     const k = el.closest("[data-anchor]");
     if (!k || setupGuard()) { render(); return; }
@@ -8828,9 +9521,36 @@ document.addEventListener("change", async (e) => {
     if (el.value && shotById(el.value)) focusShot(el.value);
     return;
   }
+  if (el.dataset.faceRegionText !== undefined) {   // 0.17.38: what's in the region (its prompt)
+    const sh = shotById(el.dataset.shot);
+    if (sh) { sh.face_region = Object.assign({ on: true, keys: [] }, sh.face_region || {}, { text: el.value.trim().slice(0, 300) }); scheduleSave(); }
+    return;
+  }
   if (el.dataset.faceShot !== undefined) {         // 0.14.1: pick the Shot (moves the viewer there too)
     if (el.value && shotById(el.value)) focusShot(el.value);
     return;
+  }
+  if (el.dataset.swapCast !== undefined) {          // 0.18.0
+    const f = p.settings.face_swap.faces[Number(el.dataset.i)];
+    if (f) { f.cast = el.value || null; commit(); }
+    return;
+  }
+  if (el.dataset.swapShot !== undefined) {
+    const sw = p.settings.face_swap;
+    if (sw.source.shot !== (el.value || null)) { sw.source.shot = el.value || null; sw.faces.forEach((x) => { x.keys = []; }); }
+    return commit();
+  }
+  if (el.dataset.swap) {
+    const sw = p.settings.face_swap, k = el.dataset.swap;
+    const num = (lo, hi, d, int) => { const v = Number(el.value); const x = Number.isFinite(v) && el.value !== "" ? v : d; return Math.max(lo, Math.min(hi, int ? Math.round(x) : x)); };
+    if (k === "model") sw.model = el.value || null;
+    else if (k === "denoise") sw.denoise = num(0.2, 1, 0.6);
+    else if (k === "steps") sw.steps = num(1, 200, 12, true);
+    else if (k === "shift_video") sw.shift_video = num(0.5, 100, 4);
+    else if (k === "color") sw.color = num(0, 1, 0.4);
+    else if (k === "mask") sw.mask = num(0.5, 2.5, 1.15);
+    else if (k === "seed") sw.seed = num(0, 2 ** 53, 0, true);
+    return commit();
   }
   if (el.dataset.face) {
     const f = p.settings.face, k = el.dataset.face;
@@ -9176,22 +9896,119 @@ async function renameProject() {
   toast(res.slug === old ? "Renamed." : `Renamed. Its files moved to input/longshot/${res.slug} and output/longshot/${res.slug}.`);
 }
 
+/** 0.17.36: the Open project list: sorted by date or name, filed in folders (one level,
+ *  each one folds), at most about 10 rows tall, then it scrolls. */
 async function openList() {
   await refreshProjects();
+  renderOpenList();
+}
+
+function renderOpenList() {
   const when = (iso) => iso ? new Date(iso.slice(0, 19)).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "never";
-  const rows = S.projects.map((p) => {
+  const sort = store("h3studio.projSort") === "name" ? "name" : "date";
+  let closed = new Set();
+  try { closed = new Set(JSON.parse(store("h3studio.projFoldersClosed") || "[]")); } catch (e) { /* none */ }
+  const byName = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+  const list = (S.projects || []).slice().sort(sort === "name" ? byName : (a, b) => (b.saved_at || "").localeCompare(a.saved_at || ""));
+  const row = (p) => {
     const v = p.video;
     const thumb = v && v.workflow
       ? `<img alt="" loading="lazy" src="${esc(viewURL({ filename: v.workflow, subfolder: v.subfolder, type: v.type || "output" }))}" onerror="this.replaceWith(document.createTextNode('no preview'))">`
       : v && v.filename ? `<video muted playsinline preload="metadata" src="${esc(viewURL(v))}#t=0.5"></video>` : "no video";
-    return `<button class="proj-row${p.slug === P().slug ? " current" : ""}" data-action="open-project" data-slug="${esc(p.slug)}">
+    return `<div class="proj-item" draggable="true" data-drag-proj="${esc(p.slug)}" data-folder="${esc(p.folder || "")}"><button class="proj-row${p.slug === P().slug ? " current" : ""}" data-action="open-project" data-slug="${esc(p.slug)}">
       <span class="proj-thumb">${thumb}</span>
       <span class="proj-meta"><b>${esc(p.name)}</b>
         <span class="muted small">Saved ${esc(when(p.saved_at))} · ${p.approved} of ${p.shots} shots approved</span>
         ${p.slug !== P().slug && tabWith(p.slug) ? '<span class="missing-tag" title="Open in another Studio tab: switch to that tab to work on it.">open in another tab</span>' : ""}
-        ${p.files_missing ? '<span class="missing-tag" title="Its input or output folder was deleted. Delete the project, or put the folder back.">files missing</span>' : ""}</span></button>`;
-  }).join("") || '<div class="muted">No saved projects yet.</div>';
-  showModal("Open project", null, rows);
+        ${p.files_missing ? '<span class="missing-tag" title="Its input or output folder was deleted. Delete the project, or put the folder back.">files missing</span>' : ""}</span></button>
+      <button class="ghost sm proj-move" data-action="proj-folder" data-slug="${esc(p.slug)}" title="${p.folder ? `In “${esc(p.folder)}”. Move it to another folder, or out of folders` : "Put it in a folder"}">${FOLDER_ICON}</button></div>`;
+  };
+  // folders A→Z (with any new, still empty ones), then the projects in none
+  const names = [...new Set(list.map((p) => p.folder).filter(Boolean).concat([...(S.newFolders || [])]))]
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+  const groups = names.map((n) => {
+    const items = list.filter((p) => p.folder === n), open = !closed.has(n);
+    return `<div class="proj-folder${open ? " open" : ""}" data-drop-folder="${esc(n)}">
+      <button class="proj-folder-head" data-action="proj-folder-fold" data-folder="${esc(n)}" aria-expanded="${open}">
+        <span class="chev">${open ? "▾" : "▸"}</span>${FOLDER_ICON}<b>${esc(n)}</b><span class="muted small">${items.length ? `${items.length} project${items.length === 1 ? "" : "s"}` : "empty · drag projects here"}</span></button>
+      ${open ? items.map(row).join("") : ""}</div>`;
+  }).join("");
+  const loose = list.filter((p) => !p.folder).map(row).join("");
+  const body = (groups + (names.length ? `<div class="proj-loose" data-drop-folder=""><div class="proj-loose-head muted small">Not in a folder${loose ? "" : " · drag a project here to take it out of its folder"}</div>${loose}</div>` : loose)) ||
+    '<div class="muted">No saved projects yet.</div>';
+  const tools = `<div class="proj-tools">
+      <span class="muted small">Sort</span>
+      <div class="seg seg-sm" role="group" aria-label="Sort projects">
+        <button data-action="proj-sort" data-v="date" aria-pressed="${sort === "date"}">Date</button>
+        <button data-action="proj-sort" data-v="name" aria-pressed="${sort === "name"}">Name</button>
+      </div>
+      <button class="ghost sm" data-action="proj-new-folder" title="Make a folder, then drag projects into it">＋ New folder</button>
+      <span class="push"></span>
+      <span class="muted small">${list.length} project${list.length === 1 ? "" : "s"}${names.length ? ` · ${names.length} folder${names.length === 1 ? "" : "s"}` : ""} · drag projects onto a folder</span>
+    </div>`;
+  const keep = $("modal").hidden ? 0 : (($("modal-body").querySelector(".proj-list") || {}).scrollTop || 0);
+  showModal("Open project", null, `${tools}<div class="proj-list">${body}</div>`);
+  const pl = $("modal-body").querySelector(".proj-list");
+  if (pl) pl.scrollTop = keep;
+}
+
+const FOLDER_ICON = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><path d="M1.75 4.25v8a1 1 0 0 0 1 1h10.5a1 1 0 0 0 1-1v-6.5a1 1 0 0 0-1-1H8L6.5 3.25H2.75a1 1 0 0 0-1 1z"/></svg>';
+
+/** 0.17.37: file a project (drag and drop, or the folder button). */
+async function setProjectFolder(slug, folder) {
+  const p = (S.projects || []).find((x) => x.slug === slug);
+  if (!p || (p.folder || "") === (folder || "")) return;
+  try {
+    const r = await api(`/longshot/projects/${encodeURIComponent(slug)}/folder`, { method: "POST", body: { folder } });
+    p.folder = r.folder || "";
+    if (p.folder && S.newFolders) S.newFolders.delete(p.folder);
+  } catch (e) { toast(e.message); return; }
+  renderOpenList();
+}
+
+const PDND = { slug: null };
+document.addEventListener("dragstart", (e) => {
+  const it = e.target.closest && e.target.closest("[data-drag-proj]");
+  if (!it) return;
+  PDND.slug = it.dataset.dragProj;
+  e.dataTransfer.effectAllowed = "move";
+  try { e.dataTransfer.setData("text/plain", "h3proj:" + PDND.slug); } catch (err) { /* ignore */ }
+  it.classList.add("dragging");
+});
+document.addEventListener("dragover", (e) => {
+  if (!PDND.slug) return;
+  const t = e.target.closest && e.target.closest("[data-drop-folder]");
+  document.querySelectorAll(".proj-drop").forEach((x) => x.classList.remove("proj-drop"));
+  if (!t) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  t.classList.add("proj-drop");
+});
+document.addEventListener("drop", (e) => {
+  if (!PDND.slug) return;
+  const t = e.target.closest && e.target.closest("[data-drop-folder]");
+  const slug = PDND.slug;
+  PDND.slug = null;
+  document.querySelectorAll(".proj-drop").forEach((x) => x.classList.remove("proj-drop"));
+  if (!t) return;
+  e.preventDefault();
+  setProjectFolder(slug, t.dataset.dropFolder || "");
+});
+document.addEventListener("dragend", () => {
+  if (!PDND.slug && !document.querySelector(".proj-item.dragging")) return;
+  PDND.slug = null;
+  document.querySelectorAll(".proj-drop").forEach((x) => x.classList.remove("proj-drop"));
+  document.querySelectorAll(".proj-item.dragging").forEach((x) => x.classList.remove("dragging"));
+});
+
+async function projectFolder(slug) {
+  const p = (S.projects || []).find((x) => x.slug === slug);
+  if (!p) return;
+  const existing = [...new Set((S.projects || []).map((x) => x.folder).filter(Boolean))].sort();
+  const name = prompt(`Folder for “${p.name}”.\nType a folder name (a new one is made), or leave it empty for no folder.` +
+    (existing.length ? `\n\nFolders: ${existing.join(", ")}` : ""), p.folder || "");
+  if (name === null) return;
+  await setProjectFolder(slug, name.trim());
 }
 
 function deleteDialog() {
@@ -9463,7 +10280,7 @@ async function addImages(fileList, targetId) {
   else if (target && same) notes.push("Same picture as before, so nothing re-renders.");
   else if (list.length > 1 && !shared) notes.push(`Added ${list.length} references.`);
   if (files.length > imgs.length) notes.push(`Skipped ${files.length - imgs.length} file${files.length - imgs.length > 1 ? "s" : ""} that ${files.length - imgs.length > 1 ? "aren't images" : "isn't an image"}.`);
-  if (target && imgs.length > 1) notes.push("Only the first image replaced it; drop several on Add reference to add each one.");
+  if (target && imgs.length > 1) notes.push("Only the first image replaced it; drop several on the panel to add each one.");
   if (notes.length) toast(notes.join(" "));
   if (!target && list.length === 1 && !failed.length) openEditor(cards[0]);   // name the new reference
 }
@@ -9585,9 +10402,10 @@ window.addEventListener("drop", (e) => {
   if (t.zone === "cast") {
     const fl = [...e.dataTransfer.files];
     // audio files on Cast & Scenes are voice references (a voice card: replace its file)
-    if (t.video || (fl.some((x) => VIDEO_RE.test(x.name || "")) && !fl.some(isImageFile))) addVideos(fl, t.video || null);   // 0.17.1
-    else if (t.voice || (fl.some((x) => AUDIO_RE.test(x.name || "")) && !fl.some(isImageFile))) addVoices(fl, t.voice || null);
-    else addImages(e.dataTransfer.files, t.id);
+    if (t.video) addVideos(fl, t.video);              // a card: replace its file
+    else if (t.voice) addVoices(fl, t.voice);
+    else if (t.id) addImages(fl, t.id);
+    else addRefFiles(fl);                             // 0.17.43: the panel: every kind, sorted
   }
   else if (t.zone === "audio") addAudio(e.dataTransfer.files);
   else if (t.zone === "shots") addClipFiles(e.dataTransfer.files, t.id);
@@ -10367,6 +11185,9 @@ function renderStats(d) {
   const out = [];
   if (d.ram) out.push(chip("RAM", `${fmtGB(d.ram.used)}/${fmtGB(d.ram.total)} GB`, d.ram.used / d.ram.total, "System memory in use on the ComfyUI machine"));
   if (d.gpu && d.gpu.util !== null && d.gpu.util !== undefined) out.push(chip("GPU", `${Math.round(d.gpu.util)}%`, d.gpu.util / 100, d.gpu.name || "GPU load"));
+  // 0.17.34: the GPU's core temperature (amber from 83 °C)
+  if (d.gpu && d.gpu.temp !== null && d.gpu.temp !== undefined) out.push(chip("TEMP", `${Math.round(d.gpu.temp)} °C`, d.gpu.temp >= 83 ? 1 : 0,
+    `GPU core temperature${d.gpu.name ? " · " + d.gpu.name : ""}`));
   if (d.gpu) out.push(chip("VRAM", `${fmtGB(d.gpu.vram_used)}/${fmtGB(d.gpu.vram_total)} GB`, d.gpu.vram_used / d.gpu.vram_total, `Video memory in use on ${d.gpu.name || "the GPU"}`));
   el.innerHTML = out.join("");
   el.hidden = !out.length;
@@ -10572,6 +11393,7 @@ function currentFor(target) {
   if (target === "melband") return p.audio.melband_model;
   if (target === "refine_model") return s.refine.model;
   if (target === "face_model") return s.face.model;
+  if (target === "swap_model") return s.face_swap.model;
   if (target.startsWith("lora:")) return s.loras[+target.slice(5)].name;
   return s[target];
 }
@@ -10645,6 +11467,7 @@ async function mbPick(name) {
   if (t === "melband") { p.audio.melband_model = name; if (p.audio.voice_ref) sharedChanged("Audio"); return commit(); }
   if (t === "refine_model") { s.refine.model = name; S.dry = null; return commit(); }
   if (t === "face_model") { s.face.model = name; return commit(); }
+  if (t === "swap_model") { s.face_swap.model = name; return commit(); }
   const matters = t === "turbo" ? s.turbo.on : t.startsWith("lora:") ? s.loras[+t.slice(5)].on : true;
   const what = t === "turbo" ? "the Turbo LoRA" : t.startsWith("lora:") ? `LoRA ${+t.slice(5) + 1}` : KEEPABLE[t] || "the model";
   let mode = "all";
@@ -10896,7 +11719,7 @@ function insertShot(at, group = null) {
   S.dry = null;
   syncAfter(s, "Inserting a Shot");
   commit();
-  setTimeout(() => { const t = document.querySelector(`[data-shot="${s.id}"] textarea`); if (t) t.focus(); }, 0);
+  setTimeout(() => { const t = document.querySelector(`[data-shot="${s.id}"] textarea`); if (t) { scrollIntent++; t.focus(); } }, 0);
 }
 
 const takesLoading = new Set();
@@ -11232,10 +12055,60 @@ for (const name of ["render", "renderShots", "renderDecision", "renderViewer", "
   window[name] = function (...args) { if (S.swapped) return undefined; return f.apply(this, args); };
 }
 
+// 0.17.45: a refresh mid-render. The running job keeps its ComfyUI run (prompt id and what
+// was built) in the saved queue; after the page loads, a run still going is watched again
+// and a run that finished meanwhile is saved as its take(s), the same as without the refresh.
+const RESUME_TYPES = new Set(["shot", "through", "all", "face", "refine", "stems", "swap"]);
+function keepRun(b) {
+  const job = b && b.jobId && Q.jobs.find((j) => j.id === b.jobId);
+  if (!job || !RESUME_TYPES.has(job.spec.type)) return;
+  const run = {};
+  for (const [k, v] of Object.entries(b)) if (typeof v !== "function") run[k] = v;
+  if (run.built) run.built = Object.assign({}, run.built, { prompt: undefined });   // (the graph isn't needed again)
+  job.run = run;
+  saveQueue();
+}
+async function resumeRun() {
+  const job = Q.jobs.find((j) => j.state === "running" && j.run && j.run.promptId);
+  if (!job) return false;
+  const back = (why) => { delete job.run; job.state = "waiting"; saveQueue(); if (why) console.info("Studio: " + why); return false; };
+  const pid = job.run.promptId;
+  let entry = null, live = false;
+  try { entry = (await api("/history/" + encodeURIComponent(pid)))[pid] || null; } catch (e) { /* ComfyUI not up yet */ }
+  if (!entry) {
+    try {
+      const q = await api("/queue");
+      live = [...(q.queue_running || []), ...(q.queue_pending || [])].some((x) => x && x[1] === pid);
+    } catch (e) { return back("couldn't reach ComfyUI's queue"); }
+    if (!live) return back("its run is no longer in ComfyUI");
+  }
+  let o = null;
+  try { await inProject(job.slug, () => { o = jobOpts(job); }); } catch (e) { o = null; }
+  if (!o) return back("its Shots changed");
+  S.busy = Object.assign({}, job.run, { onDone: o.onDone, jobId: job.id, finishing: false,
+    segs: job.run.segs || {}, segT0: {}, phase: entry ? "saving" : job.run.phase || "queued" });
+  render();
+  renderQueue();
+  if (entry && entry.status && (entry.status.completed || entry.status.status_str === "error")) {
+    toast(`${job.title}: it finished while the page was reloading. Saving its take…`);
+    await finish(pid, entry);
+  } else {
+    toast(`${job.title} is still rendering: the Studio is following it again.`);
+    pollLater();
+  }
+  return true;
+}
+
 async function init() {
   loadQueue();
   renderQueue();
-  try { await start(); } finally {
+  try {
+    await start();
+    try { await resumeRun(); } catch (e) {
+      console.warn(e);
+      if (!S.busy) for (const j of Q.jobs) if (j.state === "running" && j.run) { delete j.run; j.state = "waiting"; saveQueue(); }
+    }
+  } finally {
     S.ready = true;
     renderQueue();
     queueNext();

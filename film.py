@@ -170,14 +170,25 @@ def run_shifts(shots):
     return out
 
 
-def film_pieces(shots, windows=None):
-    """Layout pieces for these Shots (film order); `windows` overrides a Shot's frames."""
+def line_up(project):
+    """0.17.44: Line up Shots: every Shot starts where the one before ends (pins and moves
+    not used). Unset: on when no song is in use."""
+    v = (project.get("settings") or {}).get("line_up")
+    if v is not None:
+        return bool(v)
+    a = project.get("audio") or {}
+    return not (a.get("file") and (a.get("song_ref") or a.get("lip_sync") or a.get("final_override")))
+
+
+def film_pieces(shots, windows=None, lined=False):
+    """Layout pieces for these Shots (film order); `windows` overrides a Shot's frames.
+    lined (0.17.44): no pins, no moves."""
     windows = windows or {}
-    moves = run_shifts(shots)
+    moves = {} if lined else run_shifts(shots)
     return [{"id": str(sh.get("id")), "seconds": shot_seconds(sh), "shift": moves.get(str(sh.get("id")), 0),
              "window": windows.get(str(sh.get("id")), planned_window(sh)), "cut": is_cut(shots, i),
              "hold": hold_frames(sh) if is_empty(sh) else 0,
-             "pin": shot_pin(shots, i)}
+             "pin": None if lined else shot_pin(shots, i)}
             for i, sh in enumerate(shots)]
 
 
@@ -248,14 +259,14 @@ def film_shots(project):
             if isinstance(sh, dict) and (not sh.get("bypassed") or sh.get("left_out"))]
 
 
-def frame0_positions(film_shots, chain, overlap, planner):
+def frame0_positions(film_shots, chain, overlap, planner, lined=False):
     """{id: (frame, window)} for the Shots of this render: where each take's frame 0
     lands on the film (moves included), and its window. Film Shots not in the render
     keep their planned frames."""
     wins = render_windows(chain, overlap, planner)
-    lay = film_layout(film_pieces(film_shots, wins), overlap, planner)
+    lay = film_layout(film_pieces(film_shots, wins, lined), overlap, planner)
     by = {p["id"]: p for p in lay["pieces"]}
-    shifts = run_shifts(film_shots)
+    shifts = {} if lined else run_shifts(film_shots)
     out = {}
     for sh in chain:
         sid = str(sh.get("id"))

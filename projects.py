@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.17.32"
+STUDIO_VERSION = "0.18.5"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -83,6 +83,7 @@ class ProjectStore:
         out = []
         if not os.path.isdir(self.folder):
             return out
+        folders = self.folders()
         for f in os.listdir(self.folder):
             slug = f[:-5]
             if not f.endswith(".json") or not is_slug(slug):
@@ -93,6 +94,7 @@ class ProjectStore:
                 continue
             lo = p.get("last_output") or {}
             out.append({"slug": slug, "name": p.get("name") or slug,
+                        "folder": folders.get(slug, ""),          # 0.17.36
                         "saved_at": p.get("saved_at") or "",
                         "video": lo.get("video"),
                         "shots": len([s for s in p.get("shots") or [] if not s.get("bypassed")]),
@@ -160,8 +162,40 @@ class ProjectStore:
         path = self.path(slug)
         if os.path.isfile(path):
             os.remove(path)
+            self.set_folder(slug, "")
             return True
         return False
+
+    # 0.17.36: folders for the Open project list ({slug: folder name}), kept beside the
+    # project files so filing a project never changes the project itself (or its saved_at)
+    def _folders_path(self):
+        return os.path.join(self.folder, ".folders.json")
+
+    def folders(self):
+        try:
+            with open(self._folders_path(), encoding="utf-8") as fh:
+                data = json.load(fh)
+            return {k: str(v) for k, v in data.items() if isinstance(k, str) and isinstance(v, str) and v} \
+                if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def set_folder(self, slug, folder):
+        """File a project in a folder ("" takes it out). Returns the folder name kept."""
+        if not is_slug(slug):
+            raise ValueError("Not a project slug.")
+        name = re.sub(r"\s+", " ", str(folder or "")).strip()[:60]
+        data = self.folders()
+        if name:
+            data[slug] = name
+        else:
+            data.pop(slug, None)
+        os.makedirs(self.folder, exist_ok=True)
+        tmp = self._folders_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=1, sort_keys=True)
+        os.replace(tmp, self._folders_path())
+        return name
 
 
 def migrate(old_folder, store):

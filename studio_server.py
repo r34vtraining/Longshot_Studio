@@ -385,7 +385,7 @@ def _nvidia_smi():
         return None
     try:
         out = subprocess.run(
-            [_NVSMI["path"], "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+            [_NVSMI["path"], "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=2,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
@@ -394,13 +394,18 @@ def _nvidia_smi():
     gpus = []
     for line in out.strip().splitlines():
         parts = [x.strip() for x in line.split(",")]
-        if len(parts) == 4:
+        if len(parts) >= 4:
             try:
-                gpus.append({"name": parts[0], "util": float(parts[1]),
-                             "vram_used": float(parts[2]) * 1048576,
-                             "vram_total": float(parts[3]) * 1048576})
+                g = {"name": parts[0], "util": float(parts[1]),
+                     "vram_used": float(parts[2]) * 1048576,
+                     "vram_total": float(parts[3]) * 1048576, "temp": None}
             except ValueError:
                 continue
+            try:
+                g["temp"] = float(parts[4]) if len(parts) > 4 else None    # 0.17.34: core temperature, °C
+            except ValueError:
+                pass
+            gpus.append(g)
     return gpus or None
 
 
@@ -1317,7 +1322,7 @@ def register(routes=None):
         project = resolve_names(body.get("project") or {}, lists)
         context_notes = []
         if not body.get("take_clips") and not body.get("export_clips") and not body.get("face_try") \
-                and not body.get("refine_try"):
+                and not body.get("refine_try") and not body.get("face_swap"):
             context_notes = await asyncio.get_running_loop().run_in_executor(
                 None, add_context_frames, project, bool(body.get("dry_run")), body.get("upto"),
                 bool(body.get("standalone")))
@@ -1328,6 +1333,8 @@ def register(routes=None):
                 built = gb.build_take_clips(project, body["take_clips"][:64], env=current_env())
             elif isinstance(body.get("refine_try"), dict):
                 built = gb.build_refine_try(project, body["refine_try"], env=current_env())
+            elif isinstance(body.get("face_swap"), dict):
+                built = gb.build_face_swap(project, body["face_swap"], env=current_env())
             elif isinstance(body.get("face_try"), dict):
                 built = gb.build_face_try(project, body["face_try"], env=current_env())
             elif isinstance(body.get("stems"), dict):
@@ -1472,7 +1479,26 @@ def register(routes=None):
                                       "current": c.current}, status=409)
         except ValueError as err:
             return error(err)
+        if new != slug:                                  # 0.17.36: it stays in its folder
+            fd = store.folders().get(slug, "")
+            if fd:
+                store.set_folder(new, fd)
+                store.set_folder(slug, "")
         return web.json_response({"slug": new, "saved_at": saved_at})
+
+    @routes.post("/longshot/projects/{slug}/folder")
+    async def project_folder(request):
+        """0.17.36: {folder}: files the project in a folder of the Open project list ("" = none)."""
+        slug, body = slug_of(request), await body_of(request)
+        if not slug or body is None:
+            return error("Send {folder}.")
+        store = project_store()
+        if not store.exists(slug):
+            return error("No such project.", 404)
+        try:
+            return web.json_response({"folder": store.set_folder(slug, body.get("folder") or "")})
+        except ValueError as err:
+            return error(err)
 
     @routes.delete("/longshot/projects/{slug}")
     async def delete_project(request):

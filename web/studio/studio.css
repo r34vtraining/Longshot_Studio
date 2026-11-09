@@ -104,6 +104,9 @@ textarea.field { resize: vertical; line-height: 1.5; }
 .card { display: flex; gap: 10px; align-items: flex-start; border-radius: 8px; padding: 10px;
   border: 1px solid var(--field-line); background: var(--field); }
 .card:hover { border-color: var(--line-3); }
+/* 0.17.41: an active card has a thicker, brighter edge (the padding keeps its size) */
+.card:not(.off) { border-width: 2px; padding: 9px; border-color: #4A4D55; }
+.card:not(.off):hover { border-color: #6A6D75; }
 .card.off { border-style: dashed; border-color: var(--purple-dash); background: #18171D; opacity: .6; }
 .thumb { position: relative; width: 64px; height: 64px; flex: none; border-radius: 6px; border: 1px solid var(--line-2);
   background: #2A2C31; display: flex; align-items: center; justify-content: center; font-size: 10px; color: var(--muted);
@@ -1151,3 +1154,76 @@ body.moving-block, body.moving-block * { cursor: grabbing !important; user-selec
 .dec-stems { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
 .dec-stems input { margin: 0; }
 .export-ctl .export-up + .export-up { border-left: 1px solid var(--field-line); }
+
+/* 0.17.33: a bypassed group */
+.group-head.off { opacity: .6; border-style: dashed; }
+.group-head.off .group-name { text-decoration: line-through; text-decoration-color: rgba(255,255,255,.35); }
+.group-head .group-bypass.on { color: var(--amber-lt); border-color: var(--amber-line, var(--amber)); }
+.group-head .group-bypass { display: inline-flex; align-items: center; justify-content: center; }
+.group-head .group-bypass svg { display: block; }
+
+/* 0.17.36: Open project: sort, folders, about 10 rows then it scrolls */
+.proj-tools { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.proj-tools .push { flex: 1; }
+.proj-list { display: flex; flex-direction: column; gap: 8px; max-height: min(780px, 70vh); overflow-y: auto; padding-right: 4px; scrollbar-width: thin; }
+.proj-item { display: flex; gap: 6px; align-items: stretch; }
+.proj-item .proj-row { flex: 1; min-width: 0; }
+.proj-item .proj-move { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 36px; padding: 0; }
+.proj-folder { display: flex; flex-direction: column; gap: 8px; }
+.proj-folder-head { display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,.035); border: 1px solid var(--line-2);
+  border-radius: 8px; padding: 8px 10px; color: var(--text); cursor: pointer; text-align: left; font: inherit; }
+.proj-folder-head:hover { border-color: var(--amber); }
+.proj-folder-head .chev { color: var(--amber-lt); width: 12px; }
+.proj-folder-head b { font-weight: 600; }
+.proj-folder.open { padding-left: 10px; border-left: 2px solid rgba(232,170,72,.35); }
+.proj-folder.open > .proj-folder-head { margin-left: -10px; }
+.proj-loose-head { margin-top: 4px; }
+
+/* 0.17.37: drag projects into folders */
+.proj-item[draggable="true"] { cursor: grab; }
+.proj-item.dragging { opacity: .45; }
+.proj-folder.proj-drop > .proj-folder-head, .proj-loose.proj-drop { border-color: var(--amber); background: var(--amber-bg); }
+.proj-loose { display: flex; flex-direction: column; gap: 8px; border: 1px dashed transparent; border-radius: 8px; padding: 2px; }
+.proj-loose.proj-drop { border-color: var(--amber); }
+
+/* 0.17.38: Region editor (Face refine on a box drawn by hand) */
+.rg-stage { position: relative; width: 100%; max-width: 960px; aspect-ratio: 16 / 9; background: #000; border-radius: 6px; overflow: hidden; margin: 0 auto; }
+.rg-stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; }
+.rg-hit { position: absolute; inset: 0; cursor: crosshair; touch-action: none; }
+.rg-box { position: absolute; border: 2px dashed rgba(255,208,138,.85); box-shadow: 0 0 0 9999px rgba(0,0,0,.25); pointer-events: none; }
+.rg-box.key { border-style: solid; border-color: var(--amber); }
+.rg-bar { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.rg-bar input[type=range] { flex: 1; }
+.rg-keys { margin-top: 8px; font-size: 12px; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.rg-keys .on { border-color: var(--amber); color: var(--amber-lt); }
+.rg-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.rg-actions .push { flex: 1; }
+
+/* 0.17.43: one drop bar for every kind of reference */
+.add-all { grid-column: 1 / -1; display: flex; align-items: stretch; gap: 8px; border: 1.5px dashed var(--line-3);
+  border-radius: 8px; padding: 6px; }
+#cast-panel.dragging .add-all { border-color: var(--amber-line); }
+.add-all.drop-target { outline: 2px dashed var(--amber); outline-offset: 2px; }
+.add-all-pick { flex: 1; display: flex; align-items: center; gap: 10px; background: transparent; border: 0; border-radius: 6px;
+  color: var(--muted); font-size: 13px; padding: 8px 10px; text-align: left; line-height: 1.35; cursor: pointer; }
+.add-all-pick:hover { color: var(--amber-lt); background: var(--amber-bg); }
+.add-blank, .refmod-btn { flex: none; display: flex; align-items: center; gap: 6px; background: transparent; border: 1px solid var(--line-2);
+  border-radius: 6px; color: var(--muted); font-size: 12px; padding: 0 12px; cursor: pointer; }
+.add-blank:hover { color: var(--amber-lt); border-color: var(--amber); }
+.refmod-btn { color: #C9B6FF; }
+.refmod-btn:hover { border-color: #C9B6FF; }
+.refmod-btn.install { cursor: default; }
+@media (max-width: 640px) { .add-all { flex-wrap: wrap; } .add-all-pick { flex-basis: 100%; } }
+
+/* 0.18.0: Face swap */
+.swap-face { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
+.swap-face select { max-width: 240px; }
+.swap-results { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+.swap-res { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.swap-res .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 0.18.4: drag a waiting job to its place in line */
+.q-row.q-drag { cursor: grab; }
+.q-row.dragging { opacity: .45; }
+.q-row.q-before { box-shadow: inset 0 2px 0 var(--amber); }
+.q-row.q-after { box-shadow: inset 0 -2px 0 var(--amber); }

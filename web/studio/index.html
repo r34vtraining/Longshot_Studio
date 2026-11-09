@@ -162,6 +162,7 @@
         <div id="tl-sbar" class="tl-sbar" aria-hidden="true"><div id="tl-sthumb" class="tl-sthumb"></div><div id="tl-smark" class="tl-smark"></div></div>
         <div class="tl-row">
         <label class="live-toggle" id="live-wrap" title="Show the picture forming on this screen while a Shot renders."><input type="checkbox" id="live-preview"> Live preview</label>
+        <label class="live-toggle" id="lineup-wrap" title="Every Shot starts right where the one before ends: no Shots on a second track, no moves on the film. On by itself when no song is in use (timing to music needs overlaps and moves)."><input type="checkbox" id="line-up"> Line up Shots</label>
         <div id="tl-approx" class="tl-approx" hidden>
           <span id="tl-approx-main"><span title="Takes that were never rendered side by side are shown from the renders that made them, so the joins between them can jump slightly.">Approximate joins</span>
           · <button class="linkbtn" data-action="update-preview" id="tl-update" title="Decode every rendered Shot together for the exact video. Nothing is sampled.">Update preview</button></span>
@@ -282,7 +283,7 @@
         <h2><button class="fold" data-action="fold" data-fold="queue" aria-expanded="true" title="Show only one line"><span class="fold-ch" aria-hidden="true">▾</span>Queue</button> <span class="muted small q-count" id="queue-count"></span></h2>
         <span class="q-btns">
           <button class="ghost sm" data-action="queue-flip" id="queue-flip" aria-pressed="false" aria-label="Latest on top" title="Oldest on top · click for latest on top">⇅</button>
-          <button class="ghost sm" data-action="queue-pause" id="queue-pause" title="Finish the job that's running, then hold the rest">Pause</button>
+          <button class="ghost sm" data-action="queue-pause" id="queue-pause" title="Hold the queue: stop the running job now (it goes back in line) or let it finish first">Pause</button>
           <button class="ghost sm" data-action="queue-clear" id="queue-clear" title="Remove finished, failed and stopped jobs from the list">Clear finished</button>
           <button class="ghost sm" data-action="queue-stop-all" id="queue-stop-all" title="Stop the job that's running and every job still waiting (they stay in the list, stopped, to retry)">Stop all</button>
         </span>

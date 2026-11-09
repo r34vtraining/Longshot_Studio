@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -966,6 +967,29 @@ def face_rows(f: dict) -> list:
     return [t.get("boxes") or [] for t in f.get("tracks") or [] if t.get("id") in treated and t.get("boxes")]
 
 
+def face_shapes(f: dict) -> list:
+    """0.17.38: each redrawn face's mask shape, in face_rows' order ("rect" for a region)."""
+    treated = {c.get("track") for c in f.get("crops") or []}
+    return [t.get("shape") or "oval" for t in f.get("tracks") or [] if t.get("id") in treated and t.get("boxes")]
+
+
+def region_prompt(what="", with_ref=False, label=""):
+    """0.17.38: the close-up's prompt for a region drawn by hand: what's in it (the user's
+    words), kept moving as before with sharper detail. with_ref: <Picture 1> as who it is."""
+    what = (what or "").strip().rstrip(".") or "the characters"
+    action = ("Everything keeps exactly the same pose, movement, expression and timing as before. Sharp clean "
+              "detail in the faces, eyes, fur, fabric and materials. The camera is static.")
+    sound = "overall_soundscape: The scene's own sound, unchanged.\nnon_diegetic_music: N/A"
+    if not with_ref:
+        return ("integrated_multimodal_description: [Shot 1] Cinematic, high detail. "
+                f"A close-up of {what}, filling most of the frame. {action}\n" + sound)
+    name = (label or "").strip() or "the characters"
+    return (f"subject_definitions: <Subject 1> is {name}, whose appearance comes from <Picture 1>.\n"
+            f"summary: [reference generation] A close-up of {what}.\n"
+            "retention_analysis: <Subject 1> (appears in [Shot 1]): fully_preserved - face, design, colours and materials.\n"
+            f"detailed_description: Cinematic, high detail. [Shot 1] A close-up of {what}, filling most of the frame. {action}\n" + sound)
+
+
 def face_settings(project: dict, env: "Env | None" = None, strict: bool = True):
     """0.14.0: the Face refine panel's settings when it applies (a model chosen, H3 Long Shot
     1.8.0 with its Face Refine node), with `key` naming the redraw model and settings, `sig`
@@ -1070,18 +1094,131 @@ def _face_nodes(g, project, f, env):
     return out
 
 
-def _face_node(g, nid, project, f, env, images, latent, skip=None, title="Face refine"):
-    """MiniMax H3 Face Refine over `images` (decoded from `latent`)."""
+def _face_node(g, nid, project, f, env, images, latent, skip=None, title="Face refine", regions=None, text=None):
+    """MiniMax H3 Face Refine over `images` (decoded from `latent`). 0.17.38: regions (JSON)
+    drawn by hand replace the found faces, with their own prompt (text)."""
     m = _face_nodes(g, project, f, env)
     extra = {"ref_image": m["ref"]} if m.get("ref") else {}
     if skip:
         extra["skip"] = json.dumps([[int(a), int(b)] for a, b in skip])
+    if regions:
+        extra["regions"] = regions
     return g.add(nid, "MiniMaxH3FaceRefine", title, images=images, latent=latent, model=m["model"],
                  clip=m["clip"], vae=m["vae"], noise=m["noise"], sampler=m["sampler"], sigmas=m["sigmas"],
-                 text=f["text"], max_face=f["max_face"], which=f["which"], work_size=f["work"],
+                 text=text if text else f["text"], max_face=f["max_face"], which=f["which"], work_size=f["work"],
                  padding=f["padding"], follow=f["follow"], mask_scale=f["mask"], feather=f["feather"],
                  color_match=f["color"], hold_audio=bool(f.get("hold_audio", True)), max_window=362,
                  cache_name=project_slug(project), cache_key=f["key"], detect_every=2, enabled=True, **extra)
+
+
+# ---------------------------------------------------------------------------
+# Face swap (0.18.0, Long Shot 1.9.0): a take or any video, each face given the identity
+# of a Cast picture by the ref2va model, saved in <project>/Face_Swap
+# ---------------------------------------------------------------------------
+
+FACE_SWAP_DEFAULTS = {"model": None, "steps": 12, "denoise": 0.6, "shift_video": 4.0, "color": 0.4,
+                      "mask": 1.15, "seed": 0, "work": 640}
+FACE_SWAP_SUBFOLDER = "Face_Swap"
+
+
+def is_ref2va(name) -> bool:
+    n = str(name or "").lower()
+    return bool(n) and "fl2v" not in n and "t2v" not in n
+
+
+def build_face_swap(project: dict, item: dict, env: Env | None = None) -> Build:
+    """item: {source: {kind: "take", take, key} | {kind: "file", file, subfolder},
+    faces: [{cast, keys?}], name}. One face without a box: the largest face found gets its
+    picture. Two or more: each needs its box (drawn like a region), and gets its own."""
+    import copy
+    env = env or Env()
+    s = project.get("settings") or {}
+    sw = dict(FACE_SWAP_DEFAULTS, **(s.get("face_swap") or {}))
+    if not sw.get("model"):
+        raise BuildError("Face swap: choose the ref2va model first (Face refine → Face swap).")
+    if not is_ref2va(sw["model"]):
+        raise BuildError(f"Face swap needs a ref2va model (it takes the new face as a reference picture); "
+                         f"{sw['model']} isn't one.")
+    if not env.longshot_at_least(1, 9, 0):
+        raise BuildError("Face swap needs H3 Long Shot 1.9.0 or later. Update it, then restart ComfyUI.")
+    for key in ("video_vae", "audio_vae", "clip"):
+        if not s.get(key):
+            raise BuildError(f"Settings: choose a {key.replace('_', ' ')} file.")
+    item = item or {}
+    src = item.get("source") or {}
+    cast = {str(c.get("id")): c for c in project.get("cast") or [] if isinstance(c, dict)}
+    rows = []
+    for k, fc in enumerate((item.get("faces") or [])[:4]):
+        c = cast.get(str((fc or {}).get("cast") or ""))
+        if not c or not c.get("image"):
+            raise BuildError(f"Face swap: face {k + 1} has no picture card chosen.")
+        keys = [[float(v) for v in list(x)[:5]] for x in ((fc or {}).get("keys") or [])
+                if isinstance(x, (list, tuple)) and len(x) >= 5][:64]
+        rows.append((c, keys))
+    if not rows:
+        raise BuildError("Face swap: choose the picture of the new face.")
+    if len(rows) > 1 and not all(keys for _c, keys in rows):
+        raise BuildError("Face swap with more than one face: draw a box for each face, so each gets its own picture.")
+    p2 = copy.deepcopy(project)
+    p2.setdefault("settings", {})["face"] = dict((s.get("face") or {}), model=sw["model"], steps=sw["steps"],
+                                                 denoise=sw["denoise"], shift_video=sw["shift_video"], color=sw["color"],
+                                                 mask=sw["mask"], seed=sw["seed"], work=sw["work"], cast=None,
+                                                 turbo={"on": False}, max_face=4096, which="largest", describe="")
+    f = face_settings(p2, env)
+    warnings = []
+    fmt = _video_format(env, warnings)
+    g = _Graph()
+    vae = g.add("vae_video", "VAELoader", "Video VAE", vae_name=s["video_vae"])
+    if src.get("kind") == "take":
+        key, take = str(src.get("key") or ""), str(src.get("take") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,150}", key) or not TAKE_NAME_RE.fullmatch(take):
+            raise BuildError(f"Not a take: {take!r}")
+        avae = g.add("vae_audio", "VAELoader", "Audio VAE", vae_name=s["audio_vae"])
+        lat = g.add("take", "MiniMaxH3Take", f"Take {take}", cache_name=project_slug(project), take=take, shot_id="")
+        images = g.add("dec", "VAEDecode", "VAE Decode", samples=lat, vae=vae)
+        audio = g.add("aud", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
+        base = key
+    elif src.get("kind") == "file":
+        if not env.has("MiniMaxH3LoadVideo"):
+            raise BuildError("Face swap on a video file needs H3 Long Shot 1.9.0 (MiniMax H3 Load Video). Restart ComfyUI after updating.")
+        try:
+            path = pj.input_path_value(str(src.get("file") or ""), str(src.get("subfolder") or ""))
+        except ValueError as err:
+            raise BuildError(f"Face swap video: {err}") from None
+        load = g.add("swapsrc", "MiniMaxH3LoadVideo", f"Video {src.get('file')}", video=path,
+                     max_seconds=_num(src.get("max_seconds", 60), "Face swap length", 1, 600))
+        images, audio, lat = _out(load, 0), _out(load, 1), None
+        base = re.sub(r"[^A-Za-z0-9_-]+", "_", os.path.splitext(str(src.get("file")))[0])[:60] or "video"
+    else:
+        raise BuildError("Face swap: choose a Shot's take or a video file.")
+    m = _face_nodes(g, p2, f, env)
+    refs = {}
+    for k, (c, _keys) in enumerate(rows):
+        try:
+            image = pj.input_path_value(c["image"], c.get("subfolder", ""))
+        except ValueError as err:
+            raise BuildError(f"Face swap picture ({c.get('label') or 'Cast'}): {err}") from None
+        refs[("ref_image", "ref_image_2", "ref_image_3", "ref_image_4")[k]] = g.add(
+            f"swapref{k + 1}", "LoadImage", f"New face {k + 1} {c.get('label', '')}".strip(), image=image)
+    extra = dict(refs)
+    if rows[0][1]:
+        extra["regions"] = json.dumps([{"keys": keys, "ref": k + 1, "label": re.sub(r"[<>]", "", str(c.get("label") or ""))[:80],
+                                        "describe": str(c.get("desc") or "")[:200], "shape": "oval"}
+                                       for k, (c, keys) in enumerate(rows)])
+    if lat is not None:
+        extra["latent"] = lat
+    face = g.add("swap", "MiniMaxH3FaceRefine", "Face swap", images=images, model=m["model"], clip=m["clip"],
+                 vae=m["vae"], noise=m["noise"], sampler=m["sampler"], sigmas=m["sigmas"], text="", mode="swap",
+                 max_face=4096, which="largest", work_size=f["work"], padding=f["padding"], follow=f["follow"],
+                 mask_scale=f["mask"], feather=f["feather"], color_match=f["color"], hold_audio=lat is not None,
+                 max_window=362, cache_name=project_slug(project), cache_key=f["key"], detect_every=2, enabled=True,
+                 **extra)
+    name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(item.get("name") or base))[:80] + "_swap"
+    prefix = f"{OUTPUT_SUBFOLDER}/{project_slug(project)}/{FACE_SWAP_SUBFOLDER}"
+    save = g.add("swapsave", "MiniMaxH3SaveVideo", f"Face swap {name}", images=_out(face, 0), audio=audio,
+                 filename_prefix=f"{prefix}/{name}", codec=_codec(fmt), frame_rate=float(FPS))
+    return Build(prompt=g.nodes, width=0, height=0, chain=[], nodes={"face": "swap", "save": "swapsave"},
+                 filename_prefix=prefix, video_format=fmt, warnings=warnings)
 
 
 REFINE_CLIP_SUFFIX = "__ref"
@@ -1169,7 +1306,23 @@ def build_face_try(project: dict, item: dict, env: Env | None = None) -> Build:
     avae = g.add("vae_audio", "VAELoader", "Audio VAE", vae_name=s["audio_vae"])
     lat = g.add("take", "MiniMaxH3Take", f"Take {take}", cache_name=project_slug(project), take=take, shot_id="")
     images = g.add("dec", "VAEDecode", "VAE Decode", samples=lat, vae=vae)
-    face = _face_node(g, "face", project, f, env, images, lat)
+    # 0.17.38: a region drawn by hand (cartoon characters, creatures…) instead of found faces
+    regions = item.get("regions") if isinstance(item.get("regions"), list) else None
+    extra = {}
+    if regions:
+        if not env.longshot_at_least(1, 8, 2):
+            raise BuildError("Region refine needs H3 Long Shot 1.8.2 or later. Update it, then restart ComfyUI.")
+        clean = []
+        for r in regions[:8]:
+            keys = [[float(v) for v in list(k)[:5]] for k in ((r or {}).get("keys") or []) if isinstance(k, (list, tuple)) and len(k) >= 5]
+            if keys:
+                clean.append({"keys": keys[:64]})
+        if not clean:
+            raise BuildError("Draw the region on the Shot first (Face refine → Region).")
+        who = f.get("identity")
+        extra = {"regions": json.dumps(clean), "text": region_prompt(str(item.get("region_text") or ""),
+                 with_ref=who is not None, label=(who or {}).get("label") or "")}
+    face = _face_node(g, "face", project, f, env, images, lat, **extra)
     songs = _song_slices(g, project, [item])
     audio = songs.get(1) or g.add("aud", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
     name = key + FACE_CLIP_SUFFIX
@@ -1290,7 +1443,8 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
     lipsong = bool(audio.get("lip_sync") and audio.get("file"))
     if (songref or lipsong or (audio.get("final_override") and audio.get("file"))) and env.planner is not None:
         try:
-            positions = film.frame0_positions(film.film_shots(project), chain, overlap, env.planner)
+            positions = film.frame0_positions(film.film_shots(project), chain, overlap, env.planner,
+                                               film.line_up(project))
         except Exception as err:          # never stop a render over the song's place
             warnings.append(f"Couldn't work out where the Shots sit in the song ({err}).")
     per_shot_song = bool(songref and positions is not None and env.shot_takes("song_at")
@@ -1754,7 +1908,8 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                 first, end, ws = sp
                 rows.append({"file": f"{clips_subfolder(project)}/{str(fc['take'])[:-len('.safetensors')]}{FACE_CLIP_SUFFIX}.mp4",
                              "at": first, "from": first - ws, "frames": end - first,
-                             "w": int(fc.get("w") or 0), "h": int(fc.get("h") or 0), "faces": face_rows(fc)})
+                             "w": int(fc.get("w") or 0), "h": int(fc.get("h") or 0), "faces": face_rows(fc),
+                             "shapes": face_shapes(fc)})
             if rows:
                 images = g.add("faces", "MiniMaxH3PasteFaces", "Refined faces", images=images, items=json.dumps(rows))
                 ids["faces"] = "faces"
