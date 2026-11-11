@@ -49,7 +49,7 @@ thrown away.
 - Dialogue and SFX stems as separate .wav files.
 - Export or import a whole project as one .zip.
 
-## What's new in 0.21.10
+## What's new in 0.21.11
 
 1. H3 Image generation UI, in the same project folder, you can now generate image directly into the project
    folder.  Or send them directly to reference images for the video side.  It works with both using the video
