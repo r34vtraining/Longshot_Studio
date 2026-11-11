@@ -13,6 +13,9 @@ thrown away.
 
 <img width="1696" height="1350" alt="image" src="https://github.com/user-attachments/assets/af2861fe-43ed-436d-a908-d954a6788a3d" />
 
+<img width="1637" height="1394" alt="image" src="https://github.com/user-attachments/assets/5360aecc-d4ef-49c4-a54c-db465f0fd163" />
+
+
 ## Features
 
 **Generate**
@@ -47,35 +50,38 @@ thrown away.
 - Dialogue and SFX stems as separate .wav files.
 - Export or import a whole project as one .zip.
 
-## What's new in 0.18.5
+## What's new in 0.21.10
 
-1. **Face swap.** In the Face refine panel, pick a Shot's take or any video file, choose the picture
+1. H3 Image generation UI, in the same project folder, you can now generate image directly into the project
+   folder.  Or send them directly to reference images for the video side.  It works with both using the video
+   models or the new official H3 image model (download required)
+2. **Face swap.** In the Face refine panel, pick a Shot's take or any video file, choose the picture
    card for the new face, and the ref2va model redraws the face as that person, keeping the head
    movement, expression and mouth. One face swaps the largest face found; for up to four faces, draw
    a box around each and give each its own picture. Results go to `<project>/Face_Swap`.
    Needs H3 Long Shot 1.9.0 and a ref2va model.
-2. **Region refine.** For faces the detector can't see (cartoon characters, creatures), draw a box on
+3. **Region refine.** For faces the detector can't see (cartoon characters, creatures), draw a box on
    the first and last frame and describe what's in it. The box follows a straight line between key
    frames.
-3. **Line up Shots.** When you're not syncing to music, placement on the timeline doesn't matter:
+4. **Line up Shots.** When you're not syncing to music, placement on the timeline doesn't matter:
    tick Line up Shots under the timeline and every Shot starts where the one before ends, with no
    second track. It's on by itself in projects without a song.
-4. **Rearrange approved Shots.** Approved Cut, Context and Cutaway Shots can now be dragged to a new
+5. **Rearrange approved Shots.** Approved Cut, Context and Cutaway Shots can now be dragged to a new
    place in the Shots list and keep their takes. Continuous and Lead in Shots stay put.
-5. **Reference check.** Before a render, Studio reads the `<tags>` in the prompts and checks them
+6. **Reference check.** Before a render, Studio reads the `<tags>` in the prompts and checks them
    against the reference cards. A bypassed card, a label no card has, or `<Picture 6>` with only five
    pictures on gets flagged, with **Turn on and render**, **Render anyway** or **Cancel**.
-6. **Better queue.**
+7. **Better queue.**
 - **Pause now** stops the running job and puts it back first in line; on Resume it picks up the
   Shots it had already finished. **Pause after it** lets it finish first.
 - Drag waiting jobs to any place in line (▲ ▼ still work).
 - A page refresh in the middle of a render no longer loses it: Studio follows it again, or saves its
   take if it finished during the refresh.
-7. **Easier references.** One drop bar in Cast & Scenes takes pictures, videos and audio together and
+8. **Easier references.** One drop bar in Cast & Scenes takes pictures, videos and audio together and
   sorts each into its own row. Active reference cards have a thicker border, so it's easier to see
   what's on.
-8. **Project window.** Sort by date or name, scroll, and drag projects into folders by project type.
-9. **Smaller things.** GPU temperature in the top bar, group bypass button, Settings stays folded
+9. **Project window.** Sort by date or name, scroll, and drag projects into folders by project type.
+10. **Smaller things.** GPU temperature in the top bar, group bypass button, Settings stays folded
   after a refresh, the page no longer jumps when you change a chip, and Alt + mouse wheel never goes
   back a page.
 
