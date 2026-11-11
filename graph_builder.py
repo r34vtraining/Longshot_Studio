@@ -362,17 +362,17 @@ def voice_retention(project: dict) -> list:
             if v.get("use") == "copy":
                 out.append(f"{a} ({what}): fully_copy - the audio is reused as it is.")
             else:
-                out.append(f"{a} ({what}): reference - the character of the sound only, not the recording itself.")
+                out.append(f"{a} ({what}): reference - its sound character only; the recording itself is not reused.")
             continue
         who = voiced_by(str(v.get("id")))
-        out.append(f"{a} (voice timbre{' of ' + ', '.join(who) if who else ''}): reference - the voice "
-                   "timbre only; what is said comes from each Shot's dialogue.")
+        out.append(f"{a} (voice timbre{' of ' + ', '.join(who) if who else ''}): reference - voice timbre, "
+                   "pitch and delivery only; none of its words are reused.")
     for m, lab in mods:
         if m.get("kind") == "audio":
             who = voiced_by("refmod:" + str(m.get("id")))
             if who:
-                out.append(f"{lab} (voice timbre of {', '.join(who)}): reference - the voice "
-                           "timbre only; what is said comes from each Shot's dialogue.")
+                out.append(f"{lab} (voice timbre of {', '.join(who)}): reference - voice timbre, "
+                           "pitch and delivery only; none of its words are reused.")
     return out
 
 
@@ -1978,3 +1978,358 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
     return Build(prompt=g.nodes, width=width, height=height,
                  chain=[x.get("id") for x in chain], nodes=ids, filename_prefix=prefix,
                  video_format=fmt, warnings=warnings)
+
+
+# ---------------------------------------------------------------------------
+# 0.20.0: Images. MiniMax-H3-Image (ComfyUI 0.44.0+, core nodes): one picture from a
+# prompt and the project's reference pictures (<Picture 1..N>), or an edit of a
+# picture (it becomes <Picture 1>; the references follow as <Picture 2..>).
+#
+#     UNETLoader (image model) -> KSampler (6 steps, cfg 1, euler / simple)
+#     CLIPLoader (the video text encoder) + VAELoader (image VAE)
+#     LoadImage x N -> MiniMax H3 Image Conditioning (prompt, width, height, images.image_k)
+#     ConditioningZeroOut -> negative;  VAEDecode -> SaveImage output/longshot/<slug>/images
+#     [CLIPLoader (Qwen3.5) -> StringReplace -> TextGenerateV2 -> JsonExtractString: Expand prompt]
+# ---------------------------------------------------------------------------
+
+IMAGES_SUBFOLDER = "images"
+IMAGE_MEGAPIXELS = [4, 6, 8, 12, 16, 20]       # 0.21.3: H3-Image works from about 4 MP up
+IMAGE_MAX_REFS = 9
+IMAGE_DEFAULTS = {"model": "", "vae": "", "expander": "", "steps": 6, "cfg": 1.0, "sampler": "euler",
+                  "scheduler": "simple", "megapixels": 8, "aspect": "1:1", "keep": 20}
+IMAGE_NODE = "MiniMaxH3ImageConditioning"
+# Where each file comes from (the links the Studio shows when one is missing)
+IMAGE_FILES = {
+    "model": {"name": "minimax_h3_image_pruned_int8_convrot.safetensors", "folder": "diffusion_models", "size": "21 GB",
+              "url": "https://huggingface.co/Comfy-Org/MiniMax-H3-Image/resolve/main/diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors"},
+    "vae": {"name": "minimax_h3_image_vae_fp16.safetensors", "folder": "vae", "size": "0.7 GB",
+            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3-Image/resolve/main/vae/minimax_h3_image_vae_fp16.safetensors"},
+    "clip": {"name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "folder": "text_encoders", "size": "25 GB",
+             "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"},
+    "expander": {"name": "qwen3.5_9b_w4a8_gptq.safetensors", "folder": "text_encoders", "size": "6 GB",
+                 "url": "https://huggingface.co/Comfy-Org/Qwen3.5/resolve/main/text_encoders/qwen3.5_9b_w4a8_gptq.safetensors"},
+}
+PACKS.update({
+    IMAGE_NODE: "ComfyUI core 0.44.0+ (update ComfyUI)",
+    "TextGenerateV2": "ComfyUI core 0.44.0+ (update ComfyUI)",
+    "JsonExtractString": "ComfyUI core 0.44.0+ (update ComfyUI)",
+})
+
+
+def image_settings(project: dict) -> dict:
+    s = project.get("settings") or {}
+    return dict(IMAGE_DEFAULTS, **(s.get("image") or {}))
+
+
+def images_subfolder(project: dict) -> str:
+    return f"{OUTPUT_SUBFOLDER}/{project_slug(project)}/{IMAGES_SUBFOLDER}"
+
+
+def image_size(megapixels, aspect, like=None) -> tuple[int, int]:
+    """The canvas: an aspect preset, or the shape of the picture being edited (`like`:
+    (width, height)), at the megapixel budget, in multiples of 32."""
+    mp = _num(megapixels, "Image size (MP)", 0.25, 64)
+    if like and like[0] and like[1]:
+        w, h = int(like[0]), int(like[1])
+        scale = math.sqrt(mp * 1024 * 1024 / (w * h))
+        return max(32, round(w * scale / 32) * 32), max(32, round(h * scale / 32) * 32)
+    return output_size(mp, aspect)
+
+
+def _picture_path(ref: dict, what: str) -> str:
+    """What LoadImage takes: an input file, or an output file with ComfyUI's [output] mark."""
+    name, sub = str(ref.get("image") or ref.get("filename") or ""), str(ref.get("subfolder") or "")
+    try:
+        if ref.get("type") == "output":
+            return pj.output_path_value(name, sub)
+        return pj.input_path_value(name, sub)
+    except ValueError as err:
+        raise BuildError(f"{what}: {err}") from None
+
+
+def build_image(project: dict, item: dict, env: Env | None = None) -> Build:
+    """item: {text, expand, edit: {image, subfolder, type, width?, height?} | null,
+    refs: [{image, subfolder, type, label}], megapixels, aspect, seed, steps, name}."""
+    env = env or Env()
+    if not env.has(IMAGE_NODE):
+        raise BuildError("This ComfyUI has no MiniMax H3 Image Conditioning node: update ComfyUI to 0.44.0 or later, "
+                         "then restart it.")
+    s = project.get("settings") or {}
+    im = image_settings(project)
+    item = item or {}
+    for key, label in (("model", "image model"), ("vae", "image VAE")):
+        if not im.get(key):
+            raise BuildError(f"Image settings: choose the {label} file.")
+    if not s.get("clip"):
+        raise BuildError("Settings: choose a text encoder file (it's shared with the video renders).")
+    text = str(item.get("text") or "").strip()
+    if not text:
+        raise BuildError("The Picture has no prompt.")
+    refs = [r for r in (item.get("refs") or []) if isinstance(r, dict) and (r.get("image") or r.get("filename"))]
+    edit = item.get("edit") if isinstance(item.get("edit"), dict) and (item["edit"].get("image") or item["edit"].get("filename")) else None
+    pictures = ([edit] if edit else []) + refs
+    if len(pictures) > IMAGE_MAX_REFS:
+        raise BuildError(f"At most {IMAGE_MAX_REFS} pictures: the one to edit and {IMAGE_MAX_REFS - 1} references. Bypass some.")
+    expand = bool(item.get("expand"))
+    if expand and not im.get("expander"):
+        raise BuildError("Expand prompt needs the prompt expander file (Image settings).")
+    if expand and not (env.has("TextGenerateV2") and env.has("JsonExtractString")):
+        raise BuildError("Expand prompt needs ComfyUI 0.44.0 or later (Generate Text). Update ComfyUI, then restart it.")
+    steps = int(_num(item.get("steps", im["steps"]), "Steps", 1, 200, kind=int))
+    seed = _seed(item.get("seed", 0), "Seed")
+    mp = max(4.0, float(_num(item.get("megapixels", im["megapixels"]), "Image size (MP)", 0.25, 64)))
+    aspect = str(item.get("aspect") or im["aspect"])
+    if edit and edit.get("width") and edit.get("height"):
+        width, height = image_size(mp, aspect, (edit["width"], edit["height"]))
+    elif edit:
+        width, height = 0, 0            # the node takes the edited picture's size
+    else:
+        width, height = image_size(mp, aspect)
+    warnings = []
+    if (width * height or 4 * 1024 * 1024) < 3.5 * 1024 * 1024:
+        warnings.append("MiniMax-H3-Image loses detail under about 4 MP; 8–16 MP is its range.")
+
+    g = _Graph()
+    model = g.add("img_model", "UNETLoader", "Image model", unet_name=im["model"], weight_dtype="default")
+    clip = g.add("img_clip", "CLIPLoader", "Text encoder", clip_name=s["clip"], type="minimax", device="default")
+    vae = g.add("img_vae", "VAELoader", "Image VAE", vae_name=im["vae"])
+    loaders = {}
+    for k, ref in enumerate(pictures, 1):
+        what = "The picture to edit" if (edit and k == 1) else f"Reference {k - (1 if edit else 0)} ({ref.get('label') or ref.get('image')})"
+        loaders[k] = g.add(f"pic{k}", "LoadImage", f"<Picture {k}> {ref.get('label') or ref.get('image') or ''}".strip(),
+                           image=_picture_path(ref, what))
+    prompt_in = text
+    if expand:
+        from . import image_pe
+        pe_clip = g.add("pe_clip", "CLIPLoader", "Prompt expander", clip_name=im["expander"], type="minimax", device="default")
+        ask = g.add("pe_ask", "StringReplace", "Expander brief", string=image_pe.EDIT_SYSTEM if pictures else image_pe.T2I_SYSTEM,
+                    find=image_pe.PLACEHOLDER, replace=text)
+        gen_in = {f"images.image{k}": v for k, v in loaders.items()}
+        gen = g.add("pe", "TextGenerateV2", "Expand prompt", clip=pe_clip, prompt=ask, system_prompt=image_pe.PREFIX,
+                    max_length=8192, sampling_mode="on", thinking=True, use_default_template=True,
+                    mtp="off",       # 0.21.3: speculative decoding crashed in comfy_kitchen's flash attention
+                    **{
+                        "sampling_mode.temperature": 1.0, "sampling_mode.top_k": 20, "sampling_mode.top_p": 0.95,
+                        "sampling_mode.min_p": 0.0, "sampling_mode.repetition_penalty": 1.0,
+                        "sampling_mode.presence_penalty": 0.0, "sampling_mode.seed": 0}, **gen_in)
+        prompt_in = g.add("pe_text", "JsonExtractString", "Expanded caption", json_string=_out(gen, 0), key="expanded_caption")
+    cond_in = {f"images.image_{k}": v for k, v in loaders.items()}
+    cond = g.add("cond", IMAGE_NODE, "MiniMax H3 Image Conditioning", clip=clip, vae=vae, prompt=prompt_in,
+                 width=width, height=height, **cond_in)
+    neg = g.add("neg", "ConditioningZeroOut", "Negative (none)", conditioning=_out(cond, 0))
+    sampler = g.add("sampler", "KSampler", "Sample", model=model, positive=_out(cond, 0), negative=neg,
+                    latent_image=_out(cond, 1), seed=seed, steps=steps, cfg=float(im.get("cfg", 1.0)),
+                    sampler_name=str(im.get("sampler") or "euler"), scheduler=str(im.get("scheduler") or "simple"), denoise=1.0)
+    images = g.add("decode", "VAEDecode", "VAE Decode", samples=sampler, vae=vae)
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", str(item.get("name") or "picture")).strip("_")[:60] or "picture"
+    prefix = images_subfolder(project)
+    g.add("save", "SaveImage", f"Save {stem}", images=images, filename_prefix=f"{prefix}/{stem}")
+    nodes = {"sampler": "sampler", "save": "save", "longshot": "sampler", "combine": "decode", "cond": "cond"}
+    if expand:
+        nodes["expand"] = "pe_text"
+    return Build(prompt=g.nodes, width=width, height=height, chain=[], nodes=nodes,
+                 filename_prefix=prefix, video_format="", warnings=warnings)
+
+
+# ---------------------------------------------------------------------------
+# 0.21.0: Stills with the video model. The Images side's default engine: the project's own
+# H3 video model (Settings: model, text encoder, VAEs, shift, Turbo, LoRAs, steps) renders
+# the shortest clip H3 allows from the References (<Picture 1..N>) with a "nothing moves"
+# tail on the prompt, and the middle frame is saved as the picture.
+#
+#     UNETLoader -> [Sage] -> SigmaShift -> [Turbo] -> [LoRA x3] -> BasicScheduler / KSamplerSelect / RandomNoise
+#     LoadImage -> ImageScaleToMaxDimension -> MiniMax H3 Reference to Video (prompt, size, length)
+#     BasicGuider -> SamplerCustomAdvanced -> VAEDecode -> ImageFromBatch (middle) -> [RTX VSR] -> SaveImage
+# ---------------------------------------------------------------------------
+
+STILL_FRAMES = [5, 22, 39]
+STILL_TAIL = ("A single still frame: the camera is static and nothing moves; everything stays exactly as it is "
+              "for the whole shot. No dialogue.")
+STILL_DEFAULTS = {"engine": "video", "frames": 22, "tail": STILL_TAIL, "upscale": False, "scale": 2.0,
+                  "quality": "ULTRA", "megapixels": 1.0, "aspect": "16:9"}
+
+
+def still_settings(project: dict) -> dict:
+    s = project.get("settings") or {}
+    return dict(STILL_DEFAULTS, **(s.get("image") or {}))
+
+
+def _tag(label: str, k: int) -> str:
+    """A reference's tag in the prompt: its label as <label>, or <Picture k>."""
+    name = re.sub(r"[<>]", "", str(label or "")).strip()
+    return f"<{name}>" if name else picture_label(k - 1)
+
+
+def still_prompt(project: dict, text: str, pictures: list, tail: str, edit: bool = False) -> str:
+    """The r2v six sections for one still: each reference a subject whose appearance comes
+    from its <Picture k>, fully preserved; the Style panel's look line; the user's text as
+    [Shot 1] with the still tail; no sound."""
+    style = project.get("style") or {}
+    own = (project.get("settings") or {}).get("image") or {}      # 0.21.5: the stills' own style line / summary
+    defs, ret = [], []
+    for k, ref in enumerate(pictures, 1):
+        tag = _tag(ref.get("label"), k)
+        pic = picture_label(k - 1)
+        desc = str(ref.get("desc") or "").strip().rstrip(".")
+        if edit and k == 1:
+            # To edit: the picture itself is the starting point, changed only as the text says
+            defs.append(f"{tag} is the scene in {pic}: its people, objects, place, light and composition.")
+            ret.append(f"{tag} (appears in [Shot 1]): partially_preserved - kept as it is except for what the "
+                       "description changes.")
+            continue
+        defs.append(f"{tag} is {desc}, whose appearance comes from {pic}." if desc else f"{tag} is the subject shown in {pic}.")
+        ret.append(f"{tag} (appears in [Shot 1]): fully_preserved - appearance, identity, colours and materials.")
+    look = str(own.get("style_line") or "").strip() or str(style.get("style_line") or "").strip()
+    body = str(text or "").strip()
+    if body and not body.endswith((".", "!", "?")):
+        body += "."
+    shot = f"[Shot 1] {body} {str(tail or '').strip()}".strip()
+    out = []
+    if defs:
+        out.append("subject_definitions: " + " ".join(defs))
+    summary = str(own.get("summary") or "").strip()
+    out.append("summary: [reference generation] " + (summary if summary else
+                                                    f"A single static frame: {body or 'the scene described below.'}"))
+    if ret:
+        out.append("retention_analysis: " + "\n".join(ret))
+    out.append("detailed_description: " + (look + " " if look else "") + shot)
+    out.append("overall_soundscape: N/A")
+    out.append("non_diegetic_music: N/A")
+    return "\n".join(out)
+
+
+def build_still(project: dict, item: dict, env: Env | None = None) -> Build:
+    """item: {text, edit: {image, subfolder, type, label, desc?} | null, refs: [{image, subfolder, type,
+    label, desc}], megapixels, aspect, seed, steps?, frames?, name}. The picture being edited (To edit)
+    is <Picture 1>; the References follow."""
+    env = env or Env()
+    s = project.get("settings") or {}
+    st = still_settings(project)
+    item = item or {}
+    for key in ("model", "clip", "video_vae", "audio_vae"):
+        if not s.get(key):
+            raise BuildError(f"Settings (Video side): choose a {key.replace('_', ' ')} file; stills use the video model.")
+    need = ["UNETLoader", "CLIPLoader", "VAELoader", "MiniMaxH3SigmaShift", "MiniMaxH3ReferenceToVideo",
+            "BasicScheduler", "KSamplerSelect", "RandomNoise", "BasicGuider", "SamplerCustomAdvanced",
+            "VAEDecode", "ImageFromBatch", "SaveImage", "ImageScaleToMaxDimension"]
+    missing = [c for c in need if not env.has(c)]
+    if missing:
+        raise BuildError("ComfyUI is missing node(s) this needs:\n  " +
+                         "\n  ".join(f"{c} — from {PACKS.get(c, 'ComfyUI core (update ComfyUI)')}" for c in missing))
+    text = str(item.get("text") or "").strip()
+    if not text:
+        raise BuildError("The Picture has no prompt.")
+    refs = [r for r in (item.get("refs") or []) if isinstance(r, dict) and (r.get("image") or r.get("filename"))]
+    edit = item.get("edit") if isinstance(item.get("edit"), dict) and (item["edit"].get("image") or item["edit"].get("filename")) else None
+    pictures = ([edit] if edit else []) + refs
+    if len(pictures) > MAX_REFERENCES:
+        raise BuildError(f"At most {MAX_REFERENCES} pictures (the one to edit and the References). Bypass some.")
+    # 0.21.4: any H3 video model takes the References (fl2va too, as on the Video side)
+    frames = int(_num(item.get("frames", st.get("frames", 22)), "Frames", 5, 362, kind=int))
+    if (frames - 5) % 17:
+        raise BuildError("Frames must be 5, 22, 39… (17k + 5).")
+    steps = int(_num(item.get("steps", s.get("steps", 8)), "Steps", 1, 200, kind=int))
+    seed = _seed(item.get("seed", 0), "Seed")
+    width, height = output_size(item.get("megapixels", st.get("megapixels", 1.0)),
+                                str(item.get("aspect") or st.get("aspect") or "16:9"))
+    warnings = []
+    tail = str(item.get("tail") or st.get("tail") or STILL_TAIL)
+
+    g = _Graph()
+    model = g.add("unet", "UNETLoader", "Load Diffusion Model", unet_name=s["model"],
+                  weight_dtype=s.get("weight_dtype", "default"))
+    sage = s.get("sage_attention", "auto")
+    if sage and sage not in ("disabled", "off", False) and env.has("PathchSageAttentionKJ"):
+        model = g.add("sage", "PathchSageAttentionKJ", "Patch Sage Attention KJ", model=model,
+                      sage_attention=sage, allow_compile=False)
+    model = g.add("shift", "MiniMaxH3SigmaShift", "ModelSamplingMiniMaxH3", model=model,
+                  shift_video=_num(s.get("shift_video", 12), "Video shift", 0.01, 100),
+                  shift_audio=_num(s.get("shift_audio", 3), "Audio shift", 0.01, 100))
+    turbo = s.get("turbo") or {}
+    if turbo.get("on"):
+        if not turbo.get("lora"):
+            raise BuildError("Turbo is on but no Turbo LoRA file is chosen (Settings).")
+        strength = _num(turbo.get("strength", 1.0), "Turbo strength", -10, 10)
+        if env.has("MiniMaxH3TurboLoRA"):
+            model = g.add("turbo", "MiniMaxH3TurboLoRA", "MiniMax-H3 Turbo LoRA", model=model,
+                          lora_name=turbo["lora"], strength=strength, low_vram=bool(turbo.get("low_vram", False)))
+        else:
+            model = g.add("turbo", "LoraLoaderModelOnly", "Turbo LoRA (stock loader)", model=model,
+                          lora_name=turbo["lora"], strength_model=strength)
+    elif steps < 20 and not re.search(r"fast[\s_-]?h3", str(s.get("model") or ""), re.I):
+        warnings.append(f"Turbo is off and steps are at {steps}. Without Turbo, H3 needs about 20 steps or more.")
+    for n, lora in enumerate((s.get("loras") or [])[:3], 1):
+        if not lora.get("on"):
+            continue
+        if not lora.get("name"):
+            raise BuildError(f"LoRA {n} is switched on but has no file chosen.")
+        model = g.add(f"lora{n}", "LoraLoaderModelOnly", f"LoRA {n}", model=model, lora_name=lora["name"],
+                      strength_model=_num(lora.get("strength", 1.0), f"LoRA {n} strength", -100, 100))
+    clip = g.add("clip", "CLIPLoader", "Load CLIP", clip_name=s["clip"], type="minimax", device="default")
+    vae = g.add("vae_video", "VAELoader", "Video VAE", vae_name=s["video_vae"])
+    avae = g.add("vae_audio", "VAELoader", "Audio VAE", vae_name=s["audio_vae"])
+    sigmas = g.add("scheduler", "BasicScheduler", "BasicScheduler", model=model,
+                   scheduler=s.get("scheduler", "beta"), steps=steps, denoise=1.0)
+    sampler = g.add("sampler", "KSamplerSelect", "KSamplerSelect", sampler_name=s.get("sampler", "er_sde"))
+    noise = g.add("noise", "RandomNoise", "RandomNoise", noise_seed=seed)
+
+    resize_px = _num(s.get("ref_resize_px", 1500), "Reference resize", 16, 8192, int)
+    ref_in = {}
+    for k, ref in enumerate(pictures, 1):
+        what = "The picture to edit" if (edit and k == 1) else f"Reference {k - (1 if edit else 0)} ({ref.get('label') or ref.get('image')})"
+        img = g.add(f"img{k}", "LoadImage", f"{picture_label(k - 1)} {ref.get('label') or ''}".strip(),
+                    image=_picture_path(ref, what))
+        ref_in[f"ref_images.ref_image_{k - 1}"] = g.add(f"resize{k}", "ImageScaleToMaxDimension", f"Resize {picture_label(k - 1)}",
+                                                        image=img, upscale_method="lanczos", largest_size=resize_px)
+    ref_size = s.get("ref_image_size", "match")
+    if ref_size not in ("match", "max"):
+        ref_size = "match"
+    prompt = still_prompt(project, text, pictures, tail, edit=bool(edit))
+    cond = g.add("r2v", "MiniMaxH3ReferenceToVideo", "MiniMax H3 Reference to Video", clip=clip, vae=vae,
+                 audio_vae=avae, prompt=prompt, width=width, height=height, length=frames, ref_image_size=ref_size, **ref_in)
+    guider = g.add("guider", "BasicGuider", "BasicGuider", model=model, conditioning=_out(cond, 0))
+    out = g.add("sample", "SamplerCustomAdvanced", "SamplerCustomAdvanced", noise=noise, guider=guider,
+                sampler=sampler, sigmas=sigmas, latent_image=_out(cond, 1))
+    images = g.add("decode", "VAEDecode", "VAE Decode", samples=_out(out, 0), vae=vae)
+    images = g.add("middle", "ImageFromBatch", f"Middle frame ({frames // 2 + 1} of {frames})", image=images,
+                   batch_index=frames // 2, length=1)
+    scale = 1.0
+    if item.get("upscale", st.get("upscale")) and env.has("RTXVideoSuperResolution"):
+        quality = str(item.get("quality", st.get("quality", "ULTRA")))
+        if quality not in VSR_QUALITIES:
+            quality = "ULTRA"
+        scale = _num(item.get("scale", st.get("scale", 2.0)), "RTX upscale factor", 1, 4)
+        images = g.add("vsr", "RTXVideoSuperResolution", "RTX Video Super Resolution", images=images,
+                       resize_type="scale by multiplier", **{"resize_type.scale": scale}, quality=quality)
+    elif item.get("upscale", st.get("upscale")):
+        warnings.append("RTX Super Resolution isn't installed, so the still is saved at the render size.")
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", str(item.get("name") or "picture")).strip("_")[:60] or "picture"
+    prefix = images_subfolder(project)
+    g.add("save", "SaveImage", f"Save {stem}", images=images, filename_prefix=f"{prefix}/{stem}")
+    nodes = {"sampler": "sample", "save": "save", "longshot": "sample", "combine": "decode", "cond": "r2v"}
+    return Build(prompt=g.nodes, width=int(width * scale), height=int(height * scale), chain=[], nodes=nodes,
+                 filename_prefix=prefix, video_format="", warnings=warnings)
+
+
+def build_image_upscale(project: dict, item: dict, env: Env | None = None) -> Build:
+    """0.21.3, Upscale this: one finished picture (an output file) through RTX Video Super
+    Resolution, saved next to it as <name>_up_#####.png. item: {filename, subfolder, scale, quality}."""
+    env = env or Env()
+    if not env.has("RTXVideoSuperResolution"):
+        raise BuildError("Upscale needs RTX Video Super Resolution (ComfyUI-NVIDIA-RTX-VSR-Pro). Install it, then restart ComfyUI.")
+    item = item or {}
+    name = str(item.get("filename") or "")
+    src = _picture_path({"image": name, "subfolder": item.get("subfolder") or "", "type": item.get("type") or "output"},
+                        "The picture to upscale")
+    q = item.get("quality") if item.get("quality") in VSR_QUALITIES else "ULTRA"
+    scale = _num(item.get("scale", 2), "Upscale", 1, 4)
+    g = _Graph()
+    img = g.add("up_src", "LoadImage", f"Picture {name}", image=src)
+    up = g.add("vsr", "RTXVideoSuperResolution", "RTX Video Super Resolution", images=img,
+               resize_type="scale by multiplier", **{"resize_type.scale": scale}, quality=q)
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", os.path.splitext(name)[0]).strip("_")[:70] or "picture"
+    stem = re.sub(r"_\d{5}_?$", "", stem)
+    prefix = images_subfolder(project)
+    g.add("save", "SaveImage", f"Save {stem}_up", images=up, filename_prefix=f"{prefix}/{stem}_up")
+    return Build(prompt=g.nodes, width=0, height=0, chain=[], nodes={"save": "save", "sampler": "vsr", "longshot": "vsr"},
+                 filename_prefix=prefix, video_format="", warnings=[])

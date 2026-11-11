@@ -133,6 +133,14 @@ const DEFAULT_SETTINGS = {
     turbo: { on: false, lora: null, strength: 1.0 },
     max_face: 150, which: "all", work: 640, padding: 0.8, follow: "auto", mask: 1.0, feather: 0.3,
     color: 1.0, hold_audio: true, seed: 0, describe: "", cast: null },
+  // 0.20.0: Images (MiniMax-H3-Image, ComfyUI 0.44.0+): the picture model, its VAE, and the optional
+  // Qwen3.5 prompt expander; the text encoder is the video one (settings.clip)
+  image: { model: "", vae: "", expander: "", steps: 6, cfg: 1, sampler: "euler", scheduler: "simple",
+    megapixels: 8, aspect: "1:1", keep: 20,
+    // 0.21.0: the engine. "video" (default): the H3 video model from Settings renders a tiny clip and
+    // its middle frame is the picture; "h3image": MiniMax-H3-Image (the 0.20.0 engine)
+    engine: "video", frames: 22, tail: "", upscale: false, scale: 2, quality: "ULTRA", vmp: 1, vaspect: "16:9",
+    style_line: "", summary: "" },                 // 0.21.5: the stills' own (empty: the Video side's style line / automatic)
 };
 
 function normalize(p) {
@@ -253,7 +261,9 @@ function normalize(p) {
   s.face_swap.results = (Array.isArray(s.face_swap.results) ? s.face_swap.results : []).filter((r) => r && r.filename).slice(0, 20);
   if (![1.5, 2].includes(Number(s.rtx_vsr.scale))) s.rtx_vsr.scale = 2;   // 1.5× or 2× only
   s.loras = [0, 1, 2].map((i) => Object.assign({ on: false, name: null, strength: 1.0 }, (s.loras || [])[i] || {}));
+  s.image = Object.assign({}, DEFAULT_SETTINGS.image, s.image || {});       // 0.20.0
   p.settings = s;
+  p.images = normImages(p.images);                                          // 0.20.0: References + Pictures
   p.last_output = p.last_output || null;
   // The stitched, decoded video and the plan it shows. Renders now decode each
   // new take on its own, so the last render's plan and the last video can differ.
@@ -2031,6 +2041,8 @@ function jobTitle(spec, pass, of, ids) {
     case "export": return "Export approved clips · upscaled";
     case "face": return `Face refine · ${pad(spec.target)}`;
     case "swap": return `Face swap · ${spec.what || "video"}`;
+    case "image": return `Picture · ${spec.what || "image"}${ofTxt}`;        // 0.20.0
+    case "imageup": return `Upscale · ${spec.what || "picture"}`;             // 0.21.3
     default: return spec.type;
   }
 }
@@ -2260,6 +2272,8 @@ function jobOpts(job) {
       extra: { shot: s.id, take: s.take, sig: faceSig() }, onDone: () => {} };
   }
   if (sp.type === "swap") return swapOpts(sp);          // 0.18.0
+  if (sp.type === "image") return imageOpts(sp, job);   // 0.20.0
+  if (sp.type === "imageup") return imageUpOpts(sp);    // 0.21.3
   if (sp.type === "refine") {
     const s = shot(sp.target);
     if (!s || s.kind === "clip" || !s.take) return null;
@@ -2326,6 +2340,7 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 
 function renderQueue() {
   setTimeout(syncAwake, 0);
+  if (imagesOn()) ipicProgress();            // 0.20.0: the step bar on the Picture being rendered
   if (S.swapped || !$("queue")) return;
   if (QD.id) { QD.dirty = true; return; }           // 0.18.4: not while a row is being dragged
   // 0.9.2 ⇅: latest on top (per browser); the run order stays the same
@@ -2789,26 +2804,27 @@ function pickFields(o, keys) {
 
 async function queueJob({ upto, dry, kind, label, note, onDone, final = false, finalUp = true, standalone = false, batch = null,
   omit = null, trimLeft = false, takeClips = null, chunk = null, exportClips = null, extra = null, jobId = null,
-  joins = null, takeAudio = null, faceTry = null, refineTry = null, stems = null, faceSwap = null }) {
+  joins = null, takeAudio = null, faceTry = null, refineTry = null, stems = null, faceSwap = null, image = null, imageUp = null }) {
   if (S.busy) return;
   if (Object.keys(S.uploading).length) { toast("Wait for the image upload to finish."); return; }
   S.error = null;
   const dryBox = () => { if (kind === "dry") showModal("Dry run · it stopped with an error", S.error); };
   if (comfyTooOld()) { S.error = comfyTooOldText(); dryBox(); render(); return; }
-  const missing = kind === "clips" || kind === "export" || kind === "align" || kind === "face" || kind === "stems" || kind === "swap" ? [] : missingRefs();
+  const missing = kind === "clips" || kind === "export" || kind === "align" || kind === "face" || kind === "stems" || kind === "swap" || kind === "image" || kind === "imageup" ? [] : missingRefs();
   if (missing.length) {
     S.error = `${missing.length} reference${missing.length > 1 ? "s are" : " is"} missing — relink or bypass ${missing.length > 1 ? "them" : "it"}.`;
     dryBox();
     render();
     return;
   }
-  const lost = kind === "stems" ? [] : kind === "face" ? missingFaceModels(P()) : missingModels(P());
+  const lost = kind === "stems" || kind === "imageup" ? [] : kind === "face" ? missingFaceModels(P()) : kind === "image" ? missingImageModels(P()) : missingModels(P());
   if (kind === "refine" && S.opts && !matchModel(P().settings.refine.model, S.opts.models)) lost.push(`Refine model (${P().settings.refine.model || "none"})`);
   if (lost.length) {
     S.error = `Model file${lost.length > 1 ? "s" : ""} not found in ComfyUI's model folders: ${lost.join(", ")}. ` +
       `Choose ${lost.length > 1 ? "them" : "it"} under Advanced (Browse… can also add a folder ComfyUI doesn't know about).`;
     dryBox();
-    if (kind === "face" && lost.some((x) => x.startsWith("Face"))) S.faceOpen = true;
+    if (kind === "image") S.isetOpen = true;
+    else if (kind === "face" && lost.some((x) => x.startsWith("Face"))) S.faceOpen = true;
     else if (!lost.every((x) => x.startsWith("Vocal"))) S.advOpen = true;
     else S.audioOpen = true;
     render();
@@ -2913,6 +2929,8 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, f
       : faceTry ? { project, face_try: faceTry }
       : refineTry ? { project, refine_try: refineTry }
       : faceSwap ? { project, face_swap: faceSwap }
+      : image ? { project, image }
+      : imageUp ? { project, image_up: imageUp }
       : stems ? { project, stems }
       : { project, upto, dry_run: !!dry, final, final_upscale: finalUp !== false, standalone, clips_for: clipsFor, chunk };
     built = await api("/longshot/build", { method: "POST", body });
@@ -3013,6 +3031,7 @@ async function finish(promptId, entry) {
   } catch (e) { res = { ok: false, error: e.message }; }
   const job = b.jobId && Q.jobs.find((j) => j.id === b.jobId);
   if (job && !res.more) endJob(job, res.ok ? "done" : res.stopped ? "stopped" : "failed", res.error);
+  if (OD.open) loadOutputs();                        // 0.20.0: the drawer shows the new files
   if (!res.more) setTimeout(queueNext, 0);
   renderQueue();
 }
@@ -3046,6 +3065,10 @@ async function finishIn(b, promptId, entry) {
     await refineDone(b, entry.outputs || {});
   } else if (b.kind === "swap") {
     swapDone(b, entry.outputs || {});
+  } else if (b.kind === "image") {
+    imageDone(b, entry.outputs || {});
+  } else if (b.kind === "imageup") {
+    imageUpDone(b, entry.outputs || {});
   } else if (b.kind === "align") {
     await alignDone(b, entry.outputs || {});
   } else if (b.kind === "stems") {
@@ -5474,6 +5497,8 @@ function drawAll() {
   renderPlan();
   renderTakeStore();
   renderQueue();
+  renderImages();          // 0.20.0 (nothing when the Video side is showing)
+  renderOutputs();
 }
 
 function renderSaveState() { $("save-state").textContent = S.saveState; renderUndo(); }
@@ -6871,6 +6896,7 @@ function renderViewer() {
   $("jump").disabled = !has || !L;
   $("loop").setAttribute("aria-pressed", S.loop && !!L);
   $("loop").disabled = !has || !L;
+  $("frame-ref").disabled = !has;
   const hasFile = !!(lo && lo.video);
   // Open output folder always works (local only): the latest video, else the clips folder
   for (const el of document.querySelectorAll('[data-which="output"]')) {
@@ -8755,6 +8781,9 @@ document.addEventListener("click", async (e) => {
   if (!el || el.disabled) return;
   const a = el.dataset.action;
   const p = P();
+  if (a === "mode" || a.startsWith("ipic-") || a.startsWith("iref-") || a.startsWith("ires-") || a.startsWith("iset-") || a.startsWith("outs-")) {
+    imagesAction(a, el, e); return;            // 0.20.0
+  }
   switch (a) {
     case "primary": primary(); break;
     case "fold": toggleFold(el.dataset.fold); break;
@@ -8948,7 +8977,7 @@ document.addEventListener("click", async (e) => {
     case "remove-shot": {
       const s = shotOf(el);
       if (listGuard(p.shots.indexOf(s))) return;
-      if (s.text && !confirm(`Remove ${s.bypassed ? "this bypassed shot" : titleOf(s)}? Its text is deleted.`)) return;
+      if (s.text && !await askOK(`Remove ${s.bypassed ? "this bypassed shot" : titleOf(s)}? Its text is deleted.`)) return;
       if (!s.bypassed) syncAfter(s, "Removing a Shot");
       S.dry = null;
       p.shots = p.shots.filter((x) => x.id !== s.id);
@@ -8980,7 +9009,7 @@ document.addEventListener("click", async (e) => {
     case "mb-cd": MB.path = el.dataset.path; renderMB(); break;
     case "mb-back": MB.mode = "files"; renderMB(); break;
     case "mb-add": if (MB.shown) mbChangeFolders("add", MB.shown); break;
-    case "mb-remove": if (confirm("Stop looking for models in this folder? The files stay where they are.")) mbChangeFolders("remove", el.dataset.path); break;
+    case "mb-remove": if (await askOK("Stop looking for models in this folder? The files stay where they are.")) mbChangeFolders("remove", el.dataset.path); break;
     case "wrap": wrap(el); break;
     case "bypass-cast": {
       if (setupGuard()) return;
@@ -8995,7 +9024,7 @@ document.addEventListener("click", async (e) => {
     case "remove-cast": {
       if (setupGuard()) return;
       const c = castOf(el);
-      if (!confirm(`Remove ${c.label || "this reference"}?`)) return;
+      if (!await askOK(`Remove ${c.label || "this reference"}?`)) return;
       const mode = await askRefChange();
       p.cast = p.cast.filter((x) => x.id !== c.id);
       if (!c.bypassed) applyRefChange(mode, "Cast & Scenes");
@@ -9056,7 +9085,7 @@ document.addEventListener("click", async (e) => {
     case "remove-refmod": {
       if (setupGuard()) return;
       const m = refmodOf(el);
-      if (!m || !confirm(`Remove ${m.label || m.name}?`)) return;
+      if (!m || !await askOK(`Remove ${m.label || m.name}?`)) return;
       const mode = await askRefChange();
       p.refmods = p.refmods.filter((x) => x.id !== m.id);
       if (!m.bypassed) applyRefChange(mode, "RefMods");
@@ -9080,7 +9109,7 @@ document.addEventListener("click", async (e) => {
     case "remove-video": {
       if (setupGuard()) return;
       const v = videoOf(el);
-      if (!v || !confirm(`Remove ${v.label || "this video reference"}?`)) return;
+      if (!v || !await askOK(`Remove ${v.label || "this video reference"}?`)) return;
       const mode = await askRefChange();
       p.videos = p.videos.filter((x) => x.id !== v.id);
       if (!v.bypassed) applyRefChange(mode, "Video references");
@@ -9100,7 +9129,7 @@ document.addEventListener("click", async (e) => {
     case "remove-voice": {
       if (setupGuard()) return;
       const v = voiceOf(el);
-      if (!v || !confirm(`Remove ${v.label || "this voice reference"}? Pictures linked to it lose their voice.`)) return;
+      if (!v || !await askOK(`Remove ${v.label || "this voice reference"}? Pictures linked to it lose their voice.`)) return;
       const mode = await askRefChange();
       p.voices = p.voices.filter((x) => x.id !== v.id);
       if (!v.bypassed) applyRefChange(mode, "Voice references");
@@ -9139,7 +9168,10 @@ document.addEventListener("click", async (e) => {
       break;
     }
     case "lb-close": closeLightbox(); break;
+    case "lb-fs": lightboxFullscreen(); break;                       // 0.21.3
     case "reroll-shot": rerollShot(shotOf(el)); break;
+    case "frame-ref": frameRefMenu(el); break;                       // 0.21.2
+    case "frame-ref-to": closeFrameMenu(); frameToRef(el.dataset.to); break;
     case "use-seed": useSeed(shotOf(el), Number(el.dataset.seed)); break;
     case "shot-seed-step": stepShotSeed(shotOf(el), Number(el.dataset.d) || 0); break;
     case "quick-model": {                          // 0.17.12: the folded Advanced panel's model switch
@@ -9259,7 +9291,7 @@ document.addEventListener("click", async (e) => {
     case "proj-sort": store("h3studio.projSort", el.dataset.v === "name" ? "name" : "date"); renderOpenList(); break;
     case "proj-folder": projectFolder(el.dataset.slug); break;
     case "proj-new-folder": {                       // 0.17.37: an empty folder to drag projects into
-      const n = (prompt("Name of the new folder:") || "").replace(/\s+/g, " ").trim().slice(0, 60);
+      const n = (await askText("Name of the new folder:") || "").replace(/\s+/g, " ").trim().slice(0, 60);
       if (!n) break;
       (S.newFolders = S.newFolders || new Set()).add(n);
       renderOpenList();
@@ -9360,6 +9392,7 @@ document.addEventListener("input", (e) => {
   if (el.id === "editor-desc") autoGrow(el);
   else if (el.dataset.style) { p.style[el.dataset.style] = el.value; fitText(el); scheduleSave(); }
   else if (el.dataset.shotField) { shotInput(el); if (el.tagName === "TEXTAREA") fitText(el); }
+  else if (el.dataset.ipic === "text" || el.dataset.ipic === "title") { imagesInput(el); }     // 0.20.0
   else if (el.type === "range" && el.nextElementSibling && el.nextElementSibling.tagName === "OUTPUT") {
     el.nextElementSibling.textContent = Number(el.value).toFixed(2);
   }
@@ -9377,6 +9410,7 @@ document.addEventListener("change", async (e) => {
   const changed = before === undefined || before !== el.value;
   committed.set(el, el.value);
   if (el.dataset.relink) { relinkFromSelect(el); return; }
+  if (el.dataset.ipic !== undefined || el.dataset.iset !== undefined || el.dataset.outs !== undefined || el.dataset.iref !== undefined) { imagesChange(el); return; }   // 0.20.0
   if (el.dataset.refmodField) {
     const m = refmodOf(el), k = el.dataset.refmodField;
     if (!m) return;
@@ -9800,6 +9834,19 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (imagesOn()) {                                // 0.21.3: the Images side's own keys
+    const cur = ipicCurrent();
+    if (e.key === "t" || e.key === "T") { e.preventDefault(); setItheater(!IMG.theater); }
+    else if (e.key === "f" || e.key === "F") { e.preventDefault(); ipreviewFullscreen(); }
+    else if (e.key === "Escape" && IMG.theater && !document.fullscreenElement) { e.preventDefault(); setItheater(false); }
+    else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && cur.pic && cur.pic.results.length) {
+      e.preventDefault();
+      const n = cur.pic.results.length;
+      cur.pic.current = Math.max(0, Math.min(n - 1, cur.pic.current + (e.key === "ArrowRight" ? 1 : -1)));
+      renderIpreview(); renderIpics();
+    }
+    return;
+  }
   if (e.key === "m" || e.key === "M") {
     e.preventDefault();
     toggleMute();
@@ -9861,14 +9908,14 @@ async function createProject(name, project) {
 }
 
 async function newProject() {
-  const name = (prompt("Name for the new project:", "New long shot") || "").trim();
+  const name = (await askText("Name for the new project:", "New long shot") || "").trim();
   if (!name) return;
   const settings = JSON.parse(JSON.stringify(P() ? P().settings : DEFAULT_SETTINGS));
   createProject(name, { settings, cast: [], shots: [{ id: uid("s"), text: "", seconds: 5, status: "queued" }] });
 }
 
 async function saveAs() {
-  const name = (prompt("Save a copy as:", P().name + " copy") || "").trim();
+  const name = (await askText("Save a copy as:", P().name + " copy") || "").trim();
   if (name) createProject(name, Object.assign(copyForNew(), { name }));
 }
 
@@ -9878,7 +9925,7 @@ async function duplicateProject() {
 
 async function renameProject() {
   if (busyGuard()) return;
-  const name = (prompt("Rename the project. Its input, takes and videos folders are renamed too:", P().name) || "").trim();
+  const name = (await askText("Rename the project. Its input, takes and videos folders are renamed too:", P().name) || "").trim();
   if (!name || name === P().name) return;
   await saveNow();
   let res;
@@ -10005,7 +10052,7 @@ async function projectFolder(slug) {
   const p = (S.projects || []).find((x) => x.slug === slug);
   if (!p) return;
   const existing = [...new Set((S.projects || []).map((x) => x.folder).filter(Boolean))].sort();
-  const name = prompt(`Folder for “${p.name}”.\nType a folder name (a new one is made), or leave it empty for no folder.` +
+  const name = await askText(`Folder for “${p.name}”.\nType a folder name (a new one is made), or leave it empty for no folder.` +
     (existing.length ? `\n\nFolders: ${existing.join(", ")}` : ""), p.folder || "");
   if (name === null) return;
   await setProjectFolder(slug, name.trim());
@@ -10367,7 +10414,7 @@ function dropTargetOf(e) {
     const card = e.target.closest("[data-shot]");
     return card ? { zone: "shots", el: card, id: card.dataset.shot } : { zone: "shots", el: shots, id: null };
   }
-  return null;
+  return imagesDropTarget(e);          // 0.20.0
 }
 
 function clearDrop() {
@@ -10410,12 +10457,14 @@ window.addEventListener("drop", (e) => {
   else if (t.zone === "audio") addAudio(e.dataTransfer.files);
   else if (t.zone === "shots") addClipFiles(e.dataTransfer.files, t.id);
   else if (t.zone === "anchor") anchorUpload(t.id, e.dataTransfer.files);
+  else if (t.zone === "irefs") irefAddFiles(e.dataTransfer.files);                 // 0.20.0
+  else if (t.zone === "iedit") ipicEditFiles(t.id, e.dataTransfer.files);
 });
 
 async function clearSegments() {
   if (busyGuard()) return;
   const st = S.segStats || { files: 0, bytes: 0 };
-  if (!confirm(`Delete all ${st.files} saved take file${st.files === 1 ? "" : "s"} (${(st.bytes / 1048576).toFixed(1)} MB) for "${P().name}"? ` +
+  if (!await askOK(`Delete all ${st.files} saved take file${st.files === 1 ? "" : "s"} (${(st.bytes / 1048576).toFixed(1)} MB) for "${P().name}"? ` +
       "Rendered Shots keep their status, but every Shot has to render again (Shots still in ComfyUI's memory come back until it restarts).")) return;
   try { S.segStats = await api("/longshot/clear-segments", { method: "POST", body: { project: P().slug } }); }
   catch (e) { toast(e.message); return; }
@@ -10450,7 +10499,7 @@ async function clearUnapproved() {
   const gone = Math.max(0, st.files - kept);
   if (!gone) { toast("Every saved take belongs to an approved Shot: nothing to delete."); return; }
   const losing = P().shots.filter((x) => x.kind !== "clip" && x.take && !keep.has(x.take));
-  if (!confirm(`Delete ${gone} unapproved take file${gone === 1 ? "" : "s"} for "${P().name}"? ` +
+  if (!await askOK(`Delete ${gone} unapproved take file${gone === 1 ? "" : "s"} for "${P().name}"? ` +
       `The ${kept} take${kept === 1 ? "" : "s"} your approved Shots use stay.` +
       (losing.length ? ` ${losing.map(titleOf).join(", ")} ${losing.length === 1 ? "loses its take and has" : "lose their takes and have"} to render again.` : ""))) return;
   let res;
@@ -10541,9 +10590,33 @@ function confirmBox({ title, body, yes = "Continue", no = "Cancel", check = null
     const host = document.fullscreenElement || document.querySelector(".app");
     host.appendChild($("confirm"));
     $("confirm").hidden = false;
-    $("confirm-yes").focus();
+    const inp = document.getElementById("confirm-input");
+    if (inp) { inp.focus(); inp.select(); } else $("confirm-yes").focus();
   });
 }
+// 0.21.11: the Studio's own boxes instead of the browser's confirm() / prompt(), which stop working for
+// good (until the tab reloads) once "don't let this page show more dialogs" is ticked
+function askOK(text, yes = "OK") {
+  const t = String(text || "");
+  const m = t.match(/^([^?]{1,160}\?)\s*([\s\S]*)$/);
+  return confirmBox({ title: m ? m[1] : t, body: m ? m[2] : "", yes, no: "Cancel" }).then((v) => v === true);
+}
+function askText(text, value = "") {
+  const t = String(text || "");
+  const lines = t.split("\n");
+  return confirmBox({ title: lines[0], html: true, yes: "OK", no: "Cancel",
+    body: (lines.slice(1).join("\n").trim() ? `<span class="muted small" style="white-space:pre-wrap">${esc(lines.slice(1).join("\n").trim())}</span><br>` : "") +
+      `<input id="confirm-input" class="field" style="width:100%;margin-top:8px" value="${esc(value == null ? "" : value)}">` }).then((v) => {
+    const el = document.getElementById("confirm-input");
+    const out = v === true && el ? el.value : null;
+    if (el) el.remove();
+    return out;
+  });
+}
+document.addEventListener("keydown", (e) => {
+  if (e.target && e.target.id === "confirm-input" && e.key === "Enter") { e.preventDefault(); confirmDone(true); }
+}, true);
+
 function confirmDone(v) {
   $("confirm").hidden = true;
   const r = confirmResolve;
@@ -10971,6 +11044,41 @@ function openLightbox(id) {
   showLightbox();
 }
 function showLightbox() {
+  if (lb.irefs) {                                 // 0.21.10: the Images References
+    const list = refViewList(), it = list[lb.i];
+    if (!it) { closeLightbox(); return; }
+    $("lb-pic").textContent = it.tag;
+    $("lb-title").textContent = it.label;
+    $("lb-file").textContent = `${it.f.subfolder ? it.f.subfolder + "/" : ""}${it.f.image}${it.r.cast ? " · from Cast & Scenes" : ""}`;
+    $("lb-foot").textContent = "Scroll to zoom · drag to pan · double-click to reset · ← → other references · F full screen · Esc closes";
+    const im = $("lb-img");
+    im.onload = () => {
+      const st = $("lb-stage").getBoundingClientRect();
+      lb.fit = Math.min(st.width / im.naturalWidth, st.height / im.naturalHeight, 1);
+      Object.assign(lb, { s: lb.fit, x: 0, y: 0 });
+      applyLightbox();
+    };
+    im.src = viewURL({ filename: it.f.image, subfolder: it.f.subfolder, type: it.f.type });
+    return;
+  }
+  if (lb.pic) {                                   // 0.21.3: a Picture's results
+    const pic = ipicById(lb.pic), r = pic && pic.results[lb.i];
+    if (!r) { closeLightbox(); return; }
+    $("lb-pic").textContent = `Picture ${ipicNum(pic)}`;
+    $("lb-title").textContent = pic.title || "";
+    $("lb-file").textContent = `${r.filename}${r.width && r.height ? ` · ${r.width} × ${r.height}` : ""}${r.up ? ` · upscaled ×${r.up}` : ""} · result ${lb.i + 1} of ${pic.results.length}`;
+    $("lb-foot").textContent = "Scroll to zoom · drag to pan · double-click to reset · ← → other results · F full screen · Esc closes";
+    const im = $("lb-img");
+    im.onload = () => {
+      const st = $("lb-stage").getBoundingClientRect();
+      lb.fit = Math.min(st.width / im.naturalWidth, st.height / im.naturalHeight, 1);
+      Object.assign(lb, { s: lb.fit, x: 0, y: 0 });
+      applyLightbox();
+    };
+    im.src = viewURL(r);
+    return;
+  }
+  $("lb-foot").textContent = "Scroll to zoom · drag to pan · double-click to reset · ← → other references · Esc closes";
   const list = lightboxList();
   const c = list[lb.i];
   $("lb-pic").textContent = picOf(c);
@@ -10992,8 +11100,24 @@ function applyLightbox() {
   img.style.height = h + "px";
   img.style.transform = `translate(${-w / 2 + lb.x}px, ${-h / 2 + lb.y}px)`;
 }
-function closeLightbox() { $("lightbox").hidden = true; lb = null; }
+function closeLightbox() { $("lightbox").hidden = true; lb = null; if (document.fullscreenElement === $("lightbox")) document.exitFullscreen().catch(() => {}); }
 function lightboxKey(e) {
+  if (lb && lb.irefs) {                            // 0.21.10: the Images References
+    const n = refViewList().length;
+    if (e.key === "Escape") { e.preventDefault(); closeLightbox(); }
+    else if (e.key === "ArrowRight" && n) { e.preventDefault(); lb.i = (lb.i + 1) % n; showLightbox(); }
+    else if (e.key === "ArrowLeft" && n) { e.preventDefault(); lb.i = (lb.i - 1 + n) % n; showLightbox(); }
+    else if ((e.key === "f" || e.key === "F") && !e.ctrlKey && !e.metaKey) { e.preventDefault(); lightboxFullscreen(); }
+    return;
+  }
+  if (lb && lb.pic) {                              // 0.21.3: a Picture's results
+    if (e.key === "Escape") { e.preventDefault(); closeLightbox(); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); resultViewStep(1); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); resultViewStep(-1); }
+    else if ((e.key === "f" || e.key === "F") && !e.ctrlKey && !e.metaKey) { e.preventDefault(); lightboxFullscreen(); }
+    else if ((e.key === "t" || e.key === "T") && !e.ctrlKey && !e.metaKey) { e.preventDefault(); closeLightbox(); }
+    return;
+  }
   const n = lightboxList().length;
   if (e.key === "Escape") { e.preventDefault(); closeLightbox(); }
   else if (e.key === "ArrowRight" && n) { e.preventDefault(); lb.i = (lb.i + 1) % n; showLightbox(); }
@@ -11394,6 +11518,7 @@ function currentFor(target) {
   if (target === "refine_model") return s.refine.model;
   if (target === "face_model") return s.face.model;
   if (target === "swap_model") return s.face_swap.model;
+  if (target.startsWith("image_")) return s.image[target.slice(6)];        // 0.20.0
   if (target.startsWith("lora:")) return s.loras[+target.slice(5)].name;
   return s[target];
 }
@@ -11468,6 +11593,7 @@ async function mbPick(name) {
   if (t === "refine_model") { s.refine.model = name; S.dry = null; return commit(); }
   if (t === "face_model") { s.face.model = name; return commit(); }
   if (t === "swap_model") { s.face_swap.model = name; return commit(); }
+  if (t.startsWith("image_")) { s.image[t.slice(6)] = name; return commit(); }     // 0.20.0
   const matters = t === "turbo" ? s.turbo.on : t.startsWith("lora:") ? s.loras[+t.slice(5)].on : true;
   const what = t === "turbo" ? "the Turbo LoRA" : t.startsWith("lora:") ? `LoRA ${+t.slice(5) + 1}` : KEEPABLE[t] || "the model";
   let mode = "all";
@@ -12049,7 +12175,7 @@ async function afterRestart() {
 // message pops up: the open project stays on screen as it was.
 for (const name of ["render", "renderShots", "renderDecision", "renderViewer", "renderSettings", "renderAdvanced",
   "renderPlan", "renderCast", "renderStyle", "renderAudio", "renderHeader", "renderSaveState", "loadVideo",
-  "layoutStage", "toast", "showModal"]) {
+  "layoutStage", "toast", "showModal", "renderImages", "renderOutputs"]) {
   const f = window[name];
   if (typeof f !== "function") continue;
   window[name] = function (...args) { if (S.swapped) return undefined; return f.apply(this, args); };
@@ -12058,7 +12184,7 @@ for (const name of ["render", "renderShots", "renderDecision", "renderViewer", "
 // 0.17.45: a refresh mid-render. The running job keeps its ComfyUI run (prompt id and what
 // was built) in the saved queue; after the page loads, a run still going is watched again
 // and a run that finished meanwhile is saved as its take(s), the same as without the refresh.
-const RESUME_TYPES = new Set(["shot", "through", "all", "face", "refine", "stems", "swap"]);
+const RESUME_TYPES = new Set(["shot", "through", "all", "face", "refine", "stems", "swap", "image", "imageup"]);
 function keepRun(b) {
   const job = b && b.jobId && Q.jobs.find((j) => j.id === b.jobId);
   if (!job || !RESUME_TYPES.has(job.spec.type)) return;
@@ -12143,6 +12269,1190 @@ async function start() {
   } catch (e) { toast("Couldn't create a project: " + e.message); }
 }
 
+
+// ===========================================================================
+// 0.20.0: Images. MiniMax-H3-Image (ComfyUI 0.44.0+) in the same project: one shared
+// References set (<Picture 1…N>), Pictures (a prompt each, every result kept), and the
+// Outputs drawer (the project's output folder, draggable into the references of either
+// side). Everything lives in project.images and settings.image; renders go through the
+// Queue as jobs of type "image"; results are saved in output/longshot/<slug>/images.
+// ===========================================================================
+
+const IMG = { mode: store("h3studio.mode") === "images" ? "images" : "video", pic: null, drag: null };
+S.isetOpen = store("h3studio.isetOpen") !== "0";
+// 0.21.6: the Images panels fold (per browser)
+S.irefsOpen = store("h3studio.irefsOpen") !== "0";
+S.istyleOpen = store("h3studio.istyleOpen") !== "0";
+S.ipicsOpen = store("h3studio.ipicsOpen") !== "0";
+function foldPanel(panel, key, foldBtn, body) {
+  const open = !!S[key];
+  store("h3studio." + key, open ? "1" : "0");
+  $(panel).classList.toggle("folded", !open);
+  $(foldBtn).setAttribute("aria-expanded", String(open));
+  $(body).hidden = !open;
+  return open;
+}
+
+function normImages(im) {
+  im = im && typeof im === "object" ? im : {};
+  const refs = (Array.isArray(im.refs) ? im.refs : []).map((r) => ({
+    id: r.id || uid("ir"), label: r.label || "", cast: r.cast || null,
+    image: r.image || "", subfolder: r.subfolder || "", type: r.type === "output" ? "output" : "input",
+    sha256: r.sha256 || null, bypassed: !!r.bypassed, from: r.from || (r.cast ? "cast" : "file"),
+  })).filter((r) => r.cast || r.image);
+  const pictures = (Array.isArray(im.pictures) ? im.pictures : []).map((x) => ({
+    id: x.id || uid("ip"), title: x.title || "", text: x.text || "",
+    edit: x.edit && (x.edit.image || x.edit.filename) ? {
+      image: x.edit.image || x.edit.filename, subfolder: x.edit.subfolder || "", type: x.edit.type === "output" ? "output" : "input",
+      label: x.edit.label || "", width: Number(x.edit.width) || null, height: Number(x.edit.height) || null } : null,
+    megapixels: Number(x.megapixels) > 0 ? Number(x.megapixels) : null,      // null: the setting's default
+    aspect: x.aspect || null,
+    seed: Number.isFinite(Number(x.seed)) ? Number(x.seed) : -1,
+    steps: Number(x.steps) > 0 ? Math.round(Number(x.steps)) : null,
+    expand: !!x.expand, count: Math.max(1, Math.min(16, Math.round(Number(x.count) || 1))),
+    folded: !!x.folded,                          // 0.21.6: the card shows its header and one line
+    results: (Array.isArray(x.results) ? x.results : []).filter((r) => r && r.filename).map((r) => ({
+      filename: r.filename, subfolder: r.subfolder || "", type: r.type || "output", seed: r.seed ?? null,
+      width: Number(r.width) || null, height: Number(r.height) || null, made: Number(r.made) || 0,
+      prompt: r.prompt || "", refs: Array.isArray(r.refs) ? r.refs : [], edit: r.edit || "", expanded: !!r.expanded })),
+    current: Math.max(0, Math.round(Number(x.current) || 0)),
+  }));
+  return { refs, pictures };
+}
+
+const imagesOn = () => IMG.mode === "images";
+const ipics = () => P().images.pictures;
+const irefs = () => P().images.refs;
+const ipicById = (id) => ipics().find((x) => x.id === id) || null;
+const ipicNum = (pic) => ipics().indexOf(pic) + 1;
+const imgSet = () => P().settings.image;
+const imgNodeOk = () => !S.opts || !S.opts.nodes || S.opts.nodes.MiniMaxH3ImageConditioning !== false;
+const textGenOk = () => !S.opts || S.opts.text_gen !== false;
+// 0.21.0: stills from the video model (the default engine)
+const stillEngine = () => imgSet().engine !== "h3image";
+const stillNodesOk = () => !S.opts || S.opts.still_nodes !== false;
+const engineOk = () => stillEngine() ? stillNodesOk() : imgNodeOk();
+function mpList() {
+  const o = S.opts || {};
+  return stillEngine() ? (o.megapixels && o.megapixels.length ? o.megapixels : [0.5, 0.6, 0.8, 1, 1.2, 1.5, 2]) : (o.image_megapixels || [4, 8, 16]);
+}
+function picMp(pic) {
+  const im = imgSet(), list = mpList(), d = stillEngine() ? Number(im.vmp) : Math.max(4, Number(im.megapixels) || 8);
+  // 0.21.3: H3-Image starts at 4 MP: a Picture set lower moves up to 4
+  if (!stillEngine() && pic.megapixels && pic.megapixels < 4) return list.includes(4) ? 4 : list[0];
+  return list.includes(pic.megapixels) ? pic.megapixels : list.includes(d) ? d : list[Math.floor(list.length / 2)];
+}
+const picAspect = (pic) => pic.aspect || (stillEngine() ? imgSet().vaspect : imgSet().aspect) || "1:1";
+const picSteps = (pic) => (pic && pic.steps) || (stillEngine() ? Number(P().settings.steps) || 8 : imgSet().steps);
+
+/** The picture a reference stands for: a Cast & Scenes card's (it follows the card), or its own file. */
+function irefFile(r) {
+  if (r.cast) {
+    const c = (P().cast || []).find((x) => x.id === r.cast);
+    if (!c || !c.image) return null;
+    return { image: c.image, subfolder: c.subfolder || "", type: "input", label: c.label || r.label || "", desc: c.desc || "", cast: c, bypassedCard: !!c.bypassed };
+  }
+  return r.image ? { image: r.image, subfolder: r.subfolder, type: r.type, label: r.label || r.image } : null;
+}
+/** References in order, with their files: what every Picture renders with. */
+function irefsActive() {
+  return irefs().filter((r) => !r.bypassed).map((r) => Object.assign({ ref: r }, irefFile(r) || {})).filter((x) => x.image);
+}
+const slugTitle = (t) => String(t || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40);
+function fmtBytes(n) {
+  if (!(n >= 0)) return "";
+  return n >= 1073741824 ? (n / 1073741824).toFixed(2) + " GB" : n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB";
+}
+/** Width and height for a Picture: an aspect preset, or the edited picture's shape, at its megapixels. */
+function ipicSize(pic) {
+  const im = imgSet();
+  const mp = picMp(pic), aspect = picAspect(pic);
+  const fit = (w, h) => { const sc = Math.sqrt(mp * 1024 * 1024 / (w * h)); return [Math.max(32, Math.round(w * sc / 32) * 32), Math.max(32, Math.round(h * sc / 32) * 32)]; };
+  if (stillEngine()) {          // the video sizes (Settings' table); an edited picture is only a reference here
+    const t = ((S.opts || {}).sizes || {})[`${mp}|${aspect}`];
+    const [a, b] = aspect.split(":").map(Number);
+    return { mp, aspect, size: t || fit(a || 1, b || 1) };
+  }
+  if (pic.edit) return pic.edit.width && pic.edit.height ? { mp, aspect: null, size: fit(pic.edit.width, pic.edit.height) } : { mp, aspect: null, size: null };
+  const [a, b] = (aspect.split(":").map(Number).length === 2 ? aspect.split(":").map(Number) : [1, 1]);
+  return { mp, aspect, size: fit(a, b) };
+}
+function missingImageModels(p) {
+  if (!S.opts) return [];
+  if (stillEngine()) return missingModels(p);        // 0.21.0: the video model's files
+  const im = p.settings.image, out = [];
+  if (!matchModel(im.model, S.opts.models)) out.push(`Image model${im.model ? ` (${im.model})` : ""}`);
+  if (!matchModel(im.vae, S.opts.vaes)) out.push(`Image VAE${im.vae ? ` (${im.vae})` : ""}`);
+  if (!matchModel(p.settings.clip, S.opts.clips)) out.push(`Text encoder${p.settings.clip ? ` (${p.settings.clip})` : ""}`);
+  if (ipics().some((x) => x.expand) && !matchModel(im.expander, S.opts.clips)) out.push(`Prompt expander${im.expander ? ` (${im.expander})` : ""}`);
+  return out;
+}
+
+// --- the Video | Images switch ------------------------------------------------
+function setMode(m) {
+  IMG.mode = m === "images" ? "images" : "video";
+  store("h3studio.mode", IMG.mode);
+  const on = imagesOn();
+  $("video-main").hidden = on;
+  $("images-main").hidden = !on;
+  $("theater-slot").hidden = on;            // 0.21.9: each side's large view shows on its own side only
+  if ($("itheater-slot")) $("itheater-slot").hidden = !on;
+  $("mode-video").setAttribute("aria-pressed", String(!on));
+  $("mode-images").setAttribute("aria-pressed", String(on));
+  // the Queue panel is one panel, shown on whichever side is open
+  const q = $("queue-panel");
+  if (q) {
+    if (on) $("iqueue-slot").appendChild(q);
+    else if (q.parentElement && q.parentElement.id === "iqueue-slot") $("plan-panel").parentElement.appendChild(q);
+  }
+  if (on && S.ready) checkImageSetup();
+  render();
+}
+
+/** Nothing to render with: the node (ComfyUI 0.44.0) and the files, each with its download link. */
+function imageFileRows(onlyMissing = false) {
+  const o = S.opts || {}, files = o.image_files || {}, s = P().settings, im = s.image;
+  const have = (kind, v) => !!v && matchModel(v, o[kind]);
+  const rows = [
+    { key: "model", label: "Image model", kind: "models", value: im.model },
+    { key: "vae", label: "Image VAE", kind: "vaes", value: im.vae },
+    { key: "clip", label: "Text encoder", kind: "clips", value: s.clip, note: "shared with the video renders (Settings)" },
+    { key: "expander", label: "Prompt expander", kind: "clips", value: im.expander, note: "optional · Expand prompt", optional: true },
+  ];
+  return rows.map((r) => Object.assign(r, { file: files[r.key] || null, ok: have(r.kind, r.value) }))
+    .filter((r) => !onlyMissing || !r.ok);
+}
+function fileLink(f, key) {
+  if (!f) return "";
+  const j = key && DL.st[key];
+  let here = "";
+  if (S.local && key) {
+    if (j && j.active) here = `<button class="ghost xs" data-action="iset-dl-stop" data-key="${esc(key)}">Stop</button> <span class="muted small mono">${dlProgress(j)}</span>`;
+    else if (j && j.error) here = `<button class="ghost xs" data-action="iset-dl" data-key="${esc(key)}" title="Picks up where it stopped">Resume download</button> <span class="missing small">${esc(j.error)}</span>`;
+    else here = `<button class="ghost xs" data-action="iset-dl" data-key="${esc(key)}" title="The Studio downloads it into models/${esc(f.folder)} on the ComfyUI machine (it keeps going if you leave the page; a stopped one resumes)">⬇ Download here</button>`;
+  }
+  return `<span class="ifile"><a class="dl" href="${esc(f.url)}" target="_blank" rel="noopener" title="The file on Hugging Face (download it with the browser)">⬇ ${esc(f.name)}</a>
+    <span class="muted">${esc(f.size)} · goes in</span> <code>models/${esc(f.folder)}/</code> ${here}</span>`;
+}
+// 0.20.0: downloads the Studio runs on the ComfyUI machine (/longshot/download-model), polled while one runs
+const DL = { st: {}, timer: null };
+function dlProgress(j) {
+  const mb = (n) => n >= 1 << 30 ? (n / (1 << 30)).toFixed(2) + " GB" : Math.round(n / (1 << 20)) + " MB";
+  return j.total ? `${Math.floor(j.bytes / j.total * 100)}% · ${mb(j.bytes)} of ${mb(j.total)}` : mb(j.bytes || 0);
+}
+async function dlStart(key, cancel = false) {
+  try {
+    await api("/longshot/download-model", { method: "POST", body: cancel ? { key, cancel: true } : { key } });
+  } catch (e) { toast(e.message); return; }
+  if (!cancel) toast(`Downloading ${((S.opts || {}).image_files || {})[key]?.name || key}… it shows under Image settings; you can keep working.`);
+  pollDownloads(true);
+}
+async function pollDownloads(now = false) {
+  clearTimeout(DL.timer); DL.timer = null;
+  let st;
+  try { st = await api("/longshot/download-model"); } catch (e) { return; }
+  const before = DL.st; DL.st = st || {};
+  let finished = false;
+  for (const [key, j] of Object.entries(DL.st)) {
+    const was = before[key];
+    if (j.done && !(was && was.done)) {
+      finished = true;
+      toast(`Downloaded ${j.name} into ${j.folder}.`);
+    }
+  }
+  if (finished) {
+    try { S.opts = await api("/longshot/options"); } catch (e) { /* keep */ }
+    // a file that just arrived is chosen when nothing is chosen yet
+    const p = P(), f = (S.opts || {}).image_files || {};
+    if (p) {
+      const im = p.settings.image;
+      for (const key of ["model", "vae", "expander"]) if (DL.st[key] && DL.st[key].done && !im[key] && f[key]) im[key] = f[key].name;
+      if (DL.st.clip && DL.st.clip.done && !p.settings.clip && f.clip) p.settings.clip = f.clip.name;
+      commit();
+    }
+  }
+  if (imagesOn() && P()) renderIset();
+  if (Object.values(DL.st).some((j) => j.active)) DL.timer = setTimeout(pollDownloads, now ? 1500 : 2500);
+}
+function checkImageSetup() {
+  const b = $("images-banner");
+  if (!b) return;
+  if (!S.opts) { b.hidden = true; return; }
+  const tab = $("mode-images");
+  if (tab) {
+    tab.classList.toggle("needs", !engineOk());
+    tab.title = engineOk() ? (stillEngine() ? "Still pictures from the H3 video model, from the same project's references"
+      : "Still pictures with MiniMax-H3-Image, from the same project's references")
+      : "Images can't render on this ComfyUI: update it (the Images side says how)";
+  }
+  if (stillEngine()) {
+    if (stillNodesOk()) { b.hidden = true; return; }
+    b.hidden = false;
+    b.innerHTML = `<b>Update ComfyUI.</b> This ComfyUI has no MiniMax H3 Reference to Video node (or Sampler Custom Advanced / Image From Batch), ` +
+      `which stills from the video model need. Update it (ComfyUI Desktop updates with the app; a manual install: <code>git pull</code> in the ComfyUI folder, ` +
+      `then <code>pip install -r requirements.txt</code>), restart it, and reload this page.`;
+    return;
+  }
+  if (!imgNodeOk()) {
+    const c = S.opts.comfy || {};
+    b.hidden = false;
+    b.innerHTML = `<b>Update ComfyUI.</b> This ComfyUI${c.version ? " (" + esc(c.version) + ")" : ""} has no MiniMax H3 Image Conditioning node: ` +
+      `Images need ComfyUI <b>0.44.0</b> or later. Update it (ComfyUI Desktop updates with the app; a manual install: <code>git pull</code> in the ComfyUI folder, ` +
+      `then <code>pip install -r requirements.txt</code>), restart it, and reload this page.`;
+    return;
+  }
+  b.hidden = true;
+}
+
+// --- rendering -----------------------------------------------------------------
+function renderImages() {
+  if (!P()) return;
+  checkImageSetup();                 // the Images tab's ⚠ shows on the Video side too
+  if (!imagesOn()) return;
+  renderIrefs();
+  renderIstyle();
+  renderIpics();
+  renderIpreview();
+  renderIset();
+}
+
+function irefCard(r, n) {
+  const f = irefFile(r);
+  const off = r.bypassed;
+  const tag = off ? "bypassed" : `<Picture ${n}>`;
+  const thumb = f ? `<img alt="" src="${esc(viewURL({ filename: f.image, subfolder: f.subfolder, type: f.type }) + "&preview=webp;70")}" loading="lazy" draggable="false" data-action="iref-view" data-id="${esc(r.id)}" title="Click: look at it large">`
+    : `<div class="nopic">${r.cast ? "That Cast card has no picture (or was removed)" : "File missing"}</div>`;
+  const from = r.cast ? `from Cast & Scenes${f && f.bypassedCard ? " · that card is bypassed there" : ""}` : r.type === "output" ? "from Outputs" : "uploaded";
+  return `<div class="iref${off ? " off" : ""}" data-iref-card="${esc(r.id)}" draggable="true" title="Drag to change the order">
+    ${thumb}
+    <div class="iref-row">
+      <button class="label" data-action="iref-label" data-id="${esc(r.id)}" title="Rename (the name is only for you; the prompt uses ${esc(tag === "bypassed" ? "its <Picture N>" : tag)})">${esc(f && f.label ? f.label : r.label || (f ? f.image : "reference"))}</button>
+      <button class="icon${off ? " on" : ""}" data-action="iref-bypass" data-id="${esc(r.id)}" aria-pressed="${off}" title="${off ? "Turn back on" : "Bypass: not sent, the numbers close up"}">${POWER}</button>
+      <button class="icon x" data-action="iref-del" data-id="${esc(r.id)}" title="Remove from the References" aria-label="Remove">${CROSS}</button></div>
+    <div class="iref-sub"><span class="tag">${esc(tag)}</span><span class="from">${esc(from)}</span></div></div>`;
+}
+function renderIrefs() {
+  foldPanel("irefs-panel", "irefsOpen", "irefs-fold", "irefs-body");
+  const list = irefs();
+  let n = 0;
+  const cards = list.map((r) => irefCard(r, r.bypassed ? 0 : ++n)).join("");
+  const act = irefsActive().length;
+  $("irefs-summary").textContent = act ? `${act} in use · <Picture 1${act > 1 ? "…" + act : ""}>` : "none · text-to-image from the prompt alone";
+  $("irefs").innerHTML = cards + `<button class="iref-drop" data-iref-drop data-action="iref-upload" title="Add picture files">
+      <span>＋ drop a picture here</span><span class="muted">from the Outputs drawer, a Picture's results, or your desktop</span></button>`;
+  $("iref-from-cast").disabled = !(P().cast || []).some((c) => c.image && !irefs().some((r) => r.cast === c.id));
+}
+
+/** 0.21.6: the Style panel: the stills' own style line and summary. */
+function renderIstyle() {
+  const open = foldPanel("istyle-panel", "istyleOpen", "istyle-fold", "istyle");
+  const im = imgSet(), still = stillEngine();
+  const vline = (P().style || {}).style_line || "";
+  $("istyle-summary").textContent = !still ? "not used by H3-Image"
+    : [im.style_line ? "own style line" : vline ? "the Video side's style line" : "no style line",
+      im.summary ? "own summary" : "automatic summary"].join(" · ");
+  if (!open) return;
+  const box = $("istyle");
+  const active = document.activeElement;
+  if (active && box.contains(active)) return;          // not while typing in it
+  box.innerHTML = `${still ? "" : '<div class="muted small" style="margin-bottom:8px">These go into stills from the video model. The H3-Image engine takes only each Picture\'s prompt.</div>'}
+    <label class="lbl iset-tail"><span>Summary <span class="muted small">· after [reference generation]; empty: "A single static frame: " + the Picture's prompt</span></span>
+      <textarea data-iset="summary" rows="2" placeholder="A single static frame: …">${esc(im.summary || "")}</textarea></label>
+    <label class="lbl iset-tail" style="margin-top:12px"><span>Style line <span class="muted small">· the look of every still, before [Shot 1]; empty uses the Video side's style line</span></span>
+      <textarea data-iset="style_line" rows="2" placeholder="${esc(vline || "e.g. Photorealistic, soft window light, 35mm lens, shallow depth of field.")}">${esc(im.style_line || "")}</textarea></label>`;
+}
+
+function resultThumb(r) { return "/longshot/thumb?filename=" + encodeURIComponent(r.filename) + "&subfolder=" + encodeURIComponent(r.subfolder || "") + "&m=" + (r.made || 0); }
+function ipicCard(pic) {
+  const n = ipicNum(pic), im = imgSet(), sz = ipicSize(pic);
+  const sel = IMG.pic === pic.id;
+  const busyJobs = Q.jobs.filter((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "image" && j.spec.target === pic.id);
+  const running = busyJobs.find((j) => j.state === "running");
+  const b = S.busy && S.busy.kind === "image" && S.busy.extra && S.busy.extra.pic === pic.id ? S.busy : null;
+  const edit = pic.edit;
+  const editRow = edit
+    ? `<span class="chip edit"><img alt="" src="${esc(viewURL({ filename: edit.image, subfolder: edit.subfolder, type: edit.type }) + "&preview=webp;60")}"> ${esc(edit.label || edit.image)}
+        <span class="tag">this is &lt;Picture 1&gt;${irefsActive().length ? ` · References become &lt;Picture 2…${irefsActive().length + 1}&gt;` : ""}</span>
+        <button class="icon x" data-action="ipic-edit-clear" data-id="${esc(pic.id)}" title="Don't edit a picture: text-to-image with the References" aria-label="Clear">${CROSS}</button></span>`
+    : `<span class="chip add" data-action="ipic-edit-pick" data-id="${esc(pic.id)}" title="Choose a picture to edit (or drop one here: from the Outputs drawer, a result, or your desktop)">＋ none · text-to-image with the References</span>`;
+  const sizeTxt = sz.size ? `${sz.size[0]} × ${sz.size[1]}` : "from the edited picture";
+  const results = pic.results.map((r, i) => `<span class="ires"><button class="${pic.current === i ? "sel" : ""}" data-action="ipic-pick" data-id="${esc(pic.id)}" data-i="${i}" draggable="true" data-odrag='${esc(JSON.stringify({ filename: r.filename, subfolder: r.subfolder, kind: "image", type: "output" }))}' title="${esc(r.filename)}${r.seed !== null && r.seed !== undefined ? " · seed " + r.seed : ""}${r.up ? ` · upscaled ×${r.up}` : ""} · drag it into the References or Cast &amp; Scenes"><img alt="" src="${esc(resultThumb(r))}" loading="lazy" draggable="false"></button>${r.up ? `<span class="ires-up">×${esc(r.up)}</span>` : ""}<button class="ires-x" data-action="ires-del-at" data-id="${esc(pic.id)}" data-i="${i}" title="Delete this result (the file too)" aria-label="Delete result ${i + 1}">${CROSS}</button></span>`).join("");
+  const pending = busyJobs.map((j) => `<div class="busy">${j === running && b ? `<span>step ${b.stepV || 0} / ${b.stepMax || picSteps(pic)}</span><span class="bar"><span style="width:${Math.round((b.step || 0) * 100)}%"></span></span>` : j.state === "running" ? "starting…" : "in the queue"}</div>`).join("");
+  const foldBtn = `<button class="icon ipic-fold" data-action="ipic-fold" data-id="${esc(pic.id)}" aria-expanded="${!pic.folded}" title="${pic.folded ? "Unfold" : "Fold"} this Picture" aria-label="${pic.folded ? "Unfold" : "Fold"} Picture ${n}"><span class="fold-ch">▾</span></button>`;
+  const head = (inner) => `<div class="ipic${sel ? " sel" : ""}${pic.folded ? " folded" : ""}" data-ipic-card="${esc(pic.id)}">
+    <div class="ipic-head">${foldBtn}
+      <span class="num">Picture ${n}</span>` + inner;
+  if (pic.folded) {
+    const last = pic.results[0];
+    return head(`
+      <span class="ipic-line muted small" title="${esc(pic.text)}">${esc(pic.title ? pic.title + " · " : "")}${esc(pic.text.trim() ? pic.text.trim().replace(/\s+/g, " ").slice(0, 140) : "no prompt yet")}</span>
+      <span class="push"></span>
+      ${pending ? '<span class="warn-tag">in the queue</span>' : ""}
+      ${last ? `<img class="ipic-mini" alt="" src="${esc(resultThumb(last))}" loading="lazy" draggable="false">` : ""}
+      <span class="muted small">${pic.results.length} result${pic.results.length === 1 ? "" : "s"}</span>
+      <button class="primary sm-primary" style="padding:6px 14px;font-size:13px" data-action="ipic-render" data-id="${esc(pic.id)}"${!pic.text.trim() || !engineOk() ? " disabled" : ""}>▶ Render</button>
+    </div></div>`);
+  }
+  return head(`
+      <input class="title" data-ipic="title" data-id="${esc(pic.id)}" value="${esc(pic.title)}" placeholder="a name for the files (optional)" aria-label="Picture ${n} name">
+      <span class="push"></span>
+      <label class="muted small" title="How many to render, each with its own seed">×<input class="count" type="number" min="1" max="16" step="1" data-ipic="count" data-id="${esc(pic.id)}" value="${pic.count}" aria-label="How many"></label>
+      <button class="primary sm-primary" style="padding:6px 14px;font-size:13px" data-action="ipic-render" data-id="${esc(pic.id)}"${!pic.text.trim() || !engineOk() ? " disabled" : ""} title="Render ${pic.count > 1 ? pic.count + " of " : ""}this Picture (into the Queue)">▶ Render</button>
+      <button class="icon" data-action="ipic-dup" data-id="${esc(pic.id)}" title="Duplicate this Picture">⧉</button>
+      <button class="icon x" data-action="ipic-del" data-id="${esc(pic.id)}" title="Remove this Picture (its files stay in the images folder)" aria-label="Remove Picture ${n}">${CROSS}</button>
+    </div>
+    <div class="ipic-edit${edit ? " on" : ""}" data-iedit="${esc(pic.id)}"><span class="lab">To edit</span>${editRow}</div>
+    <textarea data-ipic="text" data-id="${esc(pic.id)}" placeholder="What the picture shows. Name the references as <Picture 1>, <Picture 2>…${edit ? " (<Picture 1> is the picture being edited)" : ""}" aria-label="Picture ${n} prompt">${esc(pic.text)}</textarea>
+    <div class="ipic-opts">
+      <label>Size <select data-ipic="megapixels" data-id="${esc(pic.id)}" aria-label="Megapixels">${mpList().map((m) => `<option value="${m}"${picMp(pic) === m ? " selected" : ""}>${m} MP</option>`).join("")}</select></label>
+      ${edit && !stillEngine() ? "" : `<label><select data-ipic="aspect" data-id="${esc(pic.id)}" aria-label="Aspect">${((S.opts || {}).aspects || ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9"]).map((a) => `<option value="${a}"${picAspect(pic) === a ? " selected" : ""}>${a}</option>`).join("")}</select></label>`}
+      <span class="size" title="Multiples of 32, as ComfyUI's Resolution Selector">${esc(sizeTxt)}</span>
+      <label title="-1: a new seed every render">Seed <input class="seed" type="number" min="-1" step="1" data-ipic="seed" data-id="${esc(pic.id)}" value="${pic.seed}"> ${pic.seed < 0 ? '<span class="muted">auto</span>' : ""}</label>
+      <label>Steps <input type="number" min="1" max="100" step="1" data-ipic="steps" data-id="${esc(pic.id)}" value="${picSteps(pic)}"${stillEngine() && !pic.steps ? ' title="From Settings (Video side) until you change it here"' : ""}></label>
+      ${stillEngine() ? "" : `<label title="Qwen3.5 rewrites the prompt into the long caption the model is tuned for, before the render (needs the prompt expander file in Image settings, and ComfyUI 0.44.0)"><input type="checkbox" data-ipic="expand" data-id="${esc(pic.id)}"${pic.expand ? " checked" : ""}${!textGenOk() ? " disabled" : ""}> Expand prompt${pic.expand && !matchModel(im.expander, (S.opts || {}).clips) ? ' <span class="missing small">· expander file missing</span>' : ""}</label>`}
+    </div>
+    ${results || pending ? `<div class="ipic-results">${pending}${results}</div>` : ""}
+  </div>`);
+}
+function renderIpics() {
+  foldPanel("ipics-panel", "ipicsOpen", "ipics-fold", "ipics-body");
+  const list = ipics();
+  const n = list.reduce((a, x) => a + x.results.length, 0);
+  const allFolded = list.length && list.every((x) => x.folded);
+  $("ipic-fold-all").textContent = allFolded ? "▾ Unfold all" : "▸ Fold all";
+  $("ipic-fold-all").hidden = !S.ipicsOpen || list.length < 2;
+  $("ipics-summary").textContent = list.length ? `${list.length} · ${n} result${n === 1 ? "" : "s"}` : "";
+  $("ipics").innerHTML = list.map(ipicCard).join("");
+  $("ipic-render-all").disabled = !engineOk() || !list.some((x) => x.text.trim());
+  for (const ta of $("ipics").querySelectorAll("textarea")) fitText(ta);
+}
+
+function ipicCurrent() {
+  const pic = ipicById(IMG.pic) || ipics().find((x) => x.results.length) || ipics()[0] || null;
+  if (!pic) return { pic: null, r: null };
+  const r = pic.results[Math.min(pic.current, pic.results.length - 1)] || null;
+  return { pic, r };
+}
+function renderIpreview() {
+  const { pic, r } = ipicCurrent();
+  const el = $("ipreview");
+  if (!pic || !r) {
+    el.innerHTML = `<div class="panel-head"><div class="head-left"><h2>Preview</h2></div></div>
+      <div class="ipreview-empty">${pic ? "Nothing rendered yet for this Picture.<br>Write a prompt and press Render." : "Add a Picture to start."}</div>`;
+    return;
+  }
+  const i = pic.current, total = pic.results.length;
+  el.innerHTML = `<div class="panel-head"><div class="head-left"><h2>Preview</h2><span class="muted small">Picture ${ipicNum(pic)}${pic.title ? " · " + esc(pic.title) : ""} · result ${i + 1} of ${total}</span></div>
+      <div class="head-right"><button class="ghost sm" data-action="ipic-step" data-dir="-1"${i <= 0 ? " disabled" : ""} title="Newer result">‹</button><button class="ghost sm" data-action="ipic-step" data-dir="1"${i >= total - 1 ? " disabled" : ""} title="Older result">›</button>
+        <button class="ghost sm" data-action="ires-view" aria-pressed="${IMG.theater}" title="${IMG.theater ? "Back to the normal view (T or Esc)" : "Large view above the panels (T) · ← → other results · F full screen"}">${IMG.theater ? "⤡ Normal view" : "⤢ Large view"}</button>
+        <button class="ghost sm" data-action="ires-fs" title="Full screen (F)">⛶</button>
+        <a class="ghost sm" href="${esc(viewURL(r))}" target="_blank" rel="noopener" title="Open the file at full size in a new tab">↗</a></div></div>
+    <img class="ipreview-img" alt="${esc(r.filename)}" src="${esc(viewURL(r) + "&preview=webp;85")}" data-action="ires-view" style="cursor:${IMG.theater ? "zoom-out" : "zoom-in"}" title="Click: ${IMG.theater ? "normal" : "large"} view">
+    <div class="ipreview-acts">
+      <button class="ghost sm" data-action="ires-ref-here" title="Add this result to the References above (as a picture file)">＋ Reference here</button>
+      <button class="ghost sm" data-action="ires-ref-cast" title="Copy it into the project's input folder as a picture card in Cast &amp; Scenes, for video renders">＋ To Cast &amp; Scenes</button>
+      <button class="ghost sm" data-action="ires-edit" title="A new Picture with this result as the picture to edit">✎ Edit this</button>
+      <button class="ghost sm" data-action="ires-reroll" title="Render this Picture again with a new seed">↻ Re-roll</button>
+      <button class="ghost sm up-btn" data-action="ires-upscale"${upOk() ? "" : ' disabled title="Needs RTX Video Super Resolution (ComfyUI-NVIDIA-RTX-VSR-Pro)"'}${upOk() ? ` title="RTX Super Resolution on this picture only (×${Number(imgSet().scale) || 2}, ${esc(imgSet().quality || "ULTRA")}: Image settings), saved next to it and added to this Picture's results"` : ""}>⇱ Upscale this</button>
+      ${S.local ? '<button class="ghost sm" data-action="ires-folder" title="Show the file in its folder">Open folder</button>' : `<a class="ghost sm" href="${esc(viewURL(r))}" download="${esc(r.filename)}">Download</a>`}
+      <span class="push"></span>
+      <button class="icon x" data-action="ires-del" title="Delete this result (the file too)" aria-label="Delete this result">${CROSS}</button>
+    </div>
+    <div class="ipreview-kv">
+      <b>file</b><span>${esc((r.subfolder ? r.subfolder.replace(/^longshot\/[^/]+\//, "") + "/" : "") + r.filename)}</span>
+      ${r.width && r.height ? `<b>size</b><span>${r.width} × ${r.height} · ${(r.width * r.height / 1048576).toFixed(1)} MP</span>` : ""}
+      ${r.seed !== null && r.seed !== undefined ? `<b>seed</b><span>${esc(r.seed)}</span>` : ""}
+      ${r.edit ? `<b>edited</b><span>${esc(r.edit)}</span>` : ""}
+      ${r.refs && r.refs.length ? `<b>refs</b><span>${esc(r.refs.join(", "))}</span>` : ""}
+      ${r.prompt ? `<b>prompt</b><span class="small">${esc(r.prompt.length > 400 ? r.prompt.slice(0, 400) + "…" : r.prompt)}${r.expanded ? " <i class=\"muted\">(expanded)</i>" : ""}</span>` : ""}
+    </div>`;
+}
+
+function renderIset() {
+  const im = imgSet(), o = S.opts || {}, open = !!S.isetOpen, still = stillEngine(), vs = P().settings;
+  const miss = still ? missingModels(P()) : imageFileRows(true).filter((r) => !r.optional || im.expander || ipics().some((x) => x.expand));
+  $("iset-summary").textContent = open ? "" : miss.length ? `${miss.length} file${miss.length > 1 ? "s" : ""} missing`
+    : still ? `video model · ${im.frames || 22} frames · ${im.vmp} MP ${im.vaspect}${im.upscale ? ` · RTX ×${im.scale}` : ""}`
+      : `${shortModel(im.model) || "no model"} · ${im.megapixels} MP ${im.aspect} · ${im.steps} steps`;
+  store("h3studio.isetOpen", open ? "1" : "0");
+  $("iset-chev").textContent = open ? "Hide ▴" : "Show ▾";
+  $("iset-toggle").setAttribute("aria-expanded", String(open));
+  const quick = $("iset-quick");
+  if (quick) {
+    quick.hidden = open;
+    quick.innerHTML = open ? "" : `<div class="seg seg-sm iseg" role="group" aria-label="Engine">
+      <button data-action="iset-engine" data-v="video" aria-pressed="${still}" title="The H3 video model from Settings: a tiny clip, its middle frame saved">Video model</button>
+      <button data-action="iset-engine" data-v="h3image" aria-pressed="${!still}" title="MiniMax-H3-Image">H3-Image</button></div>`;
+  }
+  const box = $("iset");
+  box.hidden = !open;
+  if (!open) return;
+  const engineSeg = `<div class="lbl" style="margin-bottom:12px">Engine
+      <div class="seg seg-sm iseg" role="group" aria-label="Engine">
+        <button data-action="iset-engine" data-v="video" aria-pressed="${still}" title="The H3 video model from Settings renders a tiny clip; its middle frame is the picture">Video model (still frame)</button>
+        <button data-action="iset-engine" data-v="h3image" aria-pressed="${!still}" title="MiniMax-H3-Image (needs ComfyUI 0.44.0 and its own files)">H3-Image</button>
+      </div></div>`;
+  if (still) {
+    const ref2 = isRef2vaName(vs.model);
+    const sizes = (o.aspects || ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "21:9"]);
+    const vsr = !o.nodes || o.nodes.RTXVideoSuperResolution !== false;
+    box.innerHTML = engineSeg + `
+      <div class="muted small">Renders with the <b>video side's Settings</b>: ${esc(shortModel(vs.model) || "no model chosen")},
+        its text encoder, VAEs, shift, Turbo, LoRAs, sampler and steps. Each Picture is a clip of a few frames from the References with a "nothing moves" line after the prompt; the middle frame is saved.</div>
+      ${miss.length ? `<div class="missing small" style="margin-top:6px">Missing on this machine: ${esc(miss.join(", "))} (choose them in Settings on the Video side).</div>` : ""}
+      <div class="grid3">
+        <label class="lbl" title="How long the clip is. 5 is H3's shortest and fastest; 22 can be cleaner if 5-frame stills come out soft">Frames <select data-iset="frames">${[5, 22, 39].map((f) => `<option value="${f}"${Number(im.frames) === f ? " selected" : ""}>${f} (${(f / 24).toFixed(2)} s)</option>`).join("")}</select></label>
+        <label class="lbl">Default size <select data-iset="vmp">${mpList().map((m) => `<option value="${m}"${Number(im.vmp) === m ? " selected" : ""}>${m} MP</option>`).join("")}</select></label>
+        <label class="lbl">Default aspect <select data-iset="vaspect">${sizes.map((a) => `<option value="${a}"${im.vaspect === a ? " selected" : ""}>${a}</option>`).join("")}</select></label>
+        <label class="lbl" title="${vsr ? "RTX Video Super Resolution on the saved picture" : "Needs ComfyUI-NVIDIA-RTX-VSR-Pro (RTX Video Super Resolution)"}"><span class="lbl-row" title="On: every new picture is upscaled. Off: only the ones you upscale with Upscale this"><input type="checkbox" data-iset="upscale"${im.upscale ? " checked" : ""}${vsr ? "" : " disabled"}> Upscale every picture</span>
+          <select data-iset="scale" title="Also the factor of Upscale this (in the Preview)">${[2, 3, 4].map((x) => `<option value="${x}"${Number(im.scale) === x ? " selected" : ""}>×${x}</option>`).join("")}</select></label>
+        <label class="lbl">RTX quality <select data-iset="quality">${["LOW", "MEDIUM", "HIGH", "ULTRA"].map((q) => `<option${im.quality === q ? " selected" : ""}>${q}</option>`).join("")}</select></label>
+        <label class="lbl" title="How many results each Picture keeps in its list; older ones drop off (their files stay in the images folder)">Results kept <input type="number" min="1" max="200" step="1" data-iset="keep" value="${im.keep}"></label>
+      </div>
+      <label class="lbl iset-tail" style="margin-top:12px"><span>Still-frame line <span class="muted small">· added after every prompt; empty uses the default</span></span>
+        <textarea data-iset="tail" rows="3" placeholder="${esc(o.still_tail || "A single still frame: the camera is static and nothing moves; everything stays exactly as it is for the whole shot. No dialogue.")}">${esc(im.tail || "")}</textarea></label>`;
+    return;
+  }
+  const rows = imageFileRows();
+  const pick = (r) => {
+    if (r.key === "clip") return `<div class="lbl">${r.label} <span class="muted small">· ${r.note}</span>${r.ok ? "" : ' <span class="missing small">· not found on this machine</span>'}
+        <div class="pick"><select data-iset="clip" aria-label="Text encoder">${fileOptions(o.clips, P().settings.clip, "Choose the text encoder…")}</select>${browseBtn("text_encoders", "clip")}</div>${r.ok ? "" : fileLink(r.file, r.key)}</div>`;
+    const target = "image_" + r.key;
+    const kind = r.key === "model" ? "diffusion_models" : r.key === "vae" ? "vae" : "text_encoders";
+    const list = r.key === "model" ? o.models : r.key === "vae" ? o.vaes : o.clips;
+    return `<div class="lbl">${r.label}${r.note ? ` <span class="muted small">· ${r.note}</span>` : ""}${r.ok || (r.optional && !r.value) ? "" : ' <span class="missing small">· not found on this machine</span>'}
+        <div class="pick${r.ok || (r.optional && !r.value) ? "" : " missing-file"}"><select data-iset="${r.key}" aria-label="${r.label}">${fileOptions(list, r.value, r.optional ? "None (Expand prompt off)" : `Choose the ${r.label.toLowerCase()}…`)}</select>${browseBtn(kind, target)}</div>
+        ${r.ok || (r.optional && !r.value && r.file && (list || []).some((n) => String(n).replace(/\\/g, "/").endsWith(r.file.name))) ? "" : fileLink(r.file, r.key)}</div>`;
+  };
+  box.innerHTML = engineSeg + `<div class="model-files">${rows.map(pick).join("")}</div>
+    <div class="grid3" style="margin-top:0">
+      <label class="lbl" title="Upscale this (in the Preview): the factor">Upscale this <select data-iset="scale">${[2, 3, 4].map((x) => `<option value="${x}"${Number(im.scale) === x ? " selected" : ""}>×${x}</option>`).join("")}</select></label>
+      <label class="lbl">RTX quality <select data-iset="quality">${["LOW", "MEDIUM", "HIGH", "ULTRA"].map((q) => `<option${im.quality === q ? " selected" : ""}>${q}</option>`).join("")}</select></label>
+    </div>
+    <div class="grid3" style="margin-top:0">
+      <label class="lbl">Default size <select data-iset="megapixels">${(o.image_megapixels || [4, 8, 16]).map((m) => `<option value="${m}"${Math.max(4, im.megapixels) === m ? " selected" : ""}>${m} MP</option>`).join("")}</select></label>
+      <label class="lbl">Default aspect <select data-iset="aspect">${(o.aspects || ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9"]).map((a) => `<option value="${a}"${im.aspect === a ? " selected" : ""}>${a}</option>`).join("")}</select></label>
+      <label class="lbl">Steps <input type="number" min="1" max="100" step="1" data-iset="steps" value="${im.steps}"></label>
+      <label class="lbl" title="1: no guidance (the model's own schedule; its template uses 1)">CFG <input type="number" min="1" max="10" step="0.1" data-iset="cfg" value="${im.cfg}"></label>
+      <label class="lbl">Sampler <select data-iset="sampler">${fileOptions(o.samplers && o.samplers.length ? o.samplers : ["euler"], im.sampler, "")}</select></label>
+      <label class="lbl">Scheduler <select data-iset="scheduler">${fileOptions(o.schedulers && o.schedulers.length ? o.schedulers : ["simple"], im.scheduler, "")}</select></label>
+      <label class="lbl" title="Older results beyond this are dropped from the list (their files stay in the images folder)">Results kept per Picture <input type="number" min="1" max="200" step="1" data-iset="keep" value="${im.keep}"></label>
+    </div>
+    <div class="muted small" style="margin-top:10px">MiniMax-H3-Image works from about 4 MP up and is best near 16 MP (4096 × 4096); under 4 MP it loses detail. ComfyUI's template: 6 steps, cfg 1, euler / simple. The text encoder is the one the video renders use. 16 MP needs more VRAM and time than a video Shot.</div>`;
+}
+
+// --- actions ---------------------------------------------------------------------
+function newPicture(after, props) {
+  const im = imgSet();
+  const pic = Object.assign({ id: uid("ip"), title: "", text: "", edit: null, megapixels: null, aspect: null, seed: -1, steps: null,
+    expand: false, count: 1, results: [], current: 0 }, props || {});
+  const list = ipics(), i = after ? list.indexOf(after) : -1;
+  list.splice(i >= 0 ? i + 1 : list.length, 0, pic);
+  IMG.pic = pic.id;
+  return pic;
+}
+function ipicRender(pic, n = null, reroll = false) {
+  if (setupGuard()) return;
+  if (!pic.text.trim()) { toast("Write the Picture's prompt first."); return; }
+  if (!engineOk()) { toast(stillEngine() ? "Update ComfyUI: it has no MiniMax H3 Reference to Video node." : "The H3-Image engine needs ComfyUI 0.44.0 or later."); return; }
+  const count = n || pic.count || 1;
+  const specs = [];
+  for (let k = 0; k < count; k++) {
+    const seed = reroll || pic.seed < 0 ? Math.floor(Math.random() * (SEED_MAX + 1)) : pic.seed + k;
+    specs.push({ type: "image", target: pic.id, what: pic.title || `Picture ${ipicNum(pic)}`, seed });
+  }
+  enqueue(specs, 1, true);
+  IMG.pic = pic.id;
+  renderIpics();
+}
+function imageOpts(sp, job) {
+  const pic = ipicById(sp.target);
+  if (!pic) { S.error = "That Picture was removed."; return null; }
+  if (!pic.text.trim()) { S.error = "The Picture has no prompt."; return null; }
+  const im = imgSet(), refs = irefsActive(), sz = ipicSize(pic);
+  const seed = Number.isFinite(Number(sp.seed)) && sp.seed >= 0 ? Number(sp.seed) : Math.floor(Math.random() * (SEED_MAX + 1));
+  const n = ipicNum(pic);
+  const still = stillEngine();
+  const item = { text: pic.text, expand: !still && !!pic.expand && !!im.expander, engine: still ? "video" : "h3image",
+    edit: pic.edit ? { image: pic.edit.image, subfolder: pic.edit.subfolder, type: pic.edit.type, width: pic.edit.width || 0, height: pic.edit.height || 0, label: pic.edit.label } : null,
+    refs: refs.map((x) => ({ image: x.image, subfolder: x.subfolder, type: x.type, label: x.label, desc: x.desc || "" })),
+    megapixels: sz.mp, aspect: sz.aspect || picAspect(pic), seed, steps: picSteps(pic),
+    name: `pic${n}${pic.title ? "_" + slugTitle(pic.title) : ""}` };
+  if (still) Object.assign(item, { frames: Number(im.frames) || 22, upscale: !!im.upscale, scale: Number(im.scale) || 2, quality: im.quality || "ULTRA" },
+    im.tail ? { tail: im.tail } : {});
+  const what = pic.edit ? `editing ${pic.edit.label || pic.edit.image}` : refs.length ? `${refs.length} reference${refs.length > 1 ? "s" : ""}` : "no references";
+  return { kind: "image", image: item, label: `Picture ${n}${pic.title ? " · " + pic.title : ""} · ${sz.mp} MP${sz.aspect ? " " + sz.aspect : ""}`,
+    note: `${what} · seed ${seed}${item.expand ? " · expanded prompt" : ""}`,
+    extra: { pic: pic.id, seed, text: pic.text, refs: refs.map((x) => x.label || x.image), edit: pic.edit ? (pic.edit.label || pic.edit.image) : "", expand: item.expand },
+    onDone: () => {} };
+}
+function imageDone(b, outputs) {
+  const o = outputs[(b.built.nodes || {}).save] || {};
+  const file = (o.images || [])[0];
+  if (!file) { S.error = "The render finished but no picture came back."; return; }
+  const pic = ipicById((b.extra || {}).pic);
+  if (!pic) { toast(`Picture saved: ${file.filename} (its Picture was removed meanwhile; it's in the images folder).`); return; }
+  const x = b.extra || {};
+  pic.results.unshift({ filename: file.filename, subfolder: file.subfolder || "", type: file.type || "output", seed: x.seed ?? null,
+    width: b.built.width || (pic.edit && pic.edit.width) || null, height: b.built.height || (pic.edit && pic.edit.height) || null,
+    made: Date.now(), prompt: x.text || "", refs: x.refs || [], edit: x.edit || "", expanded: !!x.expand });
+  pic.results = pic.results.slice(0, Math.max(1, imgSet().keep || 20));
+  pic.current = 0;
+  IMG.pic = pic.id;
+  scheduleSave();
+  toast(`Picture saved: ${file.filename}`, { label: "Show", fn: () => { setMode("images"); IMG.pic = pic.id; pic.current = 0; render(); } });
+}
+
+/** A result or an output file (any {filename, subfolder}) as a reference on the Images side. */
+function irefAddOutput(item, label) {
+  const type = item.type === "input" ? "input" : "output";
+  const r = { id: uid("ir"), label: label || item.filename.replace(/\.[a-z0-9]+$/i, ""), cast: null, image: item.filename, subfolder: item.subfolder || "",
+    type, sha256: null, bypassed: false, from: type === "input" ? "file" : "output" };
+  if (irefs().some((x) => x.type === type && x.image === r.image && x.subfolder === r.subfolder)) { toast("That picture is in the References already."); return null; }
+  irefs().push(r);
+  commit();
+  return r;
+}
+/** Picture files from the desktop (dropped or chosen) → uploaded into the project, added as references. */
+async function irefAddFiles(fileList) {
+  const files = [...fileList].filter(isImageFile);
+  if (!files.length) { toast("Only image files can be references (PNG, JPG, WebP…)."); return; }
+  if (setupGuard()) return;
+  const failed = [];
+  for (const f of files) {
+    try {
+      const info = await uploadImage(f);
+      irefs().push({ id: uid("ir"), label: f.name.replace(/\.[a-z0-9]+$/i, ""), cast: null, image: info.name, subfolder: info.subfolder,
+        type: "input", sha256: info.sha256, bypassed: false, from: "upload" });
+    } catch (e) { failed.push(`${f.name}: ${e.message}`); }
+  }
+  commit();
+  if (failed.length) toast("Couldn't upload " + failed.join("; "));
+}
+async function ipicEditFiles(id, fileList) {
+  const pic = ipicById(id);
+  const f = [...fileList].find(isImageFile);
+  if (!pic || !f) { toast("Drop an image file to edit it."); return; }
+  if (setupGuard()) return;
+  try {
+    const info = await uploadImage(f);
+    const dims = await imageDims(viewURL({ filename: info.name, subfolder: info.subfolder, type: "input" }));
+    pic.edit = { image: info.name, subfolder: info.subfolder, type: "input", label: f.name.replace(/\.[a-z0-9]+$/i, ""), width: dims[0], height: dims[1] };
+    commit();
+  } catch (e) { toast("Couldn't upload it: " + e.message); }
+}
+function imageDims(url) {
+  return new Promise((resolve) => {
+    const im = new Image();
+    im.onload = () => resolve([im.naturalWidth, im.naturalHeight]);
+    im.onerror = () => resolve([null, null]);
+    im.src = url + (url.includes("preview=") ? "" : "");
+  });
+}
+function ipicSetEdit(pic, item, label) {
+  pic.edit = { image: item.filename, subfolder: item.subfolder || "", type: item.type || "output", label: label || item.filename.replace(/\.[a-z0-9]+$/i, ""),
+    width: item.width || null, height: item.height || null };
+  commit();
+  if (!pic.edit.width) imageDims(viewURL({ filename: pic.edit.image, subfolder: pic.edit.subfolder, type: pic.edit.type }) + "&preview=webp;10").then(([w, h]) => {
+    if (pic.edit && pic.edit.image === item.filename && w) { pic.edit.width = w; pic.edit.height = h; commit(); }
+  });
+}
+/** An output file (a result, or one from the drawer) copied into the project's inputs as a Cast & Scenes picture card. */
+async function adoptIntoCast(item, targetId) {
+  const p = P();
+  if (setupGuard()) return;
+  const target = targetId ? p.cast.find((x) => x.id === targetId) : null;
+  const c = target || { id: uid("c"), label: item.filename.replace(/\.[a-z0-9]+$/i, "").replace(/_\d{5}_?$/, ""), desc: "", role: "appearance", image: "", bypassed: false };
+  if (!target) p.cast.push(c);
+  S.uploading[c.id] = true;
+  render();
+  let info;
+  if (item.type === "input") info = { name: item.filename, subfolder: item.subfolder || "", sha256: null, size_bytes: null, reused: true };   // 0.21.3: an input already
+  else try { info = await api("/longshot/adopt-output", { method: "POST", body: { project: p.slug, filename: item.filename, subfolder: item.subfolder || "", kind: "images" } }); }
+  catch (e) {
+    delete S.uploading[c.id];
+    if (!target) p.cast.splice(p.cast.indexOf(c), 1);
+    render();
+    toast("Couldn't copy it into the project: " + e.message);
+    return;
+  }
+  delete S.uploading[c.id];
+  const same = applyUpload(c, info);
+  await loadInputs();
+  if (!(target && same) && !c.bypassed) applyRefChange((await askRefChange()) || "keep", "Cast & Scenes");
+  commit();
+  toast(target ? `${c.label || "The card"} now shows ${item.filename}.` : `Added to Cast & Scenes as "${c.label}" (${info.reused ? "already in the project's inputs" : "copied into the project's inputs"}).`,
+    imagesOn() ? { label: "Show", fn: () => setMode("video") } : undefined);
+}
+
+async function imagesAction(a, el, e) {
+  const p = P();
+  const id = el.dataset.id;
+  const pic = id ? ipicById(id) : null;
+  const cur = ipicCurrent();
+  switch (a) {
+    case "mode": setMode(el.dataset.v); return;
+    case "outs-toggle": toggleOutputs(); return;
+    case "outs-refresh": loadOutputs(true); return;
+    case "iref-view": openRefView(el.dataset.id); return;          // 0.21.10
+    case "ipic-fold": if (pic) { pic.folded = !pic.folded; commit(); } return;
+    case "ipic-fold-all": { const all = ipics().length && ipics().every((x) => x.folded); ipics().forEach((x) => { x.folded = !all; }); commit(); return; }
+    case "iset-engine": imgSet().engine = el.dataset.v === "h3image" ? "h3image" : "video"; commit(); return;
+    case "iset-dl": dlStart(el.dataset.key); return;
+    case "iset-dl-stop": dlStart(el.dataset.key, true); return;
+    case "ipic-add": if (setupGuard()) return; newPicture(null); commit(); setTimeout(() => { const ta = document.querySelector(`[data-ipic="text"][data-id="${IMG.pic}"]`); if (ta) ta.focus(); }, 0); return;
+    case "ipic-render": if (pic) ipicRender(pic); return;
+    case "ipic-render-all": {
+      if (setupGuard()) return;
+      const specs = [];
+      for (const x of ipics()) if (x.text.trim()) for (let k = 0; k < (x.count || 1); k++)
+        specs.push({ type: "image", target: x.id, what: x.title || `Picture ${ipicNum(x)}`, seed: x.seed < 0 ? Math.floor(Math.random() * (SEED_MAX + 1)) : x.seed + k });
+      if (!specs.length) { toast("No Picture has a prompt yet."); return; }
+      enqueue(specs, 1, true);
+      renderIpics();
+      return;
+    }
+    case "ipic-dup": {
+      if (!pic || setupGuard()) return;
+      newPicture(pic, { title: pic.title ? pic.title + " copy" : "", text: pic.text, edit: pic.edit ? Object.assign({}, pic.edit) : null,
+        megapixels: pic.megapixels, aspect: pic.aspect, seed: pic.seed, steps: pic.steps, expand: pic.expand, count: pic.count });
+      commit(); return;
+    }
+    case "ipic-del": {
+      if (!pic || setupGuard()) return;
+      if (pic.results.length && !await askOK(`Remove Picture ${ipicNum(pic)}${pic.title ? ` (${pic.title})` : ""}? Its ${pic.results.length} result file${pic.results.length > 1 ? "s stay" : " stays"} in the images folder.`)) return;
+      ipics().splice(ipics().indexOf(pic), 1);
+      if (IMG.pic === pic.id) IMG.pic = null;
+      commit(); return;
+    }
+    case "ipic-pick": if (pic) { pic.current = Number(el.dataset.i) || 0; IMG.pic = pic.id; commit(); } return;
+    case "ipic-step": if (cur.pic) { cur.pic.current = Math.max(0, Math.min(cur.pic.results.length - 1, cur.pic.current + Number(el.dataset.dir))); commit(); } return;
+    case "ipic-edit-clear": if (pic) { pic.edit = null; commit(); } return;
+    case "ipic-edit-pick": if (pic) pickEditPicture(pic); return;
+    case "iref-upload": {
+      const inp = document.createElement("input");
+      inp.type = "file"; inp.accept = "image/*"; inp.multiple = true;
+      inp.addEventListener("change", () => { if (inp.files.length) irefAddFiles(inp.files); });
+      inp.click(); return;
+    }
+    case "iref-from-cast": pickCastForRefs(); return;
+    case "iref-cast-pick": {
+      const c = p.cast.find((x) => x.id === id);
+      $("modal").hidden = true;
+      if (!c || irefs().some((r) => r.cast === c.id)) return;
+      irefs().push({ id: uid("ir"), label: c.label || "", cast: c.id, image: "", subfolder: "", type: "input", sha256: null, bypassed: false, from: "cast" });
+      commit(); return;
+    }
+    case "iref-bypass": { const r = irefs().find((x) => x.id === id); if (r) { r.bypassed = !r.bypassed; commit(); } return; }
+    case "iref-del": { const i = irefs().findIndex((x) => x.id === id); if (i >= 0) { irefs().splice(i, 1); commit(); } return; }
+    case "iref-label": {
+      const r = irefs().find((x) => x.id === id);
+      if (!r) return;
+      const f = irefFile(r);
+      if (r.cast) { toast("It takes its name from the Cast & Scenes card: rename it there."); return; }
+      const v = await askText("Name for this reference (only for you; the prompt uses its <Picture N>):", r.label || (f ? f.image : ""));
+      if (v !== null) { r.label = v.trim(); commit(); }
+      return;
+    }
+    case "ires-ref-here": if (cur.r) irefAddOutput(cur.r, cur.pic.title ? `${cur.pic.title} ${cur.pic.current + 1}` : ""); return;
+    case "ires-ref-cast": if (cur.r) adoptIntoCast(cur.r); return;
+    case "ires-edit": {
+      if (!cur.r || setupGuard()) return;
+      const np = newPicture(cur.pic, { title: cur.pic.title ? `${cur.pic.title} edit` : `edit of Picture ${ipicNum(cur.pic)}`, megapixels: cur.pic.megapixels, steps: cur.pic.steps, expand: cur.pic.expand });
+      ipicSetEdit(np, Object.assign({ type: "output" }, cur.r), cur.r.filename.replace(/\.[a-z0-9]+$/i, ""));
+      setTimeout(() => { const ta = document.querySelector(`[data-ipic="text"][data-id="${np.id}"]`); if (ta) { ta.focus(); ta.scrollIntoView({ block: "center", behavior: "smooth" }); } }, 0);
+      return;
+    }
+    case "ires-reroll": if (cur.pic) ipicRender(cur.pic, 1, true); return;
+    case "ires-folder":
+      if (cur.r) api("/longshot/open-folder", { method: "POST", body: { which: "output", project: p.slug, subfolder: cur.r.subfolder, select: cur.r.filename } }).catch((err) => toast(err.message));
+      return;
+    case "ires-del": if (cur.r) delResult(cur.pic, cur.r); return;
+    case "ires-del-at": { const pk = ipicById(el.dataset.id); const rr = pk && pk.results[Number(el.dataset.i)]; if (rr) delResult(pk, rr); return; }
+    case "ires-view": setItheater(!IMG.theater); return;
+    case "ires-fs": ipreviewFullscreen(); return;
+    case "ires-upscale": if (cur.r) upscaleResult(cur.pic, cur.r); return;
+    case "outs-del": outsDelete(el); return;
+    default: return;
+  }
+}
+function pickCastForRefs() {
+  const cards = (P().cast || []).filter((c) => c.image && !irefs().some((r) => r.cast === c.id));
+  if (!cards.length) { toast("Every Cast & Scenes picture card is in the References already."); return; }
+  showModal("Add a Cast & Scenes picture", "", `<div class="muted small" style="margin-bottom:10px">The reference follows the card: a new picture on the card is used here too.</div>
+    <div class="iref-grid">${cards.map((c) => `<button class="iref" data-action="iref-cast-pick" data-id="${esc(c.id)}" style="cursor:pointer;text-align:left">
+      <img alt="" src="${esc(viewURL({ filename: c.image, subfolder: c.subfolder, type: "input" }) + "&preview=webp;60")}" draggable="false">
+      <div class="iref-row"><span class="label">${esc(c.label || c.image)}</span></div>${c.bypassed ? '<div class="from">bypassed in Cast &amp; Scenes</div>' : ""}</button>`).join("")}</div>`);
+}
+function pickEditPicture(pic) {
+  const inp = document.createElement("input");
+  inp.type = "file"; inp.accept = "image/*";
+  inp.addEventListener("change", () => { if (inp.files.length) ipicEditFiles(pic.id, inp.files); });
+  inp.click();
+}
+
+function imagesChange(el) {
+  const p = P(), v = el.value;
+  const num = (lo, hi, d, int) => { const x = Number(v); const y = Number.isFinite(x) && v !== "" ? x : d; return Math.max(lo, Math.min(hi, int ? Math.round(y) : y)); };
+  if (el.dataset.outs !== undefined) { outputsChange(el); return; }
+  if (el.dataset.iset !== undefined) {
+    if (setupGuard()) return;
+    const im = p.settings.image, k = el.dataset.iset;
+    if (k === "clip") { p.settings.clip = v || ""; }
+    else if (k === "model" || k === "vae" || k === "expander") im[k] = v || "";
+    else if (k === "megapixels") im.megapixels = num(0.25, 64, 8);
+    else if (k === "aspect") im.aspect = v || "1:1";
+    else if (k === "steps") im.steps = num(1, 100, 6, true);
+    else if (k === "cfg") im.cfg = num(1, 10, 1);
+    else if (k === "sampler") im.sampler = v || "euler";
+    else if (k === "scheduler") im.scheduler = v || "simple";
+    else if (k === "keep") im.keep = num(1, 200, 20, true);
+    else if (k === "engine") im.engine = v === "h3image" ? "h3image" : "video";
+    else if (k === "frames") im.frames = [5, 22, 39].includes(Number(v)) ? Number(v) : 22;
+    else if (k === "tail") im.tail = v.trim();
+    else if (k === "style_line") im.style_line = v.trim();
+    else if (k === "summary") im.summary = v.trim();
+    else if (k === "upscale") im.upscale = !!el.checked;
+    else if (k === "scale") im.scale = num(1, 4, 2);
+    else if (k === "quality") im.quality = v || "ULTRA";
+    else if (k === "vmp") im.vmp = num(0.1, 4, 1);
+    else if (k === "vaspect") im.vaspect = v || "16:9";
+    commit(); return;
+  }
+  if (el.dataset.ipic !== undefined) {
+    const pic = ipicById(el.dataset.id);
+    if (!pic) return;
+    const k = el.dataset.ipic;
+    if (k === "text") pic.text = v;
+    else if (k === "title") pic.title = v.trim();
+    else if (k === "megapixels") pic.megapixels = num(0.1, 64, 1);
+    else if (k === "aspect") pic.aspect = v || null;
+    else if (k === "seed") pic.seed = v === "" ? -1 : Math.max(-1, Math.round(Number(v) || 0));
+    else if (k === "steps") pic.steps = num(1, 100, 6, true);
+    else if (k === "expand") pic.expand = !!el.checked;
+    else if (k === "count") pic.count = num(1, 16, 1, true);
+    IMG.pic = pic.id;
+    commit(); return;
+  }
+}
+function imagesInput(el) {
+  const pic = ipicById(el.dataset.id);
+  if (!pic) return;
+  if (el.dataset.ipic === "text") { pic.text = el.value; fitText(el); scheduleSave(); }
+  else if (el.dataset.ipic === "title") { pic.title = el.value; scheduleSave(); }
+}
+/** Files from the desktop over the Images side: the References, or a Picture's To edit slot. */
+function imagesDropTarget(e) {
+  if (!imagesOn()) return null;
+  const edit = e.target.closest("[data-iedit]");
+  if (edit) return { zone: "iedit", el: edit, id: edit.dataset.iedit };
+  const refs = e.target.closest("#irefs-panel");
+  if (refs) return { zone: "irefs", el: refs.querySelector("[data-iref-drop]") || refs, id: null };
+  return null;
+}
+
+// --- dragging references to reorder them, and results / drawer files into references ----------
+const ODRAG_TYPE = "application/x-h3-output";
+let odragEl = null;
+document.addEventListener("dragstart", (e) => {
+  const card = e.target.closest && e.target.closest("[data-iref-card]");
+  if (card && imagesOn()) {
+    IMG.drag = card.dataset.irefCard;
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", "ref:" + IMG.drag);
+    card.classList.add("dragging");
+    return;
+  }
+  const o = e.target.closest && e.target.closest("[data-odrag]");
+  if (o) {
+    let item = null;
+    try { item = JSON.parse(o.dataset.odrag); } catch (err) { item = null; }
+    if (!item) return;
+    e.dataTransfer.effectAllowed = "copy";
+    e.dataTransfer.setData(ODRAG_TYPE, JSON.stringify(item));
+    e.dataTransfer.setData("text/plain", item.filename);
+    o.classList.add("dragging");
+  }
+});
+document.addEventListener("dragend", (e) => {
+  IMG.drag = null;
+  for (const el of document.querySelectorAll(".dragging")) el.classList.remove("dragging");
+  if (odragEl) { odragEl.classList.remove("drop-target"); odragEl = null; }
+});
+const dragHasOutput = (e) => !!e.dataTransfer && [...e.dataTransfer.types].includes(ODRAG_TYPE);
+/** Where a dragged output file or result may land: a Cast card / Cast & Scenes, the References, a To edit slot. */
+function odropTarget(e) {
+  if (!P() || !e.target.closest) return null;
+  const edit = e.target.closest("[data-iedit]");
+  if (edit && imagesOn()) return { zone: "iedit", el: edit, id: edit.dataset.iedit };
+  const refs = e.target.closest("#irefs-panel");
+  if (refs && imagesOn()) return { zone: "irefs", el: refs.querySelector("[data-iref-drop]") || refs };
+  const cast = e.target.closest("#cast-panel");
+  if (cast && !imagesOn()) {
+    const card = e.target.closest("[data-cast]");
+    return card ? { zone: "cast", el: card, id: card.dataset.cast } : { zone: "cast", el: cast.querySelector("[data-drop=add]") || cast, id: null };
+  }
+  return null;
+}
+document.addEventListener("dragover", (e) => {
+  if (IMG.drag) {
+    const over = e.target.closest && e.target.closest("[data-iref-card]");
+    if (over) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }
+    return;
+  }
+  if (!dragHasOutput(e)) return;
+  e.preventDefault();
+  const t = odropTarget(e);
+  e.dataTransfer.dropEffect = t ? "copy" : "none";
+  const el = t ? t.el : null;
+  if (el !== odragEl) {
+    if (odragEl) odragEl.classList.remove("drop-target");
+    if (el) el.classList.add("drop-target");
+    odragEl = el;
+  }
+});
+document.addEventListener("drop", (e) => {
+  if (IMG.drag) {
+    const over = e.target.closest && e.target.closest("[data-iref-card]");
+    const from = irefs().findIndex((r) => r.id === IMG.drag);
+    IMG.drag = null;
+    if (!over || from < 0) return;
+    e.preventDefault();
+    const to = irefs().findIndex((r) => r.id === over.dataset.irefCard);
+    if (to < 0 || to === from) return;
+    const [r] = irefs().splice(from, 1);
+    irefs().splice(to, 0, r);
+    commit();
+    return;
+  }
+  if (!dragHasOutput(e)) return;
+  e.preventDefault();
+  let item = null;
+  try { item = JSON.parse(e.dataTransfer.getData(ODRAG_TYPE)); } catch (err) { item = null; }
+  const t = odropTarget(e);
+  if (odragEl) { odragEl.classList.remove("drop-target"); odragEl = null; }
+  if (!item || !t) return;
+  if (item.kind !== "image") { toast("Only pictures can be dropped here; videos go on the Cast & Scenes panel as a video card from the input folder."); return; }
+  if (t.zone === "irefs") irefAddOutput(item);
+  else if (t.zone === "iedit") { const pic = ipicById(t.id); if (pic) ipicSetEdit(pic, item); }
+  else if (t.zone === "cast") adoptIntoCast(item, t.id);
+});
+
+// --- the Outputs drawer -------------------------------------------------------------------------------
+const OD = { open: store("h3studio.outsOpen") === "1", scope: store("h3studio.outsScope") === "all" ? "all" : "project",
+  kinds: { image: true, video: true, audio: false }, data: null, loading: false, slug: null, folded: {},
+  inputs: store("h3studio.outsInputs") === "1", idata: null };          // 0.21.3: the input folder too
+function toggleOutputs(on) {
+  OD.open = on === undefined ? !OD.open : !!on;
+  store("h3studio.outsOpen", OD.open ? "1" : "0");
+  document.body.classList.toggle("outs-open", OD.open);
+  $("outs").hidden = !OD.open;
+  if (OD.open) loadOutputs();
+}
+async function loadOutputs(force = false) {
+  if (!P() || OD.loading) return;
+  OD.loading = true;
+  const slug = OD.scope === "all" ? null : P().slug;
+  const q = slug ? "project=" + encodeURIComponent(slug) : "";
+  try {
+    OD.data = await api("/longshot/outputs" + (q ? "?" + q : ""));
+    OD.slug = slug;
+  } catch (e) { OD.data = { folders: [], error: e.message }; }
+  if (OD.inputs) {
+    try { OD.idata = await api("/longshot/outputs?which=input" + (q ? "&" + q : "")); }
+    catch (e) { OD.idata = { folders: [], error: e.message }; }
+  } else OD.idata = null;
+  OD.loading = false;
+  renderOutputs();
+}
+function outputsChange(el) {
+  const k = el.dataset.outs;
+  if (k === "scope") { OD.scope = el.value === "all" ? "all" : "project"; store("h3studio.outsScope", OD.scope); loadOutputs(true); return; }
+  if (k === "inputs") { OD.inputs = !!el.checked; store("h3studio.outsInputs", OD.inputs ? "1" : "0"); loadOutputs(true); return; }
+  if (k in OD.kinds) { OD.kinds[k] = !!el.checked; renderOutputs(); }
+}
+function renderOutputs() {
+  const open = OD.open;
+  document.body.classList.toggle("outs-open", open);
+  $("outs").hidden = !open;
+  if (!open || !P()) return;
+  const slug = OD.scope === "all" ? null : P().slug;
+  if ((!OD.data || OD.slug !== slug) && !OD.loading) { loadOutputs(); if (!OD.data) { $("outs-body").innerHTML = '<div class="outs-empty">Loading…</div>'; return; } }
+  const sc = $("outs-scope");
+  sc.innerHTML = `<option value="project"${OD.scope === "project" ? " selected" : ""}>${esc(P().name)} · output/longshot/${esc(P().slug)}</option><option value="all"${OD.scope === "all" ? " selected" : ""}>— whole output folder —</option>`;
+  sc.dataset.outs = "scope";
+  $("outs-sw").innerHTML = ["image", "video", "audio"].map((k) => `<label><input type="checkbox" data-outs="${k}"${OD.kinds[k] ? " checked" : ""}> ${k === "image" ? "pictures" : k + "s"}</label>`).join("") +
+    `<label title="Also list ${OD.scope === "all" ? "ComfyUI's input folder" : "the project's input folder (its references, frames, uploads)"}"><input type="checkbox" data-outs="inputs"${OD.inputs ? " checked" : ""}> inputs</label>` +
+    `<span class="push">newest first</span><button class="ghost xs" data-action="outs-refresh" title="Read the folder again">↻</button>`;
+  const d = OD.data;
+  const body = $("outs-body");
+  if (!d) { body.innerHTML = '<div class="outs-empty">Loading…</div>'; return; }
+  if (d.error) { body.innerHTML = `<div class="outs-empty">${esc(d.error)}</div>`; return; }
+  // 0.21.3: the input folder too (its own sections), and ✕ on files the Studio may delete (under longshot/)
+  const sections = (data, type) => (data && data.folders || []).map((f) => Object.assign({}, f, { type,
+    files: (f.files || []).filter((x) => OD.kinds[x.kind]) })).filter((f) => f.files.length);
+  const folders = sections(d, "output").concat(OD.inputs ? sections(OD.idata, "input") : []);
+  if (!folders.length) {
+    body.innerHTML = `<div class="outs-empty">Nothing here yet.${OD.scope === "project" ? "<br>Renders go to videos/, pictures to images/." : ""}</div>`;
+  } else {
+    body.innerHTML = folders.map((f) => {
+      const root = f.type === "input" ? "input" : "output";
+      const title = (f.type === "input" ? "input · " : "") + (OD.scope === "all" ? (f.subfolder || root) : (f.name || (f.type === "input" ? "(project folder)" : "(project folder)")));
+      const path = f.subfolder;
+      const canDel = /^longshot\//.test(path || "");
+      return `<div class="outs-sec${f.type === "input" ? " inp" : ""}" title="${esc(root + "/" + (path || ""))}"><span>${esc(title)}</span><span class="muted">· ${f.files.length}</span>
+          ${S.local ? `<button class="ghost xs push" data-action="outs-open-folder" data-which="${root}" data-sub="${esc(path)}" title="Open this folder">open</button>` : ""}</div>
+        <div class="outs-grid">${f.files.map((x) => {
+          const item = { filename: x.name, subfolder: path, kind: x.kind, type: f.type };
+          const thumb = x.kind === "audio" ? '<div class="noimg">♪</div>'
+            : `<img alt="" loading="lazy" draggable="false" src="/longshot/thumb?filename=${encodeURIComponent(x.name)}&subfolder=${encodeURIComponent(path)}&type=${f.type}&m=${x.mtime}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'noimg',textContent:'?'}))">`;
+          return `<div class="o${x.kind === "video" ? " vid" : ""}" draggable="${x.kind === "image"}" data-odrag='${esc(JSON.stringify(item))}' data-ofile='${esc(JSON.stringify(item))}'
+            title="${esc(x.name)} · ${fmtBytes(x.bytes)} · ${new Date(x.mtime * 1000).toLocaleString()}${x.kind === "image" ? " · drag it onto the References or Cast & Scenes · double-click: open" : " · double-click: open"}">${thumb}<span class="nm">${esc(x.name)}</span>${canDel ? `<button class="o-x" data-action="outs-del" title="Delete this file" aria-label="Delete ${esc(x.name)}">${CROSS}</button>` : ""}</div>`;
+        }).join("")}</div>`;
+    }).join("") + (d.truncated || (OD.inputs && OD.idata && OD.idata.truncated) ? '<div class="outs-empty">… more files than shown</div>' : "");
+  }
+  $("outs-foot").innerHTML = imagesOn()
+    ? "Drag a picture onto the References, or onto a Picture's <b>To edit</b> row. Double-click opens the file."
+    : "Drag a picture onto Cast &amp; Scenes (a new card) or onto a card (replaces its picture). Double-click opens the file.";
+}
+document.addEventListener("dblclick", (e) => {
+  const o = e.target.closest && e.target.closest("[data-ofile]");
+  if (!o) return;
+  let item = null;
+  try { item = JSON.parse(o.dataset.ofile); } catch (err) { return; }
+  if (e.target.closest(".o-x")) return;
+  window.open(viewURL({ filename: item.filename, subfolder: item.subfolder, type: item.type === "input" ? "input" : "output" }), "_blank", "noopener");
+});
+document.addEventListener("click", (e) => {
+  const b = e.target.closest && e.target.closest("[data-action=outs-open-folder]");
+  if (!b || !P()) return;
+  api("/longshot/open-folder", { method: "POST", body: { which: b.dataset.which === "input" ? "input" : "output", project: P().slug, subfolder: b.dataset.sub } }).catch((err) => toast(err.message));
+});
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "O" || e.key === "o")) { e.preventDefault(); toggleOutputs(); }
+});
+// the mode and the drawer come back as they were left in this browser
+document.addEventListener("DOMContentLoaded", () => { setMode(IMG.mode); setItheater(IMG.theater); if (OD.open) toggleOutputs(true); setTimeout(pollDownloads, 2000); });
+
+/** The step bar of the Picture being rendered, without redrawing the list. */
+function ipicProgress() {
+  const b = S.busy;
+  if (!b || b.kind !== "image" || !b.extra || !P() || b.slug !== P().slug) return;
+  const card = document.querySelector(`[data-ipic-card="${b.extra.pic}"] .ipic-results .busy`);
+  if (!card) return;
+  const steps = b.stepMax || picSteps(ipicById(b.extra.pic));
+  card.innerHTML = `<span>${b.phase === "saving" ? "saving…" : b.phase === "queued" ? "starting…" : `step ${b.stepV || 0} / ${steps}`}</span><span class="bar"><span style="width:${Math.round((b.step || 0) * 100)}%"></span></span>`;
+}
+
+// ---------------------------------------------------------------------------
+// 0.21.2: Frame → reference. The frame on the player, as a PNG in the project's inputs: a new
+// Cast & Scenes card (bypassed, so no Shot's references change until it's turned on) or a
+// file in the Images References.
+// ---------------------------------------------------------------------------
+function closeFrameMenu() { const m = document.getElementById("frame-menu"); if (m) m.remove(); }
+function frameRefMenu(btn) {
+  if (document.getElementById("frame-menu")) { closeFrameMenu(); return; }
+  const m = document.createElement("div");
+  m.id = "frame-menu";
+  m.className = "frame-menu";
+  m.innerHTML = `<button data-action="frame-ref-to" data-to="cast">Cast &amp; Scenes <span class="muted small">· a new card, bypassed</span></button>
+    <button data-action="frame-ref-to" data-to="images">Images References</button>`;
+  document.body.appendChild(m);
+  const r = btn.getBoundingClientRect();
+  m.style.left = Math.max(8, Math.min(window.innerWidth - m.offsetWidth - 8, r.left + window.scrollX)) + "px";
+  m.style.top = (r.bottom + window.scrollY + 4) + "px";
+  setTimeout(() => document.addEventListener("click", function off(e) {
+    if (!e.target.closest("#frame-menu") && !e.target.closest("#frame-ref")) { closeFrameMenu(); document.removeEventListener("click", off); }
+    else if (!document.getElementById("frame-menu")) document.removeEventListener("click", off);
+  }), 0);
+}
+async function frameToRef(to) {
+  const p = P();
+  const e = TL.entries[PL.k];
+  if (!p || !e || !e.src || video.readyState < 2 || video.style.visibility === "hidden" || !video.videoWidth) {
+    toast("Nothing is showing on the player here: move to a rendered Shot first."); return;
+  }
+  if (setupGuard()) return;
+  const sh = shotById(e.id), t = tlTime();
+  const mm = Math.floor(t / 60), ss = (t - mm * 60).toFixed(2).padStart(5, "0");
+  const where = sh ? `shot${numOf(sh.id)}` : "frame";
+  const c = document.createElement("canvas");
+  c.width = video.videoWidth; c.height = video.videoHeight;
+  let blob;
+  try {
+    c.getContext("2d").drawImage(video, 0, 0, c.width, c.height);
+    blob = await new Promise((res) => c.toBlob(res, "image/png"));
+  } catch (err) { blob = null; }
+  if (!blob) { toast("Couldn't read the frame from the player."); return; }
+  let info;
+  try { info = await uploadFile(new File([blob], `${where}_${String(mm).padStart(2, "0")}m${ss}s.png`, { type: "image/png" }), "images"); }
+  catch (err) { toast("Couldn't save the frame: " + err.message); return; }
+  const what = `Frame from ${sh ? titleOf(sh) : "the film"} at ${fmt(t)} on the timeline`;
+  const label = `<${where}_frame>`;
+  if (to === "images") {
+    irefs().push({ id: uid("ir"), label, cast: null, image: info.name, subfolder: info.subfolder, type: "input",
+      sha256: info.sha256 || null, bypassed: false, from: "file" });
+    commit();
+    toast(`${what} added to the Images References as ${label}.`, { label: "Show", fn: () => setMode("images") });
+    return;
+  }
+  const card = { id: uid("c"), label, desc: what + ".", role: "appearance", image: "", bypassed: true };
+  applyUpload(card, info);
+  p.cast.push(card);
+  commit();
+  toast(`${what} added to Cast & Scenes as ${label} (bypassed: turn it on to use it).`);
+}
+
+// ---------------------------------------------------------------------------
+// 0.21.3: Images side, round 2. Delete a result; large view; Upscale this; ✕ in the drawer.
+// ---------------------------------------------------------------------------
+const upOk = () => !S.opts || !S.opts.nodes || S.opts.nodes.RTXVideoSuperResolution !== false;
+const sameFileRef = (a, name, sub, type) => a && a.image === name && (a.subfolder || "") === (sub || "") && (a.type || "input") === type;
+
+/** Delete one result of a Picture: off its card, and its file from the images folder. */
+async function delResult(pic, r, ask = true) {
+  if (ask && !await askOK(`Delete ${r.filename}? The file is removed from the images folder.`)) return;
+  api("/longshot/delete-output", { method: "POST", body: { filename: r.filename, subfolder: r.subfolder } }).catch((err) => toast(err.message));
+  const k = pic.results.indexOf(r);
+  if (k >= 0) pic.results.splice(k, 1);
+  if (k >= 0 && k < pic.current) pic.current -= 1;
+  pic.current = Math.max(0, Math.min(pic.current, pic.results.length - 1));
+  commit();
+  if (OD.open) loadOutputs();
+}
+
+/** ✕ on a drawer file: what uses it, a confirm, then the file goes and everything that pointed at it lets go. */
+async function outsDelete(btn) {
+  const o = btn.closest("[data-ofile]");
+  let item = null;
+  try { item = JSON.parse(o.dataset.ofile); } catch (err) { return; }
+  const p = P(), type = item.type === "input" ? "input" : "output";
+  const uses = [];
+  for (const c of p.cast || []) if (type === "input" && c.image === item.filename && (c.subfolder || "") === (item.subfolder || "")) uses.push(`the Cast & Scenes card ${c.label || c.image} (it will show as missing)`);
+  for (const r of irefs()) if (!r.cast && sameFileRef(r, item.filename, item.subfolder, type)) uses.push(`the Images reference ${r.label || r.image} (removed)`);
+  for (const pic of ipics()) {
+    if (type === "output" && pic.results.some((r) => r.filename === item.filename && (r.subfolder || "") === (item.subfolder || ""))) uses.push(`a result of Picture ${ipicNum(pic)} (removed from its card)`);
+    if (pic.edit && sameFileRef(pic.edit, item.filename, item.subfolder, type)) uses.push(`Picture ${ipicNum(pic)}'s To edit picture (cleared)`);
+  }
+  const ok = await confirmBox({ title: `Delete ${item.filename}?`, yes: "Delete", no: "Cancel",
+    body: `The file is deleted from ${type}/${item.subfolder || ""}.` + (uses.length ? "\n\nIt's used by:\n" + uses.map((u) => "• " + u).join("\n") : "") });
+  if (!ok) return;
+  try { await api("/longshot/delete-output", { method: "POST", body: { filename: item.filename, subfolder: item.subfolder, type } }); }
+  catch (err) { toast(err.message); return; }
+  p.images.refs = irefs().filter((r) => r.cast || !sameFileRef(r, item.filename, item.subfolder, type));
+  for (const pic of ipics()) {
+    if (type === "output") {
+      const before = pic.results.length;
+      pic.results = pic.results.filter((r) => !(r.filename === item.filename && (r.subfolder || "") === (item.subfolder || "")));
+      if (pic.results.length !== before) pic.current = Math.max(0, Math.min(pic.current, pic.results.length - 1));
+    }
+    if (pic.edit && sameFileRef(pic.edit, item.filename, item.subfolder, type)) pic.edit = null;
+  }
+  commit();
+  if (type === "input") loadInputs();
+  loadOutputs(true);
+  toast(`Deleted ${item.filename}.`);
+}
+
+/** Large view of a Picture's results: the reference viewer (zoom, pan), ← → through the results. */
+function openResultView(pic) {
+  if (!pic || !pic.results.length) return;
+  lb = { i: Math.min(pic.current, pic.results.length - 1), s: 1, x: 0, y: 0, fit: 1, pic: pic.id };
+  $("lightbox").hidden = false;
+  showLightbox();
+}
+function resultViewStep(d) {
+  const pic = ipicById(lb.pic);
+  if (!pic || !pic.results.length) { closeLightbox(); return; }
+  lb.i = (lb.i + d + pic.results.length) % pic.results.length;
+  pic.current = lb.i;
+  IMG.pic = pic.id;
+  showLightbox();
+  renderIpreview();
+  renderIpics();
+}
+function lightboxFullscreen() {
+  const el = $("lightbox");
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  else if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+}
+
+/** Upscale this: one result through RTX Super Resolution, into the Queue. */
+function upscaleResult(pic, r) {
+  if (!upOk()) { toast("Upscale needs RTX Video Super Resolution (ComfyUI-NVIDIA-RTX-VSR-Pro)."); return; }
+  if (setupGuard()) return;
+  enqueue([{ type: "imageup", target: pic.id, file: { filename: r.filename, subfolder: r.subfolder || "", type: r.type || "output" },
+    what: r.filename }], 1, true);
+}
+function imageUpOpts(sp) {
+  const pic = ipicById(sp.target);
+  if (!pic) { S.error = "That Picture was removed."; return null; }
+  const src = pic.results.find((x) => x.filename === sp.file.filename && (x.subfolder || "") === (sp.file.subfolder || "")) || null;
+  const im = imgSet(), scale = Number(im.scale) || 2, quality = im.quality || "ULTRA";
+  return { kind: "imageup", imageUp: Object.assign({ scale, quality }, sp.file),
+    label: `Upscale · ${sp.file.filename} · ×${scale}`, note: `RTX Super Resolution ${quality} on this picture only`,
+    extra: { pic: pic.id, scale, src: src ? Object.assign({}, src) : Object.assign({}, sp.file) }, onDone: () => {} };
+}
+function imageUpDone(b, outputs) {
+  const o = outputs[(b.built.nodes || {}).save] || {};
+  const file = (o.images || [])[0];
+  if (!file) { S.error = "The upscale finished but no picture came back."; return; }
+  const x = b.extra || {}, pic = ipicById(x.pic), src = x.src || {};
+  if (!pic) { toast(`Upscaled: ${file.filename} (its Picture was removed meanwhile; it's in the images folder).`); return; }
+  const k = Math.max(0, pic.results.findIndex((r) => r.filename === src.filename && (r.subfolder || "") === (src.subfolder || "")));
+  pic.results.splice(k, 0, Object.assign({}, src, { filename: file.filename, subfolder: file.subfolder || "", type: file.type || "output",
+    width: src.width ? Math.round(src.width * x.scale) : null, height: src.height ? Math.round(src.height * x.scale) : null,
+    made: Date.now(), up: x.scale, from: src.filename || "" }));
+  pic.results = pic.results.slice(0, Math.max(1, imgSet().keep || 20) + 1);
+  pic.current = k;
+  IMG.pic = pic.id;
+  scheduleSave();
+  toast(`Upscaled ×${x.scale}: ${file.filename}`, { label: "Show", fn: () => { setMode("images"); IMG.pic = pic.id; pic.current = k; render(); } });
+}
+
+// 0.21.10: a click on a References picture opens it large (zoom, pan, ← → through the References)
+function refViewList() {
+  let n = 0;
+  return irefs().map((r) => {
+    const f = irefFile(r);
+    const tag = r.bypassed ? "bypassed" : `<Picture ${++n}>`;
+    return f ? { r, f, tag, label: f.label || r.label || f.image } : null;
+  }).filter(Boolean);
+}
+function openRefView(id) {
+  const list = refViewList(), i = list.findIndex((x) => x.r.id === id);
+  if (i < 0) return;
+  lb = { i, s: 1, x: 0, y: 0, fit: 1, irefs: true };
+  $("lightbox").hidden = false;
+  showLightbox();
+}
+
+// 0.21.9: the Images Preview's large view, laid out like the Video side's Theater: the Preview panel
+// moves above the panels (full width), the rest of the Studio stays where it is.
+IMG.theater = store("h3studio.itheater") === "1";
+function setItheater(on) {
+  IMG.theater = !!on;
+  store("h3studio.itheater", IMG.theater ? "1" : "0");
+  const panel = $("ipreview-panel");
+  if (!panel) return;
+  if (IMG.theater) $("itheater-slot").appendChild(panel);
+  else if (panel.parentElement && panel.parentElement.id === "itheater-slot") $("images-right").insertBefore(panel, $("images-right").firstChild);
+  panel.classList.toggle("theater", IMG.theater);
+  $("itheater-slot").hidden = !imagesOn();
+  if (IMG.theater && imagesOn()) panel.scrollIntoView({ block: "nearest" });
+  if (P()) renderIpreview();
+}
+function ipreviewFullscreen() {
+  const el = $("ipreview-panel");
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  else if (el && el.requestFullscreen) el.requestFullscreen().catch(() => {});
+}
+document.addEventListener("fullscreenchange", () => {
+  const el = $("ipreview-panel");
+  if (el) el.classList.toggle("fs", document.fullscreenElement === el);
+});
+
+// Start-up, after every definition above (0.20.2: the Images section's consts come first)
 init();
 applyFolds();
 applyViewerHidden();

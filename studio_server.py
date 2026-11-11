@@ -44,6 +44,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -106,6 +107,12 @@ def folder_for(which, output_dir, input_dir, project=None, subfolder=None):
                 if os.path.isdir(clips):
                     return clips
                 own = os.path.join(base, project)
+                if os.path.isdir(own):
+                    return own
+            # 0.20.0: any folder of the project (images, Face_Swap, Approved_Audio/Dialogue...)
+            m = re.fullmatch(rf"longshot/{re.escape(project)}((?:/[^/\\:]+){{0,2}})", sub)
+            if m and ".." not in sub:
+                own = os.path.join(base, project, *[x for x in m.group(1).split("/") if x])
                 if os.path.isdir(own):
                     return own
         return base
@@ -580,6 +587,27 @@ def apply_model_folders():
     return saved
 
 
+def image_with_dims(item):
+    """0.20.0: the picture being edited gets its width and height (PIL), so the canvas can
+    follow its shape at the Picture's megapixels."""
+    import folder_paths
+    item = dict(item or {})
+    edit = item.get("edit")
+    if isinstance(edit, dict) and (edit.get("image") or edit.get("filename")) and not (edit.get("width") and edit.get("height")):
+        name = str(edit.get("image") or edit.get("filename"))
+        try:
+            if edit.get("type") == "output":
+                path = pj.resolve_output(folder_paths.get_output_directory(), name, edit.get("subfolder") or "")
+            else:
+                path = pj.resolve_input(folder_paths.get_input_directory(), name, edit.get("subfolder") or "")
+            dims = pj.image_dims(path)
+        except ValueError:
+            dims = None
+        if dims:
+            item["edit"] = dict(edit, width=dims[0], height=dims[1])
+    return item
+
+
 def model_listing(kind):
     import folder_paths
     saved = pj.load_model_folders(model_folders_path()).get(kind, [])
@@ -624,7 +652,7 @@ def options_payload():
             return []
 
     classes = _node_classes()
-    feature_classes = sorted(set(gb.PACKS) | {"UNETLoader", "LoraLoaderModelOnly"})
+    feature_classes = sorted(set(gb.PACKS) | {"UNETLoader", "LoraLoaderModelOnly", "TextGenerateV2", "JsonExtractString", gb.IMAGE_NODE})
     input_dir = folder_paths.get_input_directory()
     return {
         "version": VERSION,
@@ -654,6 +682,13 @@ def options_payload():
         "preview_decoder": preview_decoder_installed(names("vae_approx")),
         "face_detector": face_detector_installed(),
         "live_switch": live_switch_supported(),
+        # 0.20.0: Images
+        "image_megapixels": gb.IMAGE_MEGAPIXELS,
+        "image_files": gb.IMAGE_FILES,
+        "image_node": gb.IMAGE_NODE in classes,
+        "still_frames": gb.STILL_FRAMES, "still_tail": gb.STILL_TAIL,
+        "still_nodes": all(c in classes for c in ("MiniMaxH3ReferenceToVideo", "SamplerCustomAdvanced", "ImageFromBatch")),
+        "text_gen": "TextGenerateV2" in classes and "JsonExtractString" in classes,
     }
 
 
@@ -961,6 +996,102 @@ FACE_DETECTOR = {
     },
 }
 FACE_FILES = ("pnet.pt", "rnet.pt", "onet.pt")
+
+
+# ---------------------------------------------------------------------------
+# 0.20.0: model downloads (the Images files, from Hugging Face) straight into ComfyUI's
+# model folders, in a background thread, with progress; a stopped one resumes.
+# ---------------------------------------------------------------------------
+
+class ModelDownloads:
+    """One download at a time per file key; state is polled by the page."""
+
+    def __init__(self, fetch=None):
+        self.jobs = {}          # key -> {name, folder, path, bytes, total, done, error, cancel, started}
+        self.fetch = fetch or self._fetch
+        import threading
+        self._lock = threading.Lock()
+
+    def status(self):
+        with self._lock:
+            return {k: {x: v[x] for x in ("name", "folder", "path", "bytes", "total", "done", "error", "active")}
+                    for k, v in self.jobs.items()}
+
+    def start(self, key, spec, folder):
+        """spec: {name, url}; folder: where the file goes. Returns the job's state."""
+        import threading
+        with self._lock:
+            job = self.jobs.get(key)
+            if job and job["active"]:
+                return dict(job)
+            job = {"name": spec["name"], "url": spec["url"], "folder": folder, "path": os.path.join(folder, spec["name"]),
+                   "bytes": 0, "total": None, "done": False, "error": None, "cancel": False, "active": True}
+            self.jobs[key] = job
+        threading.Thread(target=self._run, args=(key, job), name=f"h3-download-{key}", daemon=True).start()
+        return dict(job)
+
+    def cancel(self, key):
+        with self._lock:
+            job = self.jobs.get(key)
+            if job:
+                job["cancel"] = True
+        return bool(job)
+
+    def _run(self, key, job):
+        try:
+            self.fetch(job)
+            if not job["cancel"]:
+                job["done"] = True
+        except Exception as err:        # the page shows it; the .part file stays for a resume
+            job["error"] = str(err)[:300]
+        finally:
+            job["active"] = False
+
+    @staticmethod
+    def _fetch(job):
+        import urllib.request
+        os.makedirs(job["folder"], exist_ok=True)
+        dest, part = job["path"], job["path"] + ".part"
+        if os.path.isfile(dest):
+            job["bytes"] = job["total"] = os.path.getsize(dest)
+            return
+        have = os.path.getsize(part) if os.path.isfile(part) else 0
+        headers = {"User-Agent": "H3-Long-Shot-Studio"}
+        if have:
+            headers["Range"] = f"bytes={have}-"
+        req = urllib.request.Request(job["url"], headers=headers)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            resumed = have and r.status == 206
+            length = r.headers.get("Content-Length")
+            if length is not None:
+                job["total"] = int(length) + (have if resumed else 0)
+            mode = "ab" if resumed else "wb"
+            job["bytes"] = have if resumed else 0
+            with open(part, mode) as f:
+                while True:
+                    if job["cancel"]:
+                        return
+                    block = r.read(1 << 20)
+                    if not block:
+                        break
+                    f.write(block)
+                    job["bytes"] += len(block)
+        if job["total"] is not None and job["bytes"] != job["total"]:
+            raise RuntimeError(f"The download stopped at {job['bytes']} of {job['total']} bytes. Download again to resume.")
+        os.replace(part, dest)
+
+
+_DOWNLOADS = ModelDownloads()
+
+
+def model_download_folder(kind):
+    """The first existing folder ComfyUI lists for a model kind (diffusion_models, vae...)."""
+    import folder_paths
+    for f in folder_paths.get_folder_paths(kind):
+        if os.path.isdir(f):
+            return f
+    roots = folder_paths.get_folder_paths(kind)
+    return roots[0] if roots else None
 
 
 def face_detector_folder():
@@ -1322,7 +1453,8 @@ def register(routes=None):
         project = resolve_names(body.get("project") or {}, lists)
         context_notes = []
         if not body.get("take_clips") and not body.get("export_clips") and not body.get("face_try") \
-                and not body.get("refine_try") and not body.get("face_swap"):
+                and not body.get("refine_try") and not body.get("face_swap") and not body.get("image") \
+                and not body.get("image_up"):
             context_notes = await asyncio.get_running_loop().run_in_executor(
                 None, add_context_frames, project, bool(body.get("dry_run")), body.get("upto"),
                 bool(body.get("standalone")))
@@ -1333,6 +1465,14 @@ def register(routes=None):
                 built = gb.build_take_clips(project, body["take_clips"][:64], env=current_env())
             elif isinstance(body.get("refine_try"), dict):
                 built = gb.build_refine_try(project, body["refine_try"], env=current_env())
+            elif isinstance(body.get("image_up"), dict):
+                built = gb.build_image_upscale(project, body["image_up"], env=current_env())
+            elif isinstance(body.get("image"), dict):
+                # 0.21.0: the video model makes the still unless the H3-Image engine is chosen
+                if body["image"].get("engine") == "h3image":
+                    built = gb.build_image(project, image_with_dims(body["image"]), env=current_env())
+                else:
+                    built = gb.build_still(project, body["image"], env=current_env())
             elif isinstance(body.get("face_swap"), dict):
                 built = gb.build_face_swap(project, body["face_swap"], env=current_env())
             elif isinstance(body.get("face_try"), dict):
@@ -1551,6 +1691,83 @@ def register(routes=None):
         except ValueError as err:
             return error(err)
         return web.json_response(saved)
+
+    # 0.20.0: the Outputs drawer
+    @routes.get("/longshot/outputs")
+    async def outputs(request):
+        import folder_paths
+        slug = request.query.get("project") or None
+        if slug is not None and not pj.is_slug(slug):
+            return error("Not a project slug.")
+        # 0.21.3: ?which=input lists ComfyUI's input folder the same way
+        root = folder_paths.get_input_directory() if request.query.get("which") == "input" \
+            else folder_paths.get_output_directory()
+        try:
+            data = await asyncio.get_running_loop().run_in_executor(
+                None, pj.list_outputs, root, slug)
+        except ValueError as err:
+            return error(err)
+        return web.json_response(data)
+
+    @routes.get("/longshot/thumb")
+    async def thumb(request):
+        import folder_paths
+        name, sub = request.query.get("filename", ""), request.query.get("subfolder", "")
+        src_dir = folder_paths.get_input_directory() if request.query.get("type") == "input" else None
+        try:
+            path = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: pj.thumbnail(folder_paths.get_output_directory(), name, sub, 256, _ffmpeg_path(), src_dir=src_dir))
+        except ValueError as err:
+            return error(err, 404)
+        if not path:
+            return error("No thumbnail for that file.", 404)
+        return web.FileResponse(path, headers={"Cache-Control": "private, max-age=86400"})
+
+    @routes.post("/longshot/adopt-output")
+    async def adopt_output(request):
+        """{project, filename, subfolder, kind}: copy an output file into the project's inputs."""
+        import folder_paths
+        try:
+            body = await request.json()
+        except ValueError:
+            return error("Body must be JSON.")
+        slug = str(body.get("project") or "")
+        if not pj.is_slug(slug) or not project_store().exists(slug):
+            return error("No such project.", 404)
+        kind = str(body.get("kind") or "images")
+        try:
+            saved = await asyncio.get_running_loop().run_in_executor(
+                None, pj.adopt_output, folder_paths.get_input_directory(), folder_paths.get_output_directory(),
+                slug, str(body.get("filename") or ""), str(body.get("subfolder") or ""), kind)
+        except ValueError as err:
+            return error(err)
+        return web.json_response(saved)
+
+    @routes.post("/longshot/delete-output")
+    async def delete_output(request):
+        """{filename, subfolder, type?}: delete one file under output/longshot (or, with type
+        "input", under input/longshot: 0.21.3, the Outputs drawer's Inputs)."""
+        import folder_paths
+        try:
+            body = await request.json()
+        except ValueError:
+            return error("Body must be JSON.")
+        sub = str(body.get("subfolder") or "").replace("\\", "/")
+        inp = body.get("type") == "input"
+        if not sub.startswith("longshot/"):
+            return error(f"Only files under {'input' if inp else 'output'}/longshot can be deleted here.", 403)
+        try:
+            root = folder_paths.get_input_directory() if inp else folder_paths.get_output_directory()
+            path = pj.resolve_output(root, str(body.get("filename") or ""), sub)
+        except ValueError as err:
+            return error(err)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as err:
+            return error(f"Couldn't delete it: {err}", 500)
+        return web.json_response({"ok": True})
 
     @routes.post("/longshot/check-inputs")
     async def check_inputs(request):
@@ -2000,6 +2217,29 @@ def register(routes=None):
         except Exception as err:
             return error(f"Couldn't download the preview decoder: {err}", 500)
         return web.json_response(out)
+
+    # 0.20.0: the Images model files, downloaded by the Studio into ComfyUI's model folders
+    @routes.get("/longshot/download-model")
+    async def download_model_status(request):
+        return web.json_response(_DOWNLOADS.status(), headers=no_cache)
+
+    @routes.post("/longshot/download-model")
+    async def download_model(request):
+        """{key: model|vae|clip|expander, cancel?}: start (or resume, or cancel) that file's download."""
+        if not local(request):
+            return error("Model files can only be downloaded from the machine running ComfyUI.", 403)
+        body = await body_of(request)
+        key = str((body or {}).get("key") or "")
+        spec = gb.IMAGE_FILES.get(key)
+        if not spec:
+            return error("Unknown file.")
+        if (body or {}).get("cancel"):
+            _DOWNLOADS.cancel(key)
+            return web.json_response({"cancelled": True})
+        folder = model_download_folder(spec["folder"])
+        if not folder:
+            return error(f"ComfyUI has no models/{spec['folder']} folder.", 500)
+        return web.json_response(_DOWNLOADS.start(key, spec, folder))
 
     @routes.post("/longshot/install-face-detector")
     async def install_face_detector_route(request):

@@ -16,11 +16,12 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.18.5"
+STUDIO_VERSION = "0.21.11"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -2058,3 +2059,154 @@ def clip_frames(seconds, fps=24):
     if n < 5:
         return 0
     return (n - 5) // 17 * 17 + 5
+
+
+# ---------------------------------------------------------------------------
+# 0.20.0: Images, and the Outputs drawer (browse output/, drag a file into a project)
+# ---------------------------------------------------------------------------
+
+THUMBS_DIR = ".thumbs"           # output/longshot/.thumbs: small JPEGs for the drawer
+OUTPUTS_MAX_FILES = 3000
+
+
+def output_path_value(name, subfolder=""):
+    """What LoadImage takes for a file under ComfyUI's output folder: 'sub/name.png [output]'."""
+    return input_path_value(name, subfolder) + " [output]"
+
+
+def resolve_output(output_dir, name, subfolder=""):
+    """Full path of output/<subfolder>/<name>, refused outside the output folder."""
+    if not isinstance(name, str) or not name or name in (".", "..") \
+            or "/" in name or "\\" in name or ":" in name or "\0" in name:
+        raise ValueError(f"bad file name {name!r}")
+    sub = _clean_subfolder(subfolder)
+    path = os.path.join(output_dir, *(sub.split("/") if sub else []), name)
+    root = os.path.realpath(output_dir)
+    if not os.path.realpath(path).startswith(root + os.sep):
+        raise ValueError("outside the output folder")
+    return path
+
+
+def _file_kind(name):
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext in IMAGE_EXTENSIONS:
+        return "image"
+    if ext in VIDEO_EXTENSIONS:
+        return "video"
+    if ext in AUDIO_EXTENSIONS:
+        return "audio"
+    return None
+
+
+def list_outputs(output_dir, slug=None, depth=3, limit=OUTPUTS_MAX_FILES):
+    """Folders and media files under output/longshot/<slug> (a project), or under the whole
+    output folder (slug None). Each folder: {name, subfolder, files: [{name, kind, bytes, mtime}]},
+    files newest first; folders in path order. Hidden folders and the Studio's own work folders
+    (segments, takes, clips, _chunks, .thumbs) are left out."""
+    if slug is not None and not is_slug(slug):
+        raise ValueError("Not a project slug.")
+    base = os.path.join(output_dir, "longshot", slug) if slug else output_dir
+    root_sub = f"longshot/{slug}" if slug else ""
+    skip = {"segments", "takes", "clips", "_chunks", "context", THUMBS_DIR}
+    out, count = [], 0
+    if not os.path.isdir(base):
+        return {"subfolder": root_sub, "folders": out, "truncated": False}
+    stack = [(base, root_sub, 0)]
+    while stack:
+        folder, sub, level = stack.pop(0)
+        files, dirs = [], []
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.name.startswith(".") or e.name in skip:
+                    continue
+                if e.is_dir():
+                    dirs.append(e)
+                elif e.is_file():
+                    kind = _file_kind(e.name)
+                    if kind:
+                        st = e.stat()
+                        files.append({"name": e.name, "kind": kind, "bytes": st.st_size, "mtime": int(st.st_mtime)})
+            except OSError:
+                continue
+        files.sort(key=lambda f: (-f["mtime"], f["name"].lower()))
+        if files or sub == root_sub:
+            if count + len(files) > limit:
+                files = files[:max(0, limit - count)]
+                out.append({"name": os.path.basename(folder) if sub != root_sub else "", "subfolder": sub, "files": files})
+                return {"subfolder": root_sub, "folders": out, "truncated": True}
+            count += len(files)
+            out.append({"name": os.path.basename(folder) if sub != root_sub else "", "subfolder": sub, "files": files})
+        if level < depth:
+            for d in sorted(dirs, key=lambda e: e.name.lower()):
+                stack.append((d.path, f"{sub}/{d.name}" if sub else d.name, level + 1))
+    return {"subfolder": root_sub, "folders": out, "truncated": False}
+
+
+def image_dims(path):
+    """(width, height) of an image file, or None."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return im.size
+    except Exception:
+        return None
+
+
+def thumbnail(output_dir, name, subfolder="", size=256, ffmpeg="ffmpeg", run=None, src_dir=None):
+    """A small JPEG of an output image or video frame, cached in output/longshot/.thumbs by
+    file path and modification time. Returns the JPEG's path, or None when it can't be made.
+    src_dir (0.21.3): the file is under that folder instead (ComfyUI's input folder)."""
+    root = src_dir or output_dir
+    src = resolve_output(root, name, subfolder)
+    if not os.path.isfile(src):
+        raise ValueError("No such file.")
+    st = os.stat(src)
+    rel = ("input:" if src_dir else "") + os.path.relpath(src, root).replace("\\", "/")
+    key = hashlib.sha1(f"{rel}|{st.st_mtime_ns}|{st.st_size}|{size}".encode("utf-8")).hexdigest()
+    folder = os.path.join(output_dir, "longshot", THUMBS_DIR)
+    os.makedirs(folder, exist_ok=True)
+    dest = os.path.join(folder, f"{key}.jpg")
+    if os.path.isfile(dest):
+        return dest
+    kind = _file_kind(name)
+    tmp = dest + ".tmp"
+    try:
+        if kind == "image":
+            from PIL import Image, ImageOps
+            with Image.open(src) as im:
+                im.draft("RGB", (size * 2, size * 2))
+                im = ImageOps.exif_transpose(im)
+                im.thumbnail((size, size))
+                im.convert("RGB").save(tmp, "JPEG", quality=82)
+        elif kind == "video":
+            run = run or subprocess.run
+            cmd = [ffmpeg, "-y", "-v", "error", "-ss", "0", "-i", src, "-frames:v", "1",
+                   "-vf", f"scale='min({size},iw)':-2", "-q:v", "4", tmp]
+            r = run(cmd, capture_output=True, text=True, timeout=30)
+            if r.returncode or not os.path.isfile(tmp):
+                return None
+        else:
+            return None
+        os.replace(tmp, dest)
+        return dest
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+
+
+def adopt_output(input_dir, output_dir, slug, name, subfolder="", kind="images"):
+    """Copy a file from the output folder into input/longshot/<slug>/ (the same as uploading
+    it), so it can be a reference card. Same bytes already there: reused."""
+    src = resolve_output(output_dir, name, subfolder)
+    if not os.path.isfile(src):
+        raise ValueError("No such file.")
+    with open(src, "rb") as fh:
+        data = fh.read()
+    return store_upload(input_dir, slug, name, data, kind)

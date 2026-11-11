@@ -36,6 +36,10 @@
       </span>
       <span id="save-state" class="muted small"></span>
     </div>
+    <div class="mode" id="mode" role="group" aria-label="Video or Images">
+      <button data-action="mode" data-v="video" id="mode-video" aria-pressed="true" title="The film: Cast &amp; Scenes, Shots, the timeline">Video</button>
+      <button data-action="mode" data-v="images" id="mode-images" aria-pressed="false" title="Still pictures with MiniMax-H3-Image, from the same project's references">Images</button>
+    </div>
   </div>
   <div class="top-right">
     <div id="speedstat" class="sysstats mono" hidden></div>
@@ -65,7 +69,7 @@
 
 <div id="theater-slot" class="theater-slot"></div>
 
-<main class="cols">
+<main class="cols" id="video-main">
 
   <section class="col-left">
 
@@ -178,6 +182,7 @@
         <button class="ctl" data-action="step" data-dir="1" aria-label="Next frame">frame ▶</button>
         <button class="ctl" data-action="jump" id="jump">Jump to —</button>
         <button class="ctl" data-action="loop" id="loop" aria-pressed="false" title="Loops the shot under review, starting halfway through the shot before it so you see the seam">⟲ Loop shot + seam</button>
+        <button class="ctl" data-action="frame-ref" id="frame-ref" title="Send the frame on screen to Cast &amp; Scenes (a new card, bypassed) or to the Images References">📷 Frame → reference</button>
         <button class="ctl folder-btn local-only" data-action="open-folder" data-which="output" title="Open the output folder with this video selected">
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M1.5 4.5v8h13v-6.5h-7l-1.5-1.5z"/></svg>
           Open output folder
@@ -293,6 +298,78 @@
   </aside>
 </main>
 
+<!-- 0.20.0: Images. Hidden until the Images mode is on; the Queue panel moves here with it. -->
+<div id="itheater-slot" class="theater-slot"></div>      <!-- 0.21.9: the Images Preview in its large view -->
+<main class="cols" id="images-main" hidden>
+  <section class="col-left">
+    <div id="images-banner" class="banner" style="margin:0" hidden></div>
+    <div class="panel" id="irefs-panel">
+      <div class="panel-head">
+        <div class="head-left"><h2><button class="fold" data-action="toggle" data-key="irefsOpen" id="irefs-fold" aria-expanded="true"><span class="fold-ch" aria-hidden="true">▾</span>References</button></h2><span class="muted small" id="irefs-summary"></span></div>
+        <div class="head-right">
+          <button class="ghost sm" data-action="iref-from-cast" id="iref-from-cast" title="Add a Cast &amp; Scenes picture card (it follows that card's picture)">＋ from Cast &amp; Scenes ▾</button>
+          <button class="ghost sm" data-action="iref-upload" title="Add picture files">Upload…</button>
+        </div>
+      </div>
+      <div id="irefs-body">
+        <div id="irefs" class="iref-grid"></div>
+        <div class="muted small" style="margin-top:10px">Every Picture sees these as &lt;Picture 1…N&gt;, in this order (drag a card to move it). A Picture that edits an image puts that image first; the References then follow as &lt;Picture 2…&gt;.</div>
+      </div>
+    </div>
+    <!-- 0.21.6: the stills' own style line and summary (video-model engine) -->
+    <div class="panel" id="istyle-panel">
+      <div class="panel-head">
+        <div class="head-left"><h2><button class="fold" data-action="toggle" data-key="istyleOpen" id="istyle-fold" aria-expanded="true"><span class="fold-ch" aria-hidden="true">▾</span>Style</button></h2><span class="muted small" id="istyle-summary"></span></div>
+      </div>
+      <div id="istyle"></div>
+    </div>
+    <div class="panel" id="ipics-panel">
+      <div class="panel-head">
+        <div class="head-left"><h2><button class="fold" data-action="toggle" data-key="ipicsOpen" id="ipics-fold" aria-expanded="true"><span class="fold-ch" aria-hidden="true">▾</span>Pictures</button></h2><span class="muted small" id="ipics-summary"></span></div>
+        <div class="head-right">
+          <button class="ghost sm" data-action="ipic-fold-all" id="ipic-fold-all" title="Fold or unfold every Picture card">▸ Fold all</button>
+          <button class="ghost sm" data-action="ipic-render-all" id="ipic-render-all" title="Render every Picture that has a prompt, one after the other">▶ Render all</button>
+        </div>
+      </div>
+      <div id="ipics-body">
+        <div id="ipics" class="shot-list"></div>
+        <button class="addtile wide" data-action="ipic-add" id="ipic-add">＋ Picture</button>
+      </div>
+    </div>
+  </section>
+  <aside class="col-right" id="images-right">
+    <div class="panel" id="ipreview-panel">
+      <div id="ipreview"></div>
+    </div>
+    <div class="panel" id="iset-panel">
+      <div class="panel-head fold-row">
+        <button class="fold" data-action="toggle" data-key="isetOpen" id="iset-toggle" aria-expanded="true" aria-controls="iset">
+          <span class="head-left"><span class="h2">Image settings</span><span class="warn-tag">⚠ all pictures</span><span class="muted small" id="iset-summary"></span></span>
+        </button>
+        <div class="fold-quick" id="iset-quick" hidden></div>
+        <button class="fold chev-btn" data-action="toggle" data-key="isetOpen" aria-controls="iset" tabindex="-1"><span class="muted chev" id="iset-chev">Hide ▴</span></button>
+      </div>
+      <div id="iset"></div>
+    </div>
+    <div id="iqueue-slot"></div>
+  </aside>
+</main>
+
+<!-- 0.20.0: the Outputs drawer: everything in output/longshot/<project> (or the whole output folder),
+     to look at, open, and drag into the references of either side. -->
+<button class="outs-tab" id="outs-tab" data-action="outs-toggle" title="Browse this project's output folder (Ctrl+Shift+O)">Outputs</button>
+<div class="outs" id="outs" hidden>
+  <div class="outs-head">
+    <h2>Outputs</h2>
+    <select id="outs-scope" aria-label="Which folder"></select>
+    <button class="icon" data-action="outs-toggle" title="Close" aria-label="Close the Outputs drawer">✕</button>
+  </div>
+  <div class="outs-sw" id="outs-sw"></div>
+  <div class="outs-body" id="outs-body"></div>
+  <div class="outs-foot" id="outs-foot"></div>
+</div>
+
+
 <div id="ab" class="ab" hidden role="dialog" aria-modal="true" aria-labelledby="ab-title"></div>
 <div id="modal" class="modal" hidden>
   <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="modal-title">
@@ -341,12 +418,13 @@
 <div id="lightbox" class="lightbox" hidden>
   <div class="lb-head">
     <span class="pic" id="lb-pic"></span><b id="lb-title"></b><span class="muted small" id="lb-file"></span>
-    <button class="ghost close" data-action="lb-close" aria-label="Close">
+    <button class="ghost sm" data-action="lb-fs" title="Full screen (F)" style="margin-left:auto">⛶ Full screen</button>
+    <button class="ghost close" data-action="lb-close" aria-label="Close" style="margin-left:6px">
       <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg>
     </button>
   </div>
   <div class="lb-stage" id="lb-stage"><img id="lb-img" alt="" draggable="false"></div>
-  <div class="lb-foot muted small">Scroll to zoom · drag to pan · double-click to reset · ← → other references · Esc closes</div>
+  <div class="lb-foot muted small" id="lb-foot">Scroll to zoom · drag to pan · double-click to reset · ← → other references · Esc closes</div>
 </div>
 
 <div id="confirm" class="modal confirm-wrap" hidden>
