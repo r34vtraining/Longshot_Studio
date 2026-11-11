@@ -13,8 +13,7 @@ thrown away.
 
 <img width="1696" height="1350" alt="image" src="https://github.com/user-attachments/assets/af2861fe-43ed-436d-a908-d954a6788a3d" />
 
-<img width="1637" height="1394" alt="image" src="https://github.com/user-attachments/assets/5360aecc-d4ef-49c4-a54c-db465f0fd163" />
-
+<img width="1637" height="1303" alt="image" src="https://github.com/user-attachments/assets/0e0ebd5d-686e-4bd3-9603-be88d82aeb01" />
 
 ## Features
 
