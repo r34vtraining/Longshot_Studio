@@ -49,6 +49,42 @@ thrown away.
 - Dialogue and SFX stems as separate .wav files.
 - Export or import a whole project as one .zip.
 
+## What's new in 0.23.0
+
+1. Notes on a take
+
+📝 Note in the timeline controls, or N, adds a note at the frame on screen.
+Each note is saved on its Shot with the take it was written about, so it’s in the project file and readable through the API.
+On the Shot card:
+you tick a note when it’s fixed, click its time to jump there, or click its text to edit it;
+notes about an older take are marked earlier take;
+the header shows 📝 n open notes.
+The timeline shows a small marker at each open note on the current takes.
+
+2. Pinned references per group
+
+📌 Pin references on a group’s bar records which cards are switched on in Cast & Scenes, and their order.
+That group then always renders with that set. Your Cast & Scenes switches aren’t changed.
+Render all gives each pinned group its own run, in film order. Props stay in their own group, and each run counts only its own pictures toward the 9.
+The reference check before a render checks each group against its own set.
+Click 📌 References (n) to see the set, show it in Cast & Scenes, re-pin from what’s on now, or unpin.
+
+It matches cards by id or by image file, so a card you deleted and added again is found.
+Deleted cards come back from the record.
+Cards go back in the order they had, and the dialog says when it reorders them.
+Restore prompt & references on a group uses that group’s pinned set when it has one.
+Exact order only works for takes rendered from now on, because older takes didn’t record each card’s place. For those, cards are put back in the order of the ones that were switched on.
+
+Restore all with a deleted card, a re-added picture and a reshuffled order: it came back as A, B, C (off), with B matched by its file.
+Render all with two pinned groups: it queued two runs, each seeing only its own references.
+A note showed on its card and as a timeline marker.
+
+One limit: Re-render through Shot N and Dry run of the whole film use the pinned set of the last Shot’s group for the whole run. Single-Shot renders, Render group and Render all each use the right group’s set.
+
+3. Official tokens: <scenetrans>, <cutoff>, <d> and <Subject N> no longer trigger the “no reference card has this label” warning.
+
+The token check flagged only an unknown <Nope>.
+
 ## What's new in 0.21.11
 
 1. H3 Image generation UI, in the same project folder, you can now generate image directly into the project
@@ -84,31 +120,6 @@ thrown away.
   after a refresh, the page no longer jumps when you change a chip, and Alt + mouse wheel never goes
   back a page.
 
-## What's new in 0.17.32
-
-1. Group folders, you can now group your shots by scenes, act, etc.  One button to restore all the reference that was used for that group.  
-2. Audio separation.  Didn't matter too much with a music video, but with a short film the dialogue and sfx often clash, so a stems detector will output .wav files for both dialogue and sfx separately.  
-3. Added more options for consecutive shots.  
-- Cut (a hard cut shot)
-- Context (a shot that takes the last frame of the previous shot as a reference)
-- Bridge (connect 2 shots together)
-- Lead In (transition into a shot after it)
-- Cutaway (a context shot that connects to the previous shot but is not seen by the following shot, mainly used for B-roll shots)
-- Continuous (making longer and longer continuous shot)
-
-## What's new in 0.17.0
-
-**Several Studio tabs at once**, each on its own project.
-
-1. Each tab has its own queue and runs its own jobs; ComfyUI takes the runs one at a time, in the order they arrive (a tab whose run waits behind another tab's says so). Progress, previews and results go to the tab that queued them.
-2. A duplicated tab gets its own identity (it no longer steals the other tab's progress).
-3. One project, one tab: a project open in another tab can't be opened in a second one (two tabs would save over each other); the project list marks it "open in another tab". A new tab opens the last project that isn't open elsewhere.
-4. A job queued in one tab for a project that's open in another tab moves to that tab when its turn comes, so the result lands where the project is open.
-5. The queue panel also lists what the other tabs have queued (greyed). If a tab closes with jobs still waiting, another Studio tab picks them up.
-6. Lip Sync function works now.  See Audio tab for audio control for lip syncing.
-7. Face Refine Added, refine selected clip then export them as approved clips.  
-8. Stackable timelines for overlapping clips with handles for easier editing.
-   
 ## Requirements
 
 - ComfyUI with native MiniMax H3 support, and the MiniMax H3 model files.
