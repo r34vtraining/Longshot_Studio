@@ -376,6 +376,40 @@ def voice_retention(project: dict) -> list:
     return out
 
 
+def live_retention(project: dict, text, warnings=None) -> str:
+    """0.22.2: the Style panel's Retention without the lines that name a reference switched off
+    (bypassed, or with no file) and no live one: H3 brings in or morphs whatever it's told is there.
+    The panel's text stays as it is; only this render leaves them out. Unknown labels (an <OutfitA>
+    inside a card's description) are kept."""
+    def tag(x):
+        x = re.sub(r"[<>]", "", str(x or "")).strip()
+        return f"<{x}>" if x else ""
+    live, off = set(), set()
+    groups = [(project.get("cast") or [], lambda c: bool(c.get("image"))),
+              (project.get("videos") or [], lambda v: bool(v.get("file"))),
+              (project.get("refmods") or [], lambda m: bool(m.get("name"))),
+              (project.get("voices") or [], lambda v: bool(v.get("file")))]
+    for items, has_file in groups:
+        for it in items:
+            if not isinstance(it, dict) or not tag(it.get("label")):
+                continue
+            (off if it.get("bypassed") or not has_file(it) else live).add(tag(it.get("label")))
+    off -= live
+    out, dropped = [], []
+    for line in str(text or "").strip().splitlines():
+        names = set(re.findall(r"<[^<>\n]{1,80}>", line))
+        if names & off and not names & live:
+            dropped.append(line.strip())
+        else:
+            out.append(line)
+    if dropped and warnings is not None:
+        msg = ("Left out of Retention for this render (their cards are switched off): " +
+               "; ".join(dropped[:6]) + (" …" if len(dropped) > 6 else ""))
+        if msg not in warnings:
+            warnings.append(msg)
+    return "\n".join(out).strip()
+
+
 def audio_copied(project: dict) -> bool:
     """Is an audio reference set to Copy (0.12.0)? Then the summary adds "audio reuse"."""
     return any(audio_role(v) != "voice" and v.get("use") == "copy" for v in active_voices(project))
@@ -1673,8 +1707,12 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                 anchor_inputs["context_image"] = g.add(f"context{n}", "LoadImage",
                                                        f"Shot {n} context (last frame before)", image=image)
                 # reference only: never "continuity" or "last frame", which H3 reads as
-                # "open on this frame and carry on from it"
-                lead = (f"<Picture {pic}> is a reference for the characters, objects and surroundings only. "
+                # "open on this frame and carry on from it". 0.22.1: the location only: people in the
+                # frame drifted toward the model's own idea of them (a well-known IP) instead of the
+                # reference sheets, so no likeness is taken from it.
+                lead = (f"<Picture {pic}> is a reference for the location only: the setting, its layout, light "
+                        f"and props. No person's appearance comes from <Picture {pic}>: every character looks "
+                        "exactly as in their own reference pictures. "
                         f"The shot does not begin from <Picture {pic}> and does not continue it: it opens "
                         "on a new camera angle and composition. ") + lead
                 if not env.shot_takes("retention"):
@@ -1683,9 +1721,9 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                     if msg not in warnings:
                         warnings.append(msg)
                 else:
-                    own_retention = (f"<Picture {pic}> (reference for [Shot 1]): weak_reference - characters, "
-                                     "objects and surroundings only; not a frame anchor, new framing and "
-                                     "camera angle.")
+                    own_retention = (f"<Picture {pic}> (reference for [Shot 1]): partially_preserved - the location "
+                                     "only (setting, layout, light, props), seen from a new camera angle; no "
+                                     "character appearance comes from it; not a frame anchor.")
             text = (lead + text + tail).strip()
         inputs = dict(shot_id=str(shot.get("id") or f"shot{n}"), seconds=seconds,
                       text=text,
@@ -1731,7 +1769,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         subject_definitions="", task_type=types[0] if types[0] != "-" else "reference generation",
         task_type_2=types[1], task_type_3=types[2],
         summary=style.get("summary", ""),
-        retention_analysis="\n".join(x for x in [(style.get("retention") or "").strip(),
+        retention_analysis="\n".join(x for x in [live_retention(project, style.get("retention"), warnings),
                                                   song_retention(project) if songref else "", *voice_retention(project)] if x),
         style_line=style.get("style_line", ""), detailed_description="",
         overall_soundscape=style.get("soundscape", ""),
@@ -1996,7 +2034,10 @@ IMAGES_SUBFOLDER = "images"
 IMAGE_MEGAPIXELS = [4, 6, 8, 12, 16, 20]       # 0.21.3: H3-Image works from about 4 MP up
 IMAGE_MAX_REFS = 9
 IMAGE_DEFAULTS = {"model": "", "vae": "", "expander": "", "steps": 6, "cfg": 1.0, "sampler": "euler",
-                  "scheduler": "simple", "megapixels": 8, "aspect": "1:1", "keep": 20}
+                  "scheduler": "simple", "megapixels": 4, "aspect": "1:1", "keep": 20,
+                  # 0.22.0, after n8te0's 20 MP workflow: the LCM sampler with per-step noise 1.1 -> 0.9
+                  "sampler_kind": "lcm", "lcm_start": 1.1, "lcm_end": 0.9, "lcm_clip": 0.0,
+                  "pe_thinking": False, "format": "png", "avif_crf": 18}
 IMAGE_NODE = "MiniMaxH3ImageConditioning"
 # Where each file comes from (the links the Studio shows when one is missing)
 IMAGE_FILES = {
@@ -2027,13 +2068,23 @@ def images_subfolder(project: dict) -> str:
 
 def image_size(megapixels, aspect, like=None) -> tuple[int, int]:
     """The canvas: an aspect preset, or the shape of the picture being edited (`like`:
-    (width, height)), at the megapixel budget, in multiples of 32."""
+    (width, height)), at the megapixel budget, in multiples of 32. 0.22.0: H3-Image counts
+    1 MP as 1,000,000 pixels (as its published sizes and n8te0's workflow do)."""
     mp = _num(megapixels, "Image size (MP)", 0.25, 64)
     if like and like[0] and like[1]:
         w, h = int(like[0]), int(like[1])
-        scale = math.sqrt(mp * 1024 * 1024 / (w * h))
-        return max(32, round(w * scale / 32) * 32), max(32, round(h * scale / 32) * 32)
-    return output_size(mp, aspect)
+    else:
+        if aspect not in ASPECTS:
+            raise BuildError(f"Unknown aspect {aspect!r}. Choose one of {', '.join(ASPECTS)}.")
+        w, h = ASPECTS[aspect]
+    return (max(32, round(math.sqrt(w / h * mp * 1_000_000) / 32) * 32),
+            max(32, round(math.sqrt(h / w * mp * 1_000_000) / 32) * 32))
+
+
+def expander_type(name) -> str:
+    """CLIPLoader type for a prompt expander file: Qwen3.5 loads as 'minimax' (ComfyUI's template),
+    other Qwen files (Qwen3.8-27B...) as 'stable_diffusion' (n8te0's workflow)."""
+    return "minimax" if re.search(r"qwen[\s_.-]*3[._]?5", str(name or ""), re.I) else "stable_diffusion"
 
 
 def _picture_path(ref: dict, what: str) -> str:
@@ -2086,8 +2137,8 @@ def build_image(project: dict, item: dict, env: Env | None = None) -> Build:
     else:
         width, height = image_size(mp, aspect)
     warnings = []
-    if (width * height or 4 * 1024 * 1024) < 3.5 * 1024 * 1024:
-        warnings.append("MiniMax-H3-Image loses detail under about 4 MP; 8–16 MP is its range.")
+    if (width * height or 4_000_000) < 3_500_000:
+        warnings.append("MiniMax-H3-Image loses detail under about 4 MP; 4–20 MP is its range.")
 
     g = _Graph()
     model = g.add("img_model", "UNETLoader", "Image model", unet_name=im["model"], weight_dtype="default")
@@ -2101,29 +2152,52 @@ def build_image(project: dict, item: dict, env: Env | None = None) -> Build:
     prompt_in = text
     if expand:
         from . import image_pe
-        pe_clip = g.add("pe_clip", "CLIPLoader", "Prompt expander", clip_name=im["expander"], type="minimax", device="default")
+        pe_clip = g.add("pe_clip", "CLIPLoader", "Prompt expander", clip_name=im["expander"],
+                        type=expander_type(im["expander"]), device="default")
         ask = g.add("pe_ask", "StringReplace", "Expander brief", string=image_pe.EDIT_SYSTEM if pictures else image_pe.T2I_SYSTEM,
                     find=image_pe.PLACEHOLDER, replace=text)
         gen_in = {f"images.image{k}": v for k, v in loaders.items()}
-        gen = g.add("pe", "TextGenerateV2", "Expand prompt", clip=pe_clip, prompt=ask, system_prompt=image_pe.PREFIX,
-                    max_length=8192, sampling_mode="on", thinking=True, use_default_template=True,
+        thinking = bool(im.get("pe_thinking"))
+        gen = g.add("pe", "TextGenerateV2", "Expand prompt", clip=pe_clip, prompt=ask,
+                    system_prompt=image_pe.EFFORT + image_pe.PREFIX,
+                    max_length=8192, sampling_mode="on", thinking=thinking, use_default_template=True,
                     mtp="off",       # 0.21.3: speculative decoding crashed in comfy_kitchen's flash attention
                     **{
                         "sampling_mode.temperature": 1.0, "sampling_mode.top_k": 20, "sampling_mode.top_p": 0.95,
                         "sampling_mode.min_p": 0.0, "sampling_mode.repetition_penalty": 1.0,
                         "sampling_mode.presence_penalty": 0.0, "sampling_mode.seed": 0}, **gen_in)
         prompt_in = g.add("pe_text", "JsonExtractString", "Expanded caption", json_string=_out(gen, 0), key="expanded_caption")
-    cond_in = {f"images.image_{k}": v for k, v in loaders.items()}
+    cond_in = {f"images.image_{k - 1}": v for k, v in loaders.items()}     # 0.22.0: image_0 is <Picture 1>
     cond = g.add("cond", IMAGE_NODE, "MiniMax H3 Image Conditioning", clip=clip, vae=vae, prompt=prompt_in,
                  width=width, height=height, **cond_in)
-    neg = g.add("neg", "ConditioningZeroOut", "Negative (none)", conditioning=_out(cond, 0))
-    sampler = g.add("sampler", "KSampler", "Sample", model=model, positive=_out(cond, 0), negative=neg,
-                    latent_image=_out(cond, 1), seed=seed, steps=steps, cfg=float(im.get("cfg", 1.0)),
-                    sampler_name=str(im.get("sampler") or "euler"), scheduler=str(im.get("scheduler") or "simple"), denoise=1.0)
-    images = g.add("decode", "VAEDecode", "VAE Decode", samples=sampler, vae=vae)
+    sched = str(im.get("scheduler") or "simple")
+    if im.get("sampler_kind", "lcm") == "lcm" and env.has("SamplerLCM"):
+        # 0.22.0: n8te0's 20 MP workflow: LCM with per-step noise start -> end, BasicGuider (no CFG)
+        smp = g.add("lcm", "SamplerLCM", "Sampler LCM", s_noise=_num(im.get("lcm_start", 1.1), "LCM noise start", 0, 64),
+                    s_noise_end=_num(im.get("lcm_end", 0.9), "LCM noise end", 0, 64),
+                    noise_clip_std=_num(im.get("lcm_clip", 0.0), "LCM noise clip", 0, 10))
+        sigmas = g.add("sched", "BasicScheduler", "BasicScheduler", model=model, scheduler=sched, steps=steps, denoise=1.0)
+        noise = g.add("noise", "RandomNoise", "RandomNoise", noise_seed=seed)
+        guider = g.add("guider", "BasicGuider", "BasicGuider", model=model, conditioning=_out(cond, 0))
+        sampler = g.add("sampler", "SamplerCustomAdvanced", "Sample", noise=noise, guider=guider, sampler=smp,
+                        sigmas=sigmas, latent_image=_out(cond, 1))
+    else:
+        if im.get("sampler_kind", "lcm") == "lcm":
+            warnings.append("This ComfyUI has no Sampler LCM node, so the picture is sampled with euler. Update ComfyUI.")
+        neg = g.add("neg", "ConditioningZeroOut", "Negative (none)", conditioning=_out(cond, 0))
+        sampler = g.add("sampler", "KSampler", "Sample", model=model, positive=_out(cond, 0), negative=neg,
+                        latent_image=_out(cond, 1), seed=seed, steps=steps, cfg=float(im.get("cfg", 1.0)),
+                        sampler_name=str(im.get("sampler") or "euler"), scheduler=sched, denoise=1.0)
+    images = g.add("decode", "VAEDecode", "VAE Decode", samples=_out(sampler, 0), vae=vae)
     stem = re.sub(r"[^A-Za-z0-9_-]+", "_", str(item.get("name") or "picture")).strip("_")[:60] or "picture"
     prefix = images_subfolder(project)
-    g.add("save", "SaveImage", f"Save {stem}", images=images, filename_prefix=f"{prefix}/{stem}")
+    if im.get("format") == "avif" and env.has("SaveImageAdvanced"):
+        g.add("save", "SaveImageAdvanced", f"Save {stem} (AVIF)", images=images, filename_prefix=f"{prefix}/{stem}",
+              format="avif", **{"format.bit_depth": "auto", "format.input_color_space": "sRGB",
+                                "format.crf": int(_num(im.get("avif_crf", 18), "AVIF quality", 1, 63, int)),
+                                "format.save_mode": "still images"})
+    else:
+        g.add("save", "SaveImage", f"Save {stem}", images=images, filename_prefix=f"{prefix}/{stem}")
     nodes = {"sampler": "sampler", "save": "save", "longshot": "sampler", "combine": "decode", "cond": "cond"}
     if expand:
         nodes["expand"] = "pe_text"

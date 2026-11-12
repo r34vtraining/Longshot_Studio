@@ -136,7 +136,9 @@ const DEFAULT_SETTINGS = {
   // 0.20.0: Images (MiniMax-H3-Image, ComfyUI 0.44.0+): the picture model, its VAE, and the optional
   // Qwen3.5 prompt expander; the text encoder is the video one (settings.clip)
   image: { model: "", vae: "", expander: "", steps: 6, cfg: 1, sampler: "euler", scheduler: "simple",
-    megapixels: 8, aspect: "1:1", keep: 20,
+    megapixels: 4, aspect: "1:1", keep: 20,
+    // 0.22.0 (H3-Image, after n8te0's 20 MP workflow): LCM with per-step noise 1.1 -> 0.9; expander thinking; AVIF
+    sampler_kind: "lcm", lcm_start: 1.1, lcm_end: 0.9, lcm_clip: 0, pe_thinking: false, format: "png", avif_crf: 18,
     // 0.21.0: the engine. "video" (default): the H3 video model from Settings renders a tiny clip and
     // its middle frame is the picture; "h3image": MiniMax-H3-Image (the 0.20.0 engine)
     engine: "video", frames: 22, tail: "", upscale: false, scale: 2, quality: "ULTRA", vmp: 1, vaspect: "16:9",
@@ -203,6 +205,10 @@ function normalize(p) {
     context_from: s.context_from || null,     // Context: the take of the Shot before it was rendered from
     context_at: Number.isFinite(Number(s.context_at)) && s.context_at !== null ? Number(s.context_at) : null,   // 0.17.11: its frame (back from the end)
     kind: s.kind === "clip" ? "clip" : "shot",
+    // 0.23.0: notes pinned to a moment of a take: {id, take, t (s into the Shot as shown), text, done, made}
+    notes: (Array.isArray(s.notes) ? s.notes : []).filter((n) => n && String(n.text || "").trim()).map((n) => ({
+      id: n.id || uid("n"), take: n.take || null, t: Math.max(0, Number(n.t) || 0), text: String(n.text).slice(0, 2000),
+      done: !!n.done, made: Number(n.made) || Date.now() })),
     // 0.9.0: trims and move on the film, in frames (non-destructive)
     place: s.place && typeof s.place === "object" && (s.place.in || s.place.out || s.place.shift)
       ? { in: Math.max(0, Math.round(Number(s.place.in) || 0)), out: Math.max(0, Math.round(Number(s.place.out) || 0)),
@@ -598,6 +604,7 @@ function filmSpan(s) {
 function contextBack(x) {
   if (!x || x.join !== "context" || x.kind === "clip") return 0;
   const act = active(), i = act.findIndex((y) => y.id === x.id), pv = i > 0 ? act[i - 1] : null;
+  if (pv && pv.cutaway && !x.cutaway) return 0;     // 0.22.1: after a cutaway: the last frame of the Shot before it
   const Lp = pv && LAYOUT.byId[pv.id], sp = pv && shownSpan(pv);
   if (!Lp || !sp) return 0;
   return Math.max(0, (Lp.we + effEdit(pv).shift) - sp.b);
@@ -2079,7 +2086,9 @@ function enqueue(specs, takes = 1, checked = false) {
 
 // 0.17.46: before a render, the <tags> in the prompts of the Shots it renders are matched
 // with the reference cards: a tag whose card is bypassed (or that no card has) is asked about.
-const TAG_SKIP = new Set(["d"]);                       // <d>…</d> dialogue
+// <d>…</d> dialogue; 0.23.0: MiniMax's own tokens (a line across a cut, a line cut off at the end)
+const TAG_SKIP = new Set(["d", "scenetrans", "cutoff"]);
+const TAG_SKIP_RE = /^subject\s+\d+$/i;                // <Subject N>: the official format's subject labels
 const tagOf = (label) => { const m = String(label || "").match(/<[^<>]+>/); return (m ? m[0] : "<" + String(label || "").trim() + ">").toLowerCase(); };
 function refCards() {
   const p = P(), out = [];
@@ -2101,7 +2110,7 @@ function refProblems(ids, forced = new Set()) {
     if (!s || s.bypassed || s.kind === "clip" || (isRendered(s) && !forced.has(s.id))) continue;   // kept takes don't sample
     for (const m of String(s.text || "").matchAll(/<\s*([^<>\/][^<>]*?)\s*>/g)) {
       const inner = m[1], key = ("<" + inner + ">").toLowerCase();
-      if (TAG_SKIP.has(inner.toLowerCase())) continue;
+      if (TAG_SKIP.has(inner.toLowerCase()) || TAG_SKIP_RE.test(inner)) continue;
       let why = null, x = byTag.get(key);
       const num = inner.match(/^(picture|video|audio)\s+(\d+)$/i);
       if (x) { if (x.card.bypassed) why = "off"; }
@@ -2125,11 +2134,19 @@ function refCheck(specs, takes) {
     else { ids.push(sp.target); forced.add(sp.target); }
   }
   if (!ids.length || !P()) return false;
-  const probs = refProblems([...new Set(ids)], forced);
+  // 0.23.0: Shots in a group with pinned references are checked against that set
+  const byPin = new Map();
+  for (const id of new Set(ids)) { const k = pinnedSetFor(id); if (!byPin.has(k)) byPin.set(k, []); byPin.get(k).push(id); }
+  const probs = [];
+  for (const [set, list] of byPin) {
+    const found = withRefs(set, () => refProblems(list, forced));
+    for (const f of found) { if (set) { f.pinned = true; if (f.why === "off") f.why = "pinoff"; } probs.push(f); }
+  }
   if (!probs.length) return false;
   const shotsTxt = (f) => f.shots.map((id) => titleOf(shotById(id))).join(", ");
   const on = { picture: liveCast().length, video: liveVideos().length, audio: videoAudioCount() + songSlot() + liveVoices().length };
-  const lines = probs.map((f) => f.why === "off" ? `${f.tag} is bypassed (${f.what}) · in ${shotsTxt(f)}`
+  const lines = probs.map((f) => f.why === "pinoff" ? `${f.tag} isn't in that group's pinned references (📌) · in ${shotsTxt(f)}`
+    : f.why === "off" ? `${f.tag} is bypassed (${f.what}) · in ${shotsTxt(f)}`
     : f.why === "count" ? `${f.tag}: only ${on[f.kind.toLowerCase()]} ${f.kind.toLowerCase()} reference${on[f.kind.toLowerCase()] === 1 ? " is" : "s are"} on · in ${shotsTxt(f)}`
       : `${f.tag}: no reference card has this label · in ${shotsTxt(f)}`);
   const off = probs.filter((f) => f.why === "off");
@@ -2845,6 +2862,9 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, f
     undoSeeds = c.undo; claimed = c.seeds;
   }
   let project = sendable(P(), claimed);          // seeds are settled on the whole timeline first
+  // 0.23.0: a group with pinned references renders with them (Cast & Scenes as shown isn't touched)
+  const pinned = pinnedSetFor(target);
+  if (pinned) { const lay = layoutRefs(pinned, project); for (const [kind] of REF_KINDS) project[kind] = lay[kind]; }
   // 0.9.2: the film's own joins, for where each Shot sits on the film (a render may override them)
   project.shots.forEach((x) => { x.film_join = x.join || "bridge"; });
   // 0.17.26: on the film, the Shot after a cutaway starts right after the cutaway (a cut)
@@ -2965,7 +2985,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, f
     promptId: res.prompt_id, kind, target, label, note, baseNote: note, built, onDone, sent, batch, standalone, extra,
     jobId, slug: P().slug, project: P().name,
     of: built.chain.length, segs: {}, segT0: {}, step: 0, phase: "queued", started: Date.now(),
-    refs: refSnapshot(),                             // the references these takes are made with
+    refs: refSnapshot(pinned ? project : P()),       // the references these takes are made with
   };
   keepRun(S.busy);                                   // 0.17.45: a page refresh picks this run up again
   if (kind === "render" || kind === "reroll") S.open = target;
@@ -3230,7 +3250,7 @@ function adoptRows(rows, sent, standalone = false) {
     sh.seed_used = r.seed !== null && r.seed !== undefined ? Number(r.seed) : effSeed(sh);
     if (r.status !== "locked") {
       sh.seed_pending = null;
-      const act = active(), pv = act[act.indexOf(sh) - 1];
+      const act = active(), pv = act.indexOf(sh) > 0 ? mainPrev(act, act.indexOf(sh)) : null;   // 0.22.1: past cutaways
       sh.context_from = sh.join === "context" && pv ? (pv.kind === "clip" ? `clip:${pv.id}` : pv.take || null) : null;
       sh.context_at = sh.context_from ? Number(((sent || {})[sh.id] || {}).back) || 0 : null;   // 0.17.11: which frame of it
     }
@@ -3386,7 +3406,16 @@ async function renderAll(only = null, what = "Render all") {
   }
   const takes = await askMulti(`${what} (${list.length} Shot${list.length > 1 ? "s" : ""})`);
   if (!takes) return;
-  enqueue({ type: "all", ids: list.map((x) => x.id), what: only ? what : undefined }, takes);
+  // 0.23.0: Shots in a group with pinned references render in a run of their own (one set of
+  // references per run), in film order; each run continues from the takes the one before made
+  const runs = [];
+  for (const x of list) {
+    const k = x.group && pinnedSetFor(x.id) ? x.group : "";
+    if (!runs.length || runs[runs.length - 1].k !== k) runs.push({ k, ids: [] });
+    runs[runs.length - 1].ids.push(x.id);
+  }
+  if (runs.length > 1) toast(`${what}: ${runs.length} runs, one per set of references (groups with 📌 pinned references render on their own).`);
+  enqueue(runs.map((r) => ({ type: "all", ids: r.ids, what: only ? what : r.k ? `${groupById(r.k).name}` : undefined })), takes);
 }
 
 /** ▶ Render odd Shots: Shots 1, 3, 5… not rendered yet, each on its own, one
@@ -3714,7 +3743,100 @@ const REF_KINDS = [["cast", "picture", "pictures"], ["videos", "video", "videos"
 function refSnapshot(p = P()) {
   const live = (xs) => JSON.parse(JSON.stringify((xs || []).filter((x) => !x.bypassed)));
   // 0.16.0: and the Style & Sound text, so Restore all can put it back
-  return { cast: live(p.cast), videos: live(p.videos), voices: live(p.voices), refmods: live(p.refmods), style: JSON.parse(JSON.stringify(p.style || {})) };
+  // 0.23.0: and every card's place (on or off), by id and file, so Restore all puts them back in order
+  const layout = {};
+  for (const [kind] of REF_KINDS) layout[kind] = (p[kind] || []).map((x) => ({ id: x.id, key: refKey(kind, x), on: !x.bypassed }));
+  return { cast: live(p.cast), videos: live(p.videos), voices: live(p.voices), refmods: live(p.refmods), style: JSON.parse(JSON.stringify(p.style || {})), layout };
+}
+/** 0.23.0: a Shot's group's pinned references (the set recorded by 📌), or null. */
+function pinnedSetFor(id) {
+  const s = id && shotById(id), g = s && s.group ? groupById(s.group) : null;
+  return g && g.refs && g.refs.set ? g.refs.set : null;
+}
+/** Run fn with the project's cards laid out as `set` (nothing is saved or drawn meanwhile). */
+function withRefs(set, fn) {
+  const p = P();
+  if (!set) return fn();
+  const keep = {};
+  for (const [kind] of REF_KINDS) keep[kind] = p[kind];
+  const lay = layoutRefs(set, p);
+  for (const [kind] of REF_KINDS) p[kind] = lay[kind];
+  try { return fn(); } finally { for (const [kind] of REF_KINDS) p[kind] = keep[kind]; }
+}
+async function groupRefsDialog(g) {
+  const p = P(), pin = g.refs && g.refs.set;
+  const listOf = (set) => REF_KINDS.map(([kind, one, many]) => {
+    const xs = (set[kind] || []);
+    return xs.length ? `<li><b>${xs.length} ${xs.length === 1 ? one : many}</b>: ${xs.map((x) => esc(restoreName(kind, x))).join(", ")}</li>` : "";
+  }).join("");
+  if (!pin) {
+    const now = refSnapshot(p);
+    const ok = await confirmBox({ title: `Pin references to ${g.name}?`, html: true, yes: "Pin", no: "Cancel",
+      body: `<p>${esc(g.name)}'s Shots will always render with what's switched on in Cast &amp; Scenes now, in this order:</p><ul class="restore-refs-list">${listOf(now) || "<li>nothing switched on</li>"}</ul>` +
+        `<p class="muted small" style="margin-top:8px">Your Cast &amp; Scenes switches aren't changed by renders. Edits to these cards (descriptions, pictures) still count; a card you delete comes back for this group from the record. Render all renders each group with pinned references in a run of its own.</p>` });
+    if (!ok) return;
+    g.refs = { set: now, at: Date.now() };
+    commit();
+    toast(`${g.name} renders with its own references now.`);
+    return;
+  }
+  const ans = await confirmBox({ title: `${g.name}'s references`, html: true, yes: "Show them in Cast & Scenes", alt: "Pin what's on now", no: "Close",
+    body: `<p>Its Shots render with these, in this order:</p><ul class="restore-refs-list">${listOf(pin) || "<li>nothing</li>"}</ul>` +
+      `<p class="muted small" style="margin-top:8px"><b>Show them in Cast &amp; Scenes</b> switches the cards to this set (deleted ones come back). <b>Pin what's on now</b> replaces the set with what's switched on in Cast &amp; Scenes.</p>` +
+      `<p style="margin-top:8px"><button class="ghost sm" data-action="group-unpin" data-group="${esc(g.id)}">✕ Unpin: use Cast &amp; Scenes as it is</button></p>` });
+  if (ans === true) {
+    const lay = layoutRefs(pin, p);
+    for (const [kind] of REF_KINDS) p[kind] = lay[kind];
+    normalize(p);
+    refChangedQuietly("Cast & Scenes");
+    commit();
+    toast(`Cast & Scenes shows ${g.name}'s references.`);
+  } else if (ans === "alt") {
+    g.refs = { set: refSnapshot(p), at: Date.now() };
+    commit();
+    toast(`${g.name}'s references are pinned again from Cast & Scenes.`);
+  }
+}
+
+/** 0.23.0: what a card is, apart from its id: its file (or a RefMod's name). */
+function refKey(kind, x) {
+  if (!x) return "";
+  if (kind === "refmods") return "m:" + (x.name || "");
+  const f = kind === "cast" ? x.image : x.file;
+  return f ? `${kind}:${String(x.subfolder || "").replace(/\\/g, "/")}/${f}` : "";
+}
+/** 0.23.0: a recorded set laid out on the cards as they are now. Each recorded card is found by id,
+ *  else by its file (a card deleted and added again), else brought back from the record; the cards
+ *  keep the recorded order and on/off; cards not in the record stay, switched off, at the end. */
+function layoutRefs(set, cur) {
+  const out = {};
+  for (const [kind] of REF_KINDS) {
+    const now = (cur[kind] || []).slice(), used = new Set();
+    const pick = (id, key) => {
+      let x = now.find((c) => !used.has(c) && c.id === id);
+      if (!x && key) x = now.find((c) => !used.has(c) && refKey(kind, c) === key);
+      if (x) used.add(x);
+      return x || null;
+    };
+    const recorded = new Map((set[kind] || []).map((x) => [x.id, x]));
+    const list = [];
+    const order = set.layout && set.layout[kind] ? set.layout[kind]
+      : (set[kind] || []).map((x) => ({ id: x.id, key: refKey(kind, x), on: true }));
+    for (const e of order) {
+      const rec = recorded.get(e.id);
+      const live = pick(e.id, e.key || (rec ? refKey(kind, rec) : ""));
+      if (e.on) {
+        // its card as recorded (edits since are undone, as before), on the live card's id if it was re-added
+        const card = JSON.parse(JSON.stringify(rec || live || null));
+        if (!card) continue;
+        if (live) card.id = live.id;
+        list.push(Object.assign(card, { bypassed: false }));
+      } else if (live) list.push(Object.assign({}, live, { bypassed: true }));
+    }
+    for (const x of now) if (!used.has(x)) list.push(Object.assign({}, x, { bypassed: true }));
+    out[kind] = list;
+  }
+  return out;
 }
 
 function refSetKey(set) {
@@ -3756,27 +3878,15 @@ const STYLE_NAMES = { summary: "Summary", task_types: "Task types", retention: "
  *  become exactly that take's references (in its order, edits undone; the others are
  *  bypassed, which takes no reference slot), and Style & Sound its text (takes made from
  *  0.16.0 on remember it). The Shots' prompts, Audio and Settings aren't touched. */
-async function restoreRefs(s) {
+async function restoreRefs(s, pinGroup = null) {
   if (!s || setupGuard()) return;
-  const set = refSetFor(s);
+  let set = refSetFor(s);
+  // 0.23.0: a group with pinned references: those, with the take's Style & Sound text
+  if (pinGroup && pinGroup.refs && pinGroup.refs.set) set = Object.assign({}, pinGroup.refs.set, set && set.style ? { style: set.style } : { style: null });
   if (!set) { toast(`${titleOf(s)}'s take was made before 0.8.13, so what it was made with wasn't recorded.`); return; }
-  const p = P(), changes = [], plan = {};
-  for (const [kind] of REF_KINDS) {
-    const want = (set[kind] || []).map((x) => Object.assign(JSON.parse(JSON.stringify(x)), { bypassed: false }));
-    const ids = new Set(want.map((x) => x.id));
-    // the take's references in its order (so the <Picture N> labels match); the others
-    // keep their place after the reference that came before them, bypassed
-    const groups = new Map([[null, []]]);
-    let anchor = null;
-    for (const x of p[kind] || []) {
-      if (ids.has(x.id)) { anchor = x.id; continue; }
-      if (!groups.has(anchor)) groups.set(anchor, []);
-      groups.get(anchor).push(Object.assign({}, x, { bypassed: true }));
-    }
-    const out = [...groups.get(null)];
-    for (const item of want) out.push(item, ...(groups.get(item.id) || []));
-    plan[kind] = out;
-  }
+  const p = P(), changes = [];
+  // 0.23.0: by id, else by file, in the recorded order (deleted cards come back)
+  const plan = layoutRefs(set, p);
   // compare with the cards as they'll be once loaded (defaults filled in), so only real
   // differences are listed
   const after = JSON.parse(JSON.stringify(p));
@@ -3784,7 +3894,9 @@ async function restoreRefs(s) {
   normalize(after);
   const same = (a, b) => JSON.stringify(Object.assign({}, a, { bypassed: false })) === JSON.stringify(Object.assign({}, b, { bypassed: false }));
   for (const [kind, one] of REF_KINDS) {
-    const cur = p[kind] || [], ids = new Set((set[kind] || []).map((x) => x.id));
+    const cur = p[kind] || [], ids = new Set(plan[kind].filter((x) => !x.bypassed).map((x) => x.id));
+    const moved = JSON.stringify(cur.map((x) => x.id)) !== JSON.stringify(plan[kind].map((x) => x.id).filter((id) => cur.some((c) => c.id === id)));
+    if (moved) changes.push(`${one}s · put back in the order they had`);
     for (const item of after[kind].filter((x) => ids.has(x.id))) {
       const ex = cur.find((x) => x.id === item.id);
       if (!ex) changes.push(`${one} <b>${esc(restoreName(kind, item))}</b> · added again`);
@@ -6196,7 +6308,7 @@ function shotRowHTML(s) {
     : `<button class="sdot sdot-play" data-action="render-alone"${aloneOff ? " disabled" : ""}
       title="Render ${title} · ${chipName(s)}: ${esc(CHIP_HELP[chipKey(s)])}" aria-label="Render ${title} (${chipName(s)})">▶</button>`;
   // the join chip: how ▶ renders it, from the rendered Shots next to it
-  const actR = active(), prevR = !s.bypassed ? actR[actR.indexOf(s) - 1] : null;
+  const actR = active(), prevR = !s.bypassed && actR.indexOf(s) > 0 ? mainPrev(actR, actR.indexOf(s)) : null;   // 0.22.1: past cutaways
   const cj = chipJoin(s), opts = chipOptions(s);
   const icon = { bridge: chipSides(s).prev || !chipSides(s).next ? "↔" : "↘", lead: "↘", bridgeIn: "↔", cutaway: "↪", from: "→", context: "⧉", cut: "|" }[cj];
   const joinChip = !s.bypassed && s.kind !== "clip"
@@ -6219,7 +6331,7 @@ function shotRowHTML(s) {
           <span class="smeta">${isEmptyShot(s) ? `${(Number(s.seconds) || 0).toFixed(2)}s · <span class="hold-tag" title="No prompt: it holds its time on the film and never renders. Moving the Shot next to it makes it longer or shorter.">holds time</span>`
             : `${esc(s.seconds)}s · seed ${esc(seed)}`}${songSpanHTML(s)}${editTag(s)}${overlapTag(s)}${alignedTag(s)}${sizeTag(s)}</span></span>
           <span class="sprev">${esc(s.text) || '<i class="muted">empty</i>'}</span></span>
-          <span class="snotes">${flag}${cut}${standaloneTag}${ctxFlag}
+          <span class="snotes">${flag}${cut}${standaloneTag}${ctxFlag}${(() => { const n = (s.notes || []).filter((x) => !x.done).length; return n ? `<span class="flag" title="${n} open note${n === 1 ? "" : "s"} on this Shot (open the card to see them)">📝 ${n}</span>` : ""; })()}
           <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span></span>
         </button>
         <div class="shot-tools">
@@ -6369,7 +6481,8 @@ function inGroupAt(p, s) {
  *  a group with no Shots is gone. */
 function normalizeGroups(p) {
   p.groups = (Array.isArray(p.groups) ? p.groups : []).filter((g) => g && g.id)
-    .map((g) => ({ id: String(g.id), name: String(g.name || "Group").slice(0, 80) }));
+    .map((g) => Object.assign({ id: String(g.id), name: String(g.name || "Group").slice(0, 80) },
+      g.refs && typeof g.refs === "object" && g.refs.set ? { refs: g.refs } : {}));      // 0.23.0: its own references
   const known = new Set(p.groups.map((g) => g.id)), seen = new Set();
   let prev = null;
   for (const s of p.shots) {
@@ -6457,6 +6570,10 @@ function groupHeadHTML(g, open) {
       title="${nAgain ? "Queue one more set: these Shots render again after the set that's queued, each with a new seed" : "Render the Shots in this group that aren't rendered yet, each continued from the Shot before it"}">▶ Render group${nNew ? ` (${nNew})` : nAgain ? ` again (${nAgain})` : ""}</button>
     ${(() => { const src = groupRefSource(g.id); return `<button class="ghost sm" data-action="group-restore"${src ? "" : " disabled"}
       title="${src ? `Put back the Style & Sound text and the Cast & Scenes references this group was rendered with (from ${esc(titleOf(src))}'s take)` : "Render a Shot in this group first: its take records the prompt and references it was made with"}">Restore prompt & references</button>`; })()}
+    ${(() => { const pin = g.refs && g.refs.set, n = pin ? (pin.cast || []).length + (pin.videos || []).length + (pin.voices || []).length + (pin.refmods || []).length : 0;
+      return `<button class="ghost sm group-pin${pin ? " on" : ""}" data-action="group-refs"
+      title="${pin ? `This group renders with its own ${n} reference${n === 1 ? "" : "s"} (pinned ${esc(new Date(g.refs.at || 0).toLocaleString())}), whatever is switched on in Cast &amp; Scenes. Click to see them, show them in Cast &amp; Scenes, pin again or unpin.`
+        : "Pin the references switched on in Cast &amp; Scenes now (with their order) to this group: its Shots then always render with them, Render all included."}">📌 ${pin ? `References (${n})` : "Pin references"}</button>`; })()}
     <button class="ghost sm" data-action="group-rename" title="Rename this group">✎</button>
     <button class="ghost sm group-bypass${gOff ? " on" : ""}" data-action="group-bypass" aria-pressed="${gOff}" title="${gOff ? "Turn this group's Shots back on" : "Bypass every Shot in this group (they leave the film and the renders; nothing is deleted)"}" aria-label="${gOff ? "Turn the group back on" : "Bypass the group"}">${POWER}</button>
     <button class="ghost sm" data-action="group-ungroup" title="Remove the folder; the Shots stay as they are">Ungroup</button>
@@ -6730,6 +6847,7 @@ function renderShotsNow() {
           <button class="ghost sm" data-action="wrap" data-before="&quot;" data-after="&quot;">Wrap "on-screen text"</button>
           ${canReroll ? '<button class="ghost sm" data-action="reroll-shot">⟳ Reroll this Shot</button>' : ""}
         </div>
+        ${notesHTML(s)}
         <div class="shot-opts shot-more">
           ${takes}
           <span class="push"></span>
@@ -6897,6 +7015,8 @@ function renderViewer() {
   $("loop").setAttribute("aria-pressed", S.loop && !!L);
   $("loop").disabled = !has || !L;
   $("frame-ref").disabled = !has;
+  $("note-add").disabled = !has;
+  drawNoteMarks();
   const hasFile = !!(lo && lo.video);
   // Open output folder always works (local only): the latest video, else the clips folder
   for (const el of document.querySelectorAll('[data-which="output"]')) {
@@ -8954,7 +9074,13 @@ document.addEventListener("click", async (e) => {
     }
     case "group-restore": {
       const g = groupById(el.closest("[data-group]").dataset.group), src = g && groupRefSource(g.id);
-      if (src) restoreRefs(src);
+      if (src) restoreRefs(src, g && g.refs && g.refs.set ? g : null);
+      break;
+    }
+    case "group-refs": { const g = groupById(el.closest("[data-group]").dataset.group); if (g) groupRefsDialog(g); break; }   // 0.23.0
+    case "group-unpin": {
+      const g = groupById(el.dataset.group);
+      if (g) { delete g.refs; confirmDone(false); commit(); toast(`${g.name} renders with Cast & Scenes as it is again.`); }
       break;
     }
     case "group-delete": { const g = groupById(el.closest("[data-group]").dataset.group); if (g) groupDelete(g); break; }
@@ -9171,6 +9297,17 @@ document.addEventListener("click", async (e) => {
     case "lb-fs": lightboxFullscreen(); break;                       // 0.21.3
     case "reroll-shot": rerollShot(shotOf(el)); break;
     case "frame-ref": frameRefMenu(el); break;                       // 0.21.2
+    case "note-add": addNoteHere(); break;                           // 0.23.0
+    case "note-seek": noteSeek(shotOf(el) || shotById(el.dataset.shot), el.dataset.note); break;
+    case "note-done": { const sh = shotOf(el), n = sh && sh.notes.find((x) => x.id === el.dataset.note); if (n) { n.done = !n.done; commit(); } break; }
+    case "note-del": { const sh = shotOf(el); if (sh && await askOK("Delete this note?", "Delete")) { sh.notes = sh.notes.filter((x) => x.id !== el.dataset.note); commit(); } break; }
+    case "note-edit": {
+      const sh = shotOf(el), n = sh && sh.notes.find((x) => x.id === el.dataset.note);
+      if (!n) break;
+      const v = await askText(`Note on ${titleOf(sh)} at ${fmt(n.t)}`, n.text);
+      if (v !== null && v.trim()) { n.text = v.trim().slice(0, 2000); commit(); }
+      break;
+    }
     case "frame-ref-to": closeFrameMenu(); frameToRef(el.dataset.to); break;
     case "use-seed": useSeed(shotOf(el), Number(el.dataset.seed)); break;
     case "shot-seed-step": stepShotSeed(shotOf(el), Number(el.dataset.d) || 0); break;
@@ -9852,6 +9989,7 @@ document.addEventListener("keydown", (e) => {
     toggleMute();
   }
   else if (e.key === "f" || e.key === "F") { e.preventDefault(); toggleFullscreen(); }
+  else if (e.key === "n" || e.key === "N") { e.preventDefault(); addNoteHere(); }        // 0.23.0
   else if (e.key === "t" || e.key === "T") { e.preventDefault(); setTheater(!S.theater); }
   else if (e.key === " ") {
     e.preventDefault();
@@ -12337,7 +12475,7 @@ function mpList() {
   return stillEngine() ? (o.megapixels && o.megapixels.length ? o.megapixels : [0.5, 0.6, 0.8, 1, 1.2, 1.5, 2]) : (o.image_megapixels || [4, 8, 16]);
 }
 function picMp(pic) {
-  const im = imgSet(), list = mpList(), d = stillEngine() ? Number(im.vmp) : Math.max(4, Number(im.megapixels) || 8);
+  const im = imgSet(), list = mpList(), d = stillEngine() ? Number(im.vmp) : Math.max(4, Number(im.megapixels) || 4);
   // 0.21.3: H3-Image starts at 4 MP: a Picture set lower moves up to 4
   if (!stillEngine() && pic.megapixels && pic.megapixels < 4) return list.includes(4) ? 4 : list[0];
   return list.includes(pic.megapixels) ? pic.megapixels : list.includes(d) ? d : list[Math.floor(list.length / 2)];
@@ -12367,7 +12505,8 @@ function fmtBytes(n) {
 function ipicSize(pic) {
   const im = imgSet();
   const mp = picMp(pic), aspect = picAspect(pic);
-  const fit = (w, h) => { const sc = Math.sqrt(mp * 1024 * 1024 / (w * h)); return [Math.max(32, Math.round(w * sc / 32) * 32), Math.max(32, Math.round(h * sc / 32) * 32)]; };
+  // 0.22.0: H3-Image counts 1 MP as 1,000,000 px (its published sizes); the video sizes come from Settings' table
+  const fit = (w, h) => [Math.max(32, Math.round(Math.sqrt(w / h * mp * 1e6) / 32) * 32), Math.max(32, Math.round(Math.sqrt(h / w * mp * 1e6) / 32) * 32)];
   if (stillEngine()) {          // the video sizes (Settings' table); an edited picture is only a reference here
     const t = ((S.opts || {}).sizes || {})[`${mp}|${aspect}`];
     const [a, b] = aspect.split(":").map(Number);
@@ -12670,6 +12809,7 @@ function renderIpreview() {
 
 function renderIset() {
   const im = imgSet(), o = S.opts || {}, open = !!S.isetOpen, still = stillEngine(), vs = P().settings;
+  const lcm = im.sampler_kind !== "ksampler";
   const miss = still ? missingModels(P()) : imageFileRows(true).filter((r) => !r.optional || im.expander || ipics().some((x) => x.expand));
   $("iset-summary").textContent = open ? "" : miss.length ? `${miss.length} file${miss.length > 1 ? "s" : ""} missing`
     : still ? `video model · ${im.frames || 22} frames · ${im.vmp} MP ${im.vaspect}${im.upscale ? ` · RTX ×${im.scale}` : ""}`
@@ -12733,12 +12873,27 @@ function renderIset() {
       <label class="lbl">Default size <select data-iset="megapixels">${(o.image_megapixels || [4, 8, 16]).map((m) => `<option value="${m}"${Math.max(4, im.megapixels) === m ? " selected" : ""}>${m} MP</option>`).join("")}</select></label>
       <label class="lbl">Default aspect <select data-iset="aspect">${(o.aspects || ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9"]).map((a) => `<option value="${a}"${im.aspect === a ? " selected" : ""}>${a}</option>`).join("")}</select></label>
       <label class="lbl">Steps <input type="number" min="1" max="100" step="1" data-iset="steps" value="${im.steps}"></label>
-      <label class="lbl" title="1: no guidance (the model's own schedule; its template uses 1)">CFG <input type="number" min="1" max="10" step="0.1" data-iset="cfg" value="${im.cfg}"></label>
-      <label class="lbl">Sampler <select data-iset="sampler">${fileOptions(o.samplers && o.samplers.length ? o.samplers : ["euler"], im.sampler, "")}</select></label>
       <label class="lbl">Scheduler <select data-iset="scheduler">${fileOptions(o.schedulers && o.schedulers.length ? o.schedulers : ["simple"], im.scheduler, "")}</select></label>
-      <label class="lbl" title="Older results beyond this are dropped from the list (their files stay in the images folder)">Results kept per Picture <input type="number" min="1" max="200" step="1" data-iset="keep" value="${im.keep}"></label>
+      <label class="lbl" title="Older results beyond this are dropped from the list (their files stay in the images folder)">Results kept <input type="number" min="1" max="200" step="1" data-iset="keep" value="${im.keep}"></label>
     </div>
-    <div class="muted small" style="margin-top:10px">MiniMax-H3-Image works from about 4 MP up and is best near 16 MP (4096 × 4096); under 4 MP it loses detail. ComfyUI's template: 6 steps, cfg 1, euler / simple. The text encoder is the one the video renders use. 16 MP needs more VRAM and time than a video Shot.</div>`;
+    <div class="lbl" style="margin-top:12px">Sampler
+      <div class="seg seg-sm iseg" role="group" aria-label="Sampler">
+        <button data-action="iset-sampler" data-v="lcm" aria-pressed="${lcm}" title="Sampler LCM with per-step noise (n8te0's 20 MP workflow): cleaner pictures">LCM · noise ${esc(im.lcm_start)} → ${esc(im.lcm_end)}</button>
+        <button data-action="iset-sampler" data-v="ksampler" aria-pressed="${!lcm}" title="KSampler, as ComfyUI's own template (euler, cfg 1)">KSampler (template)</button>
+      </div></div>
+    <div class="grid3" style="margin-top:8px">
+      ${lcm ? `<label class="lbl" title="Per-step noise at the first step (1 = as trained)">Noise start <input type="number" min="0" max="4" step="0.05" data-iset="lcm_start" value="${esc(im.lcm_start)}"></label>
+      <label class="lbl" title="Per-step noise at the last step">Noise end <input type="number" min="0" max="4" step="0.05" data-iset="lcm_end" value="${esc(im.lcm_end)}"></label>
+      <label class="lbl" title="Clamp the added noise to ± this many standard deviations; 0: off">Noise clip <input type="number" min="0" max="10" step="0.1" data-iset="lcm_clip" value="${esc(im.lcm_clip)}"></label>`
+      : `<label class="lbl" title="1: no guidance (the model's own schedule; its template uses 1)">CFG <input type="number" min="1" max="10" step="0.1" data-iset="cfg" value="${im.cfg}"></label>
+      <label class="lbl">Sampler <select data-iset="sampler">${fileOptions(o.samplers && o.samplers.length ? o.samplers : ["euler"], im.sampler, "")}</select></label>`}
+    </div>
+    <div class="grid3" style="margin-top:8px">
+      <label class="lbl" title="The prompt expander's thinking pass (n8te0's workflow has it off: faster)"><span class="lbl-row"><input type="checkbox" data-iset="pe_thinking"${im.pe_thinking ? " checked" : ""}> Expander thinks first</span></label>
+      <label class="lbl" title="PNG: lossless, works everywhere in the Studio. AVIF: much smaller files (CRF); the Studio's thumbnails and using one as a reference need Pillow with AVIF support">File <select data-iset="format"><option value="png"${im.format !== "avif" ? " selected" : ""}>PNG</option><option value="avif"${im.format === "avif" ? " selected" : ""}>AVIF</option></select></label>
+      ${im.format === "avif" ? `<label class="lbl" title="Lower: better quality, bigger file">AVIF CRF <input type="number" min="1" max="63" step="1" data-iset="avif_crf" value="${esc(im.avif_crf)}"></label>` : ""}
+    </div>
+    <div class="muted small" style="margin-top:10px">MiniMax-H3-Image works from about 4 MP up to 20 MP (1 MP = 1,000,000 px), in one pass, no upscale; under 4 MP it loses detail. 20 MP needs a lot of VRAM and time. The prompt expander takes any Qwen file (Qwen3.5-9B, or Qwen3.8-27B as in n8te0's workflow). The text encoder is the one the video renders use.</div>`;
 }
 
 // --- actions ---------------------------------------------------------------------
@@ -12897,6 +13052,7 @@ async function imagesAction(a, el, e) {
     case "iref-view": openRefView(el.dataset.id); return;          // 0.21.10
     case "ipic-fold": if (pic) { pic.folded = !pic.folded; commit(); } return;
     case "ipic-fold-all": { const all = ipics().length && ipics().every((x) => x.folded); ipics().forEach((x) => { x.folded = !all; }); commit(); return; }
+    case "iset-sampler": imgSet().sampler_kind = el.dataset.v === "ksampler" ? "ksampler" : "lcm"; commit(); return;
     case "iset-engine": imgSet().engine = el.dataset.v === "h3image" ? "h3image" : "video"; commit(); return;
     case "iset-dl": dlStart(el.dataset.key); return;
     case "iset-dl-stop": dlStart(el.dataset.key, true); return;
@@ -13011,6 +13167,12 @@ function imagesChange(el) {
     else if (k === "frames") im.frames = [5, 22, 39].includes(Number(v)) ? Number(v) : 22;
     else if (k === "tail") im.tail = v.trim();
     else if (k === "style_line") im.style_line = v.trim();
+    else if (k === "lcm_start") im.lcm_start = num(0, 4, 1.1);
+    else if (k === "lcm_end") im.lcm_end = num(0, 4, 0.9);
+    else if (k === "lcm_clip") im.lcm_clip = num(0, 10, 0);
+    else if (k === "pe_thinking") im.pe_thinking = !!el.checked;
+    else if (k === "format") im.format = v === "avif" ? "avif" : "png";
+    else if (k === "avif_crf") im.avif_crf = num(1, 63, 18, true);
     else if (k === "summary") im.summary = v.trim();
     else if (k === "upscale") im.upscale = !!el.checked;
     else if (k === "scale") im.scale = num(1, 4, 2);
@@ -13408,6 +13570,57 @@ function imageUpDone(b, outputs) {
   IMG.pic = pic.id;
   scheduleSave();
   toast(`Upscaled ×${x.scale}: ${file.filename}`, { label: "Show", fn: () => { setMode("images"); IMG.pic = pic.id; pic.current = k; render(); } });
+}
+
+// ---------------------------------------------------------------------------
+// 0.23.0: notes on a take, pinned to a moment. Kept on the Shot (so in the project file and the
+// API's GET /longshot/projects/<slug>), each with the take it was written about; ticked when fixed.
+// ---------------------------------------------------------------------------
+async function addNoteHere() {
+  if (!P()) return;
+  if (PL.playing) pausePlayer();
+  const e = TL.entries[PL.k], sh = e && shotById(e.id);
+  if (!sh || sh.kind === "clip") { toast("Move to a Shot on the timeline first."); return; }
+  const t = Math.max(0, Math.min(e.dur || 0, tlTime() - e.start));
+  const v = await askText(`Note on ${titleOf(sh)} at ${fmt(t)}${sh.take ? "" : " (not rendered yet)"}`, "");
+  if (v === null || !v.trim()) return;
+  sh.notes.push({ id: uid("n"), take: sh.take || null, t: Math.round(t * 1000) / 1000, text: v.trim().slice(0, 2000), done: false, made: Date.now() });
+  commit();
+  toast(`Note added to ${titleOf(sh)} at ${fmt(t)}.`);
+}
+function noteSeek(sh, id) {
+  const n = sh && sh.notes.find((x) => x.id === id);
+  const e = n && TL.entries.find((x) => x.id === sh.id);
+  if (!e) return;
+  if (n.take && n.take !== sh.take) toast("That note was written about an earlier take; this is where it was in the Shot.");
+  tlSeek(e.start + Math.min(n.t, Math.max(0, (e.dur || 0) - 0.01)));
+}
+function notesHTML(s) {
+  if (!s.notes || !s.notes.length) return "";
+  const open = s.notes.filter((n) => !n.done).length;
+  return `<div class="shot-notes"><div class="muted small">📝 Notes · ${open} open${s.notes.length > open ? ` · ${s.notes.length - open} fixed` : ""}</div>${
+    [...s.notes].sort((a, b) => a.done - b.done || a.t - b.t).map((n) => `<div class="note-row${n.done ? " done" : ""}">
+      <input type="checkbox" data-action="note-done" data-note="${esc(n.id)}"${n.done ? " checked" : ""} title="Fixed" aria-label="Fixed">
+      <button class="linkbtn mono small" data-action="note-seek" data-note="${esc(n.id)}" title="Go to this moment">${fmt(n.t)}</button>
+      <span class="note-text" data-action="note-edit" data-note="${esc(n.id)}" title="Click to edit">${esc(n.text)}</span>
+      ${n.take && n.take !== s.take ? '<span class="muted small" title="Written about an earlier take of this Shot">earlier take</span>' : ""}
+      <button class="icon x" data-action="note-del" data-note="${esc(n.id)}" title="Delete this note" aria-label="Delete note">${CROSS}</button></div>`).join("")}</div>`;
+}
+/** Small marks on the timeline where the current takes have open notes. */
+function drawNoteMarks() {
+  const box = $("tl-notes");
+  if (!box || !P()) return;
+  const total = TL.total || 0;
+  const marks = [];
+  if (total > 0) for (const e of TL.entries) {
+    const sh = shotById(e.id);
+    if (!sh || !sh.notes || !sh.notes.length) continue;
+    for (const n of sh.notes) {
+      if (n.done || (n.take && n.take !== sh.take) || n.t > (e.dur || 0) + 0.05) continue;
+      marks.push(`<button class="tl-note" style="left:${((e.start + n.t) / total * 100).toFixed(3)}%" data-action="note-seek" data-shot="${esc(sh.id)}" data-note="${esc(n.id)}" title="${esc(titleOf(sh) + " · " + fmt(n.t) + " · " + n.text)}"></button>`);
+    }
+  }
+  box.innerHTML = marks.join("");
 }
 
 // 0.21.10: a click on a References picture opens it large (zoom, pan, ← → through the References)

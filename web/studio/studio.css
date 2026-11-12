@@ -1378,3 +1378,15 @@ body.outs-open { padding-right: 332px; }
 .iref-sub .tag { font-family: var(--mono); font-size: 11px; color: var(--amber); flex: none; }
 .iref.off .iref-sub .tag { color: var(--purple); }
 .iref-sub .from { min-width: 0; }
+/* 0.23.0: a group's pinned references */
+.group-pin.on { border-color: #4A8FD6; color: #9CCBFF; }
+/* 0.23.0: notes on a take */
+.tl-notes { position: absolute; left: 0; right: 0; top: 0; height: 0; pointer-events: none; z-index: 6; }
+.tl-note { position: absolute; top: 2px; width: 10px; height: 10px; margin-left: -5px; padding: 0; border-radius: 50% 50% 50% 0;
+  transform: rotate(-45deg); background: #F2C14E; border: 1px solid #1A1408; pointer-events: auto; cursor: pointer; }
+.tl-note:hover { background: #FFD97A; }
+.shot-notes { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border: 1px solid var(--field-line); border-radius: 6px; background: var(--panel); }
+.note-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.note-row .note-text { flex: 1; min-width: 0; cursor: text; }
+.note-row.done .note-text { text-decoration: line-through; color: var(--dim); }
+.note-row input[type=checkbox] { margin: 0; }

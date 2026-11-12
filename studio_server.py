@@ -1518,7 +1518,16 @@ def register(routes=None):
                 continue
             if sh.get("join") != "context" or sh.get("kind") == "clip" or sh.get("lock") or i == 0:
                 continue
-            prev = shots[i - 1]
+            # 0.22.1: a Shot after a cutaway (B-roll) takes the frame of the Shot before the cutaway
+            k = i - 1
+            if not sh.get("cutaway"):
+                while k > 0 and shots[k].get("cutaway"):
+                    k -= 1
+            prev = shots[k]
+            if prev.get("cutaway") and not sh.get("cutaway"):
+                continue                    # only cutaways before it: nothing to take the place from
+            if k != i - 1:
+                sh["context_back"] = 0          # not overlapping the Shot it takes the frame from
             if prev.get("kind") != "clip" and (prev.get("status") == "queued" or not prev.get("take")):
                 if not dry_run:
                     notes.append(f"Shot {i + 1} (Context): the Shot before it has no take yet, so it "

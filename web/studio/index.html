@@ -156,6 +156,7 @@
           <div id="tl-canvas" class="tl-canvas">
             <div id="tl-ruler" class="tl-ruler" aria-hidden="true"></div>
             <div id="loop-band" class="loop-band" hidden></div>
+            <div id="tl-notes" class="tl-notes"></div>
             <div id="ticks"></div>
             <input type="range" id="scrub" aria-label="Scrub" min="0" max="0" step="0.01" value="0">
             <div id="tl-groups" class="tl-groups" aria-hidden="true"></div>
@@ -182,6 +183,7 @@
         <button class="ctl" data-action="step" data-dir="1" aria-label="Next frame">frame ▶</button>
         <button class="ctl" data-action="jump" id="jump">Jump to —</button>
         <button class="ctl" data-action="loop" id="loop" aria-pressed="false" title="Loops the shot under review, starting halfway through the shot before it so you see the seam">⟲ Loop shot + seam</button>
+        <button class="ctl" data-action="note-add" id="note-add" title="A note on this frame of the Shot's take (what's wrong, what to change). Saved with the project, listed on the Shot card, marked on the timeline (N)">📝 Note</button>
         <button class="ctl" data-action="frame-ref" id="frame-ref" title="Send the frame on screen to Cast &amp; Scenes (a new card, bypassed) or to the Images References">📷 Frame → reference</button>
         <button class="ctl folder-btn local-only" data-action="open-folder" data-which="output" title="Open the output folder with this video selected">
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M1.5 4.5v8h13v-6.5h-7l-1.5-1.5z"/></svg>
