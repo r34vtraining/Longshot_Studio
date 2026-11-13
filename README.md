@@ -135,9 +135,7 @@ The token check flagged only an unknown <Nope>.
 | Pack | Needed for |
 |---|---|
 | [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) | prompts (always) |
-| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.7.0+** | rendering, and saving / loading video (always) |
-| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.8.2+** | Face refine and Region refine |
-| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.9.0+** | Face swap (with a ref2va model) |
+| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.9.1+** | Face swap (with a ref2va model) |
 
 ffmpeg is needed (on PATH, or `pip install imageio-ffmpeg` with ComfyUI's Python).
 
