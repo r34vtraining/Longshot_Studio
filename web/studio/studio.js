@@ -119,6 +119,7 @@ const DEFAULT_SETTINGS = {
   turbo: { on: true, lora: "", strength: 1.0 },
   loras: [0, 1, 2].map(() => ({ on: false, name: null, strength: 1.0 })),
   steps: 8, megapixels: 0.6, aspect: "16:9", ref_image_size: "match", ref_resize_px: 1500,
+  context_frame: "soft",            // 0.23.2: the frame a Context / Cutaway Shot gets: soft | full | off
   sampler: "er_sde", scheduler: "beta", overlap: 22, seed: 1722, seed_mode: "increment",
   shift_video: 12, shift_audio: 3, sage_attention: "auto", save_segments: true,
   rtx_vsr: { on: false, scale: 2, quality: "ULTRA", chunk_s: 10 },   // chunk_s: upscale a chunk at a time
@@ -202,9 +203,13 @@ function normalize(p) {
     // 0.17.26: a cutaway (B-roll): rendered like a Context Shot; the Shot after it continues from
     // the Shot before it, as if it weren't there
     cutaway: !!s.cutaway && s.join === "context",
+    // 0.24.0: 180° (shot / reverse shot): a Context Shot whose frame comes from 2 Shots back, the
+    // last Shot on its side of the line
+    alt: !!s.alt && s.join === "context" && !s.cutaway,
     context_from: s.context_from || null,     // Context: the take of the Shot before it was rendered from
     context_at: Number.isFinite(Number(s.context_at)) && s.context_at !== null ? Number(s.context_at) : null,   // 0.17.11: its frame (back from the end)
     kind: s.kind === "clip" ? "clip" : "shot",
+    context_frame: ["soft", "full", "off"].includes(s.context_frame) ? s.context_frame : null,   // 0.23.2: null = the project's
     // 0.23.0: notes pinned to a moment of a take: {id, take, t (s into the Shot as shown), text, done, made}
     notes: (Array.isArray(s.notes) ? s.notes : []).filter((n) => n && String(n.text || "").trim()).map((n) => ({
       id: n.id || uid("n"), take: n.take || null, t: Math.max(0, Number(n.t) || 0), text: String(n.text).slice(0, 2000),
@@ -373,6 +378,15 @@ function mainNext(act, i) {
   while (k < act.length && act[k].cutaway) k++;
   return act[k] || null;
 }
+/** 0.24.0: the Shot a Context Shot takes its frame from: the Shot before it (past cutaways), or
+ *  for a 180° Shot the one before that (2 back, the last Shot on its side of the line). */
+function ctxSource(act, i) {
+  const x = act[i];
+  if (!x || x.join !== "context") return null;
+  const p1 = mainPrev(act, i);
+  if (!x.alt || !p1) return p1;
+  return mainPrev(act, act.indexOf(p1));
+}
 /** The Shot after a cutaway (or a run of them): it picks up from the Shot before the cutaway. */
 const afterCutaway = (s) => { const act = active(), i = act.indexOf(s); return i > 0 && !s.cutaway && !!act[i - 1].cutaway; };
 function chipNear(s) {
@@ -398,7 +412,12 @@ function chipOptions(s) {
   const { prev, next } = chipNear(s);
   const sd = chipSides(s);
   // 0.17.25: Lead in (a fresh start whose end flows into the Shot after) whenever that Shot is rendered
-  if (prev) return sd.next ? ["bridge", "from", "lead", "context", "cutaway", "cut"] : sd.lead ? ["bridge", "bridgeIn", "lead", "context", "cutaway", "cut"] : ["bridge", "context", "cutaway", "cut"];
+  if (prev) {
+    // 0.24.0: 180° when there's a Shot 2 back (past cutaways)
+    const act = active(), two = !s.cutaway ? mainPrev(act, act.indexOf(prev)) : null;
+    const ctx = two ? ["context", "alt"] : ["context"];
+    return sd.next ? ["bridge", "from", "lead", ...ctx, "cutaway", "cut"] : sd.lead ? ["bridge", "bridgeIn", "lead", ...ctx, "cutaway", "cut"] : ["bridge", ...ctx, "cutaway", "cut"];
+  }
   if (next) return sd.lead ? ["lead", "cut"] : ["bridge", "cut"];
   return ["cut"];
 }
@@ -406,18 +425,20 @@ function chipJoin(s) {
   let j = s.join || "bridge";
   if (j === "bridge" && s.free_end) j = "from";
   if (j === "context" && s.cutaway) j = "cutaway";
+  if (j === "context" && s.alt) j = "alt";
   if (s.lead_in) {
     const sd = chipSides(s);
     if (j === "cut" && (sd.next || sd.lead)) j = "lead";
     else if (j === "bridge" && sd.lead) j = "bridgeIn";
   }
   const opts = chipOptions(s);
-  return opts.includes(j) ? j : j === "from" ? "bridge" : "cut";
+  return opts.includes(j) ? j : j === "from" ? "bridge" : j === "alt" && opts.includes("context") ? "context" : "cut";
 }
 function chipName(s, j = chipJoin(s)) {
   if (j === "from") return "Continuous";
   if (j === "lead") return "Lead in";
   if (j === "cutaway") return "Cutaway";
+  if (j === "alt") return "180°";
   if (j === "bridgeIn") return "Bridge";
   // 0.17.24: a fresh start that flows into the Shot after is a Lead in
   if (j === "bridge") { const { prev, next } = chipSides(s); return prev && next ? "Bridge" : !prev && next ? "Lead in" : "Continuous"; }
@@ -603,8 +624,11 @@ function filmSpan(s) {
  *  trim on its end, or the edit point where the two overlap, picks the frame. */
 function contextBack(x) {
   if (!x || x.join !== "context" || x.kind === "clip") return 0;
-  const act = active(), i = act.findIndex((y) => y.id === x.id), pv = i > 0 ? act[i - 1] : null;
+  const act = active(), i = act.findIndex((y) => y.id === x.id);
+  let pv = i > 0 ? act[i - 1] : null;
   if (pv && pv.cutaway && !x.cutaway) return 0;     // 0.22.1: after a cutaway: the last frame of the Shot before it
+  // 0.24.0: 180°: the last frame the film shows of the Shot 2 back (where it cut away to the other side)
+  if (x.alt) pv = ctxSource(act, i);
   const Lp = pv && LAYOUT.byId[pv.id], sp = pv && shownSpan(pv);
   if (!Lp || !sp) return 0;
   return Math.max(0, (Lp.we + effEdit(pv).shift) - sp.b);
@@ -2574,7 +2598,8 @@ function splitAtContext(job) {
   let brk = -1;
   for (let k = 1; k < ids.length; k++) {
     const i = act.findIndex((x) => x.id === ids[k]), pv = act[i - 1];
-    if (act[i].join === "context" && pv && ids.slice(0, k).includes(pv.id)) { brk = k; break; }
+    const src = ctxSource(act, i);   // 0.24.0: a 180° Shot waits for the Shot 2 back
+    if (act[i].join === "context" && src && ids.slice(0, k).includes(src.id)) { brk = k; break; }
     if (pv && pv.cutaway && ids.slice(0, k).includes(pv.id)) { brk = k; break; }   // 0.17.26: after a cutaway
   }
   if (brk < 0) return;
@@ -2871,6 +2896,9 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, f
   { const av = project.shots.filter((x) => !x.bypassed); av.forEach((x, i) => { if (i > 0 && av[i - 1].cutaway && !x.cutaway) x.film_join = "cut"; }); }
   // 0.17.0: a Context Shot that starts inside the Shot before takes the frame before its start
   project.shots.forEach((x) => { const b = contextBack(x); if (b) x.context_back = b; });
+  // 0.24.0: which Shot a Context Shot takes its frame from (a 180° Shot: 2 back)
+  { const act = active(); project.shots.forEach((x) => { const i = act.findIndex((y) => y.id === x.id);
+    const src = i > 0 && x.alt ? ctxSource(act, i) : null; if (src) x.context_src = src.id; }); }
   // 0.17.24: a Shot on Lead in pins its end into the rendered Shot after, even one that starts with a Cut
   project.shots.forEach((x, i) => {
     if (!x.lead_in || x.bypassed) return;
@@ -3250,8 +3278,8 @@ function adoptRows(rows, sent, standalone = false) {
     sh.seed_used = r.seed !== null && r.seed !== undefined ? Number(r.seed) : effSeed(sh);
     if (r.status !== "locked") {
       sh.seed_pending = null;
-      const act = active(), pv = act.indexOf(sh) > 0 ? mainPrev(act, act.indexOf(sh)) : null;   // 0.22.1: past cutaways
-      sh.context_from = sh.join === "context" && pv ? (pv.kind === "clip" ? `clip:${pv.id}` : pv.take || null) : null;
+      const act = active(), pv = act.indexOf(sh) > 0 ? ctxSource(act, act.indexOf(sh)) : null;   // 0.22.1: past cutaways; 0.24.0: 180°
+      sh.context_from = sh.join === "context" && pv && (sh.context_frame || P().settings.context_frame || "soft") !== "off" ? (pv.kind === "clip" ? `clip:${pv.id}` : pv.take || null) : null;
       sh.context_at = sh.context_from ? Number(((sent || {})[sh.id] || {}).back) || 0 : null;   // 0.17.11: which frame of it
     }
     const was = (sent || {})[sh.id] || { text: sh.text, seconds: Number(sh.seconds) };
@@ -6239,6 +6267,7 @@ const CHIP_HELP = {
   pending: "continues from the Shot before in Render all. ▶ on this Shot alone pins it to the rendered Shots next to it (approved or under review; one still rendering is waited for); with none rendered yet it renders on its own.",
   into: "a fresh start that leads into the start of the Shot after (its end is pinned to that Shot's first frames).",
   lead: "a fresh start (nothing from the Shot before) that leads into the start of the Shot after: its end is pinned to that Shot's first frames. If that Shot starts with a Cut, it carries on from this one once it's rendered (its take stays).",
+  alt: "180° (shot / reverse shot): a hard cut; the last frame of the Shot 2 back, the last one on this side of the line, goes in as a reference picture. Set a run of Shots to 180° and each side picks up from its own last Shot (C from A, D from B, E from C…).",
   cutaway: "B-roll: a hard cut, with the last frame of the Shot before as a reference picture (like Context). The Shot after it continues from the Shot before the cutaway, as if it weren't there.",
   bridgeIn: "pinned at both ends: flows from the Shot before into the Shot after, though that one starts with a Cut. Once it's rendered, the Shot after carries on from it (its take stays).",
   bridge: "pinned at both ends: flows from the Shot before into the Shot after.",
@@ -6310,20 +6339,22 @@ function shotRowHTML(s) {
   // the join chip: how ▶ renders it, from the rendered Shots next to it
   const actR = active(), prevR = !s.bypassed && actR.indexOf(s) > 0 ? mainPrev(actR, actR.indexOf(s)) : null;   // 0.22.1: past cutaways
   const cj = chipJoin(s), opts = chipOptions(s);
-  const icon = { bridge: chipSides(s).prev || !chipSides(s).next ? "↔" : "↘", lead: "↘", bridgeIn: "↔", cutaway: "↪", from: "→", context: "⧉", cut: "|" }[cj];
+  const icon = { bridge: chipSides(s).prev || !chipSides(s).next ? "↔" : "↘", lead: "↘", bridgeIn: "↔", cutaway: "↪", alt: "⇄", from: "→", context: "⧉", cut: "|" }[cj];
   const joinChip = !s.bypassed && s.kind !== "clip"
     ? `<button class="join-chip j-${esc(cj)}${opts.length < 2 ? " only" : ""}" data-action="cycle-join" title="${esc(chipName(s) + ": " + CHIP_HELP[chipKey(s)])}${
       (() => { const nb = chipNear(s), odd = [nb.prev, nb.next].filter(otherSize);
         return odd.length ? esc(` ${odd.map(titleOf).join(" and ")} ${odd.length > 1 ? "are" : "is"} another size, so not pinned to (a hard cut there).`) : ""; })()}${
       opts.length < 2 ? " No Shot next to it, so Cut is the only choice." : ` Click to switch: ${opts.map((o) => chipName(s, o)).join(" → ")}.`}">${icon} ${chipName(s)}</button>` : "";
-  const ctxTake = s.join === "context" && s.status !== "queued" && s.context_from && prevR &&
-    (prevR.kind === "clip" ? `clip:${prevR.id}` : prevR.take) !== s.context_from;
+  // 0.24.0: the Shot it takes its frame from (180°: 2 back); none when its Context frame is Off
+  const srcR = prevR && (s.context_frame || P().settings.context_frame || "soft") !== "off" ? ctxSource(actR, actR.indexOf(s)) : null;
+  const ctxTake = s.join === "context" && s.status !== "queued" && s.context_from && srcR &&
+    (srcR.kind === "clip" ? `clip:${srcR.id}` : srcR.take) !== s.context_from;
   // 0.17.11: or the frame moved (a trim on the Shot before, or the edit point)
-  const ctxFrame = !ctxTake && s.join === "context" && s.status !== "queued" && s.context_from && prevR &&
+  const ctxFrame = !ctxTake && s.join === "context" && s.status !== "queued" && s.context_from && srcR &&
     s.context_at !== null && s.context_at !== undefined && contextBack(s) !== s.context_at;
   const ctxStale = ctxTake || ctxFrame;
-  const ctxFlag = ctxStale ? `<span class="flag cut" title="${ctxTake ? `The Shot before has a different take now. Re-render ${title} to take its new last frame.`
-    : `The last frame the film shows of the Shot before moved (a trim or the edit point). Re-render ${title} to use that frame.`}">context changed</span>` : "";
+  const ctxFlag = ctxStale ? `<span class="flag cut" title="${ctxTake ? `${esc(titleOf(srcR))} has a different take now. Re-render ${title} to take its new last frame.`
+    : `The last frame the film shows of ${esc(titleOf(srcR))} moved (a trim or the edit point). Re-render ${title} to use that frame.`}">context changed</span>` : "";
   const ctxBtn = ctxStale ? `<button class="ghost sm bridge" data-action="context-redo" title="Re-render ${title} from the new last frame of the Shot before (the Shots after it keep their takes)">Re-render</button>` : "";
   return `${play}<button class="shot-head${play ? " has-play" : ""}" data-action="toggle-shot" aria-expanded="${open}">
           ${play ? "" : `<span class="sdot" style="background:${L.dot};color:${L.fg}">${L.icon}</span>`}
@@ -6842,6 +6873,7 @@ function renderShotsNow() {
         <textarea class="field fit" data-shot-field="text" rows="3" aria-label="${title} text">${esc(s.text)}</textarea>
         <div class="shot-opts">
           <label class="lbl-row">Seconds <input type="number" step="0.1" min="0.1" data-shot-field="seconds" value="${esc(s.seconds)}" style="width:72px"${ro}></label>
+          ${s.join === "context" && s.kind !== "clip" ? `<label class="lbl-row" title="The frame this Shot gets from the Shot before it (0.23.2)">Context frame <select data-shot-ctx aria-label="Context frame">${[["", `Project (${({ soft: "small + soft", full: "full", off: "off" })[P().settings.context_frame || "soft"]})`], ["soft", "Small + soft"], ["full", "Full"], ["off", "Off"]].map(([v, t]) => `<option value="${v}"${(s.context_frame || "") === v ? " selected" : ""}>${t}</option>`).join("")}</select></label>` : ""}
           <label class="lbl-row">Seed <input class="mono" data-shot-field="shot_seed" value="${s.shot_seed < 0 ? "" : esc(s.shot_seed)}" placeholder="auto${isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used) ? ` · ${s.seed_used}` : ""}" style="width:120px"${ro}></label>${seedStepHTML("shot-seed-step", !!ro, isAuto(s) ? "On auto: gives this Shot its own seed, one from its last take's" : "")}
           <button class="ghost sm" data-action="wrap" data-before="&lt;d&gt;[English] " data-after="&lt;/d&gt;">Wrap &lt;d&gt; dialogue</button>
           <button class="ghost sm" data-action="wrap" data-before="&quot;" data-after="&quot;">Wrap "on-screen text"</button>
@@ -7671,6 +7703,12 @@ function renderSettings() {
         <button data-action="ref-size" data-v="match" aria-pressed="${s.ref_image_size === "match"}">Match · lighter on VRAM</button>
         <button data-action="ref-size" data-v="max" aria-pressed="${s.ref_image_size === "max"}">Max · best identity</button>
       </div></div>
+    <div style="margin-top:14px"><div class="muted small" style="margin-bottom:6px" title="What a Context or Cutaway Shot gets from the Shot before it. The frame adds a picture next to your reference sheets: at full size it shares the model's attention with them and shows the people too, so faces can drift to the model's own idea of them">Context frame (Context and Cutaway Shots)</div>
+      <div class="seg" role="group" aria-label="Context frame">
+        <button data-action="ctx-frame" data-v="soft" aria-pressed="${(s.context_frame || "soft") === "soft"}" title="A quarter of the render's area and blurred: the place, its layout, colour and light, but no figures to copy and fewer tokens next to the sheets">Small + soft</button>
+        <button data-action="ctx-frame" data-v="full" aria-pressed="${s.context_frame === "full"}" title="The frame as it is (the behaviour before 0.23.2): more detail of props, more pull away from the sheets">Full</button>
+        <button data-action="ctx-frame" data-v="off" aria-pressed="${s.context_frame === "off"}" title="No frame: a plain Cut; the location comes from your scene cards">Off</button>
+      </div></div>
     <div class="out-files">
       <div class="muted small">Videos are saved in output/longshot/${esc(P().slug)}/videos.</div>
     </div>
@@ -8109,7 +8147,7 @@ function swapMedia() {
 }
 function swapProblem() {
   const sw = swapCfg(), m = swapMedia();
-  if (!lsAtLeast(1, 9, 0)) return "Update H3 Long Shot to 1.9.0 (and restart ComfyUI) for Face swap.";
+  if (!lsAtLeast(1, 9, 1)) return "Update H3 Long Shot to 1.9.1 (and restart ComfyUI) for Face swap.";
   if (!sw.model) return "Choose the ref2va model.";
   if (!isRef2vaName(sw.model)) return "That's not a ref2va model: Face swap needs one (it takes the new face as a picture).";
   if (!m) return sw.source.kind === "file" ? "Choose a video." : "Choose a rendered Shot.";
@@ -8870,7 +8908,7 @@ function renderPlan() {
       color = s.status === "approved" ? "#9FE0C2" : "#FFD08A";
     }
     if (s.standalone && s.status !== "queued") status += " · standalone";
-    if (s.join === "context") status = status.replace(/ · cut\b/g, "") + " · context";
+    if (s.join === "context") status = status.replace(/ · cut\b/g, "") + (s.alt ? " · 180°" : " · context");
     else if (s.join === "cut" && !/ · cut\b/.test(status)) status += " · cut";
     if (cutBefore(s) && !/hard cut/.test(status)) status += " · cut before it";
     if (((dry || row) && (dry || row).seam === "mismatch") || cutBefore(s)) color = "#FFB4A8";
@@ -9385,6 +9423,13 @@ document.addEventListener("click", async (e) => {
       commit();
       break;
     }
+    case "ctx-frame": {                              // 0.23.2
+      if (setupGuard() || (p.settings.context_frame || "soft") === el.dataset.v) return;
+      p.settings.context_frame = el.dataset.v;
+      commit();
+      toast("Context and Cutaway Shots that render from now on get the " + ({ soft: "small, soft frame", full: "full frame", off: "no frame (a plain Cut)" })[el.dataset.v] + ". Rendered ones keep their takes.");
+      break;
+    }
     case "ref-size": {
       if (setupGuard() || p.settings.ref_image_size === el.dataset.v) return;
       const mode = await askSettingChange("Change the reference image size");
@@ -9624,6 +9669,11 @@ document.addEventListener("change", async (e) => {
       applyRefChange(mode, "Style & Sound");
     } else p.style[k] = el.value;
     return commit();
+  }
+  if (el.dataset.shotCtx !== undefined) {         // 0.23.2: this Shot's context frame
+    const s = shotOf(el);
+    if (s) { s.context_frame = ["soft", "full", "off"].includes(el.value) ? el.value : null; commit(); }
+    return;
   }
   if (el.dataset.shotField) {
     const s = shotOf(el);
@@ -11889,8 +11939,9 @@ function cycleJoin(s) {
   }
   const wasJ = chipJoin(s), was = chipName(s, wasJ);
   const nextJ = order[(order.indexOf(wasJ) + 1) % order.length];
-  s.join = nextJ === "from" || nextJ === "bridgeIn" ? "bridge" : nextJ === "lead" ? "cut" : nextJ === "cutaway" ? "context" : nextJ;   // 0.17.14: "from" is Continuous with a free end
+  s.join = nextJ === "from" || nextJ === "bridgeIn" ? "bridge" : nextJ === "lead" ? "cut" : nextJ === "cutaway" || nextJ === "alt" ? "context" : nextJ;   // 0.17.14: "from" is Continuous with a free end
   s.cutaway = nextJ === "cutaway";                    // 0.17.26
+  s.alt = nextJ === "alt";                            // 0.24.0
   s.free_end = nextJ === "from";
   s.lead_in = nextJ === "lead" || nextJ === "bridgeIn";    // 0.17.24 / 0.17.25
   const name = { [s.join]: chipName(s, nextJ) };
@@ -12449,6 +12500,12 @@ function normImages(im) {
     steps: Number(x.steps) > 0 ? Math.round(Number(x.steps)) : null,
     expand: !!x.expand, count: Math.max(1, Math.min(16, Math.round(Number(x.count) || 1))),
     folded: !!x.folded,                          // 0.21.6: the card shows its header and one line
+    norefs: !!x.norefs,                          // 0.23.4: renders without the shared References (a clean plate)
+    plate: x.plate && typeof x.plate === "object" ? { shot: x.plate.shot || null, label: x.plate.label || "", what: x.plate.what || "" } : null,
+    // 0.25.0: boxes drawn on the picture being edited (0..1 of it), each with an optional note
+    regions: (Array.isArray(x.regions) ? x.regions : []).map((r) => ({ x: +r.x || 0, y: +r.y || 0, w: +r.w || 0, h: +r.h || 0, note: String(r.note || "") }))
+      .filter((r) => r.w > 0.005 && r.h > 0.005).slice(0, RG_MAX),
+    region_mode: x.region_mode === "zoom" ? "zoom" : "paste",
     results: (Array.isArray(x.results) ? x.results : []).filter((r) => r && r.filename).map((r) => ({
       filename: r.filename, subfolder: r.subfolder || "", type: r.type || "output", seed: r.seed ?? null,
       width: Number(r.width) || null, height: Number(r.height) || null, made: Number(r.made) || 0,
@@ -12462,6 +12519,9 @@ const imagesOn = () => IMG.mode === "images";
 const ipics = () => P().images.pictures;
 const irefs = () => P().images.refs;
 const ipicById = (id) => ipics().find((x) => x.id === id) || null;
+/** 0.25.0: a Picture can render with a prompt, or (editing with boxes) a note on a box. */
+const picRegions = (pic) => (pic && pic.edit && Array.isArray(pic.regions) ? pic.regions : []);
+const picReady = (pic) => !!pic.text.trim() || picRegions(pic).length > 0;     // 0.25.1: boxes alone will do
 const ipicNum = (pic) => ipics().indexOf(pic) + 1;
 const imgSet = () => P().settings.image;
 const imgNodeOk = () => !S.opts || !S.opts.nodes || S.opts.nodes.MiniMaxH3ImageConditioning !== false;
@@ -12710,7 +12770,8 @@ function ipicCard(pic) {
   const b = S.busy && S.busy.kind === "image" && S.busy.extra && S.busy.extra.pic === pic.id ? S.busy : null;
   const edit = pic.edit;
   const editRow = edit
-    ? `<span class="chip edit"><img alt="" src="${esc(viewURL({ filename: edit.image, subfolder: edit.subfolder, type: edit.type }) + "&preview=webp;60")}"> ${esc(edit.label || edit.image)}
+    ? `<span class="chip edit"><button class="rgn-open" data-action="ipic-regions" data-id="${esc(pic.id)}" title="Open it large to see it and draw boxes: only the boxes get edited"><img alt="" src="${esc(viewURL({ filename: edit.image, subfolder: edit.subfolder, type: edit.type }) + "&preview=webp;60")}"></button> ${esc(edit.label || edit.image)}
+        <button class="rgn-tag${picRegions(pic).length ? " on" : ""}" data-action="ipic-regions" data-id="${esc(pic.id)}" title="${picRegions(pic).length ? "Only the boxes get edited. Click to change them." : "Draw boxes on it so only those parts change"}">▢ ${picRegions(pic).length ? `${picRegions(pic).length} box${picRegions(pic).length > 1 ? "es" : ""} · ${pic.region_mode === "zoom" ? "zoom in" : "paste back"}` : "Regions"}</button>
         <span class="tag">this is &lt;Picture 1&gt;${irefsActive().length ? ` · References become &lt;Picture 2…${irefsActive().length + 1}&gt;` : ""}</span>
         <button class="icon x" data-action="ipic-edit-clear" data-id="${esc(pic.id)}" title="Don't edit a picture: text-to-image with the References" aria-label="Clear">${CROSS}</button></span>`
     : `<span class="chip add" data-action="ipic-edit-pick" data-id="${esc(pic.id)}" title="Choose a picture to edit (or drop one here: from the Outputs drawer, a result, or your desktop)">＋ none · text-to-image with the References</span>`;
@@ -12729,19 +12790,20 @@ function ipicCard(pic) {
       ${pending ? '<span class="warn-tag">in the queue</span>' : ""}
       ${last ? `<img class="ipic-mini" alt="" src="${esc(resultThumb(last))}" loading="lazy" draggable="false">` : ""}
       <span class="muted small">${pic.results.length} result${pic.results.length === 1 ? "" : "s"}</span>
-      <button class="primary sm-primary" style="padding:6px 14px;font-size:13px" data-action="ipic-render" data-id="${esc(pic.id)}"${!pic.text.trim() || !engineOk() ? " disabled" : ""}>▶ Render</button>
+      <button class="primary sm-primary" style="padding:6px 14px;font-size:13px" data-action="ipic-render" data-id="${esc(pic.id)}"${!picReady(pic) || !engineOk() ? " disabled" : ""}>▶ Render</button>
     </div></div>`);
   }
   return head(`
       <input class="title" data-ipic="title" data-id="${esc(pic.id)}" value="${esc(pic.title)}" placeholder="a name for the files (optional)" aria-label="Picture ${n} name">
       <span class="push"></span>
       <label class="muted small" title="How many to render, each with its own seed">×<input class="count" type="number" min="1" max="16" step="1" data-ipic="count" data-id="${esc(pic.id)}" value="${pic.count}" aria-label="How many"></label>
-      <button class="primary sm-primary" style="padding:6px 14px;font-size:13px" data-action="ipic-render" data-id="${esc(pic.id)}"${!pic.text.trim() || !engineOk() ? " disabled" : ""} title="Render ${pic.count > 1 ? pic.count + " of " : ""}this Picture (into the Queue)">▶ Render</button>
+      <button class="primary sm-primary" style="padding:6px 14px;font-size:13px" data-action="ipic-render" data-id="${esc(pic.id)}"${!picReady(pic) || !engineOk() ? " disabled" : ""} title="Render ${pic.count > 1 ? pic.count + " of " : ""}this Picture (into the Queue)">▶ Render</button>
       <button class="icon" data-action="ipic-dup" data-id="${esc(pic.id)}" title="Duplicate this Picture">⧉</button>
       <button class="icon x" data-action="ipic-del" data-id="${esc(pic.id)}" title="Remove this Picture (its files stay in the images folder)" aria-label="Remove Picture ${n}">${CROSS}</button>
     </div>
     <div class="ipic-edit${edit ? " on" : ""}" data-iedit="${esc(pic.id)}"><span class="lab">To edit</span>${editRow}</div>
-    <textarea data-ipic="text" data-id="${esc(pic.id)}" placeholder="What the picture shows. Name the references as <Picture 1>, <Picture 2>…${edit ? " (<Picture 1> is the picture being edited)" : ""}" aria-label="Picture ${n} prompt">${esc(pic.text)}</textarea>
+    ${pic.norefs ? `<div class="muted small">🧹 Clean plate: renders without the References${pic.plate ? ` · its result can go to Cast &amp; Scenes as ${esc(pic.plate.label)}` : ""} · <button class="linkbtn" data-action="ipic-norefs" data-id="${esc(pic.id)}">use the References</button></div>` : ""}
+    <textarea data-ipic="text" data-id="${esc(pic.id)}" placeholder="${picRegions(pic).length ? "Optional with boxes: each box uses its own note (Zoom in) or adds it to this prompt (Paste back)" : `What the picture shows. Name the references as <Picture 1>, <Picture 2>…${edit ? " (<Picture 1> is the picture being edited)" : ""}`}" aria-label="Picture ${n} prompt">${esc(pic.text)}</textarea>
     <div class="ipic-opts">
       <label>Size <select data-ipic="megapixels" data-id="${esc(pic.id)}" aria-label="Megapixels">${mpList().map((m) => `<option value="${m}"${picMp(pic) === m ? " selected" : ""}>${m} MP</option>`).join("")}</select></label>
       ${edit && !stillEngine() ? "" : `<label><select data-ipic="aspect" data-id="${esc(pic.id)}" aria-label="Aspect">${((S.opts || {}).aspects || ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9"]).map((a) => `<option value="${a}"${picAspect(pic) === a ? " selected" : ""}>${a}</option>`).join("")}</select></label>`}
@@ -12762,7 +12824,7 @@ function renderIpics() {
   $("ipic-fold-all").hidden = !S.ipicsOpen || list.length < 2;
   $("ipics-summary").textContent = list.length ? `${list.length} · ${n} result${n === 1 ? "" : "s"}` : "";
   $("ipics").innerHTML = list.map(ipicCard).join("");
-  $("ipic-render-all").disabled = !engineOk() || !list.some((x) => x.text.trim());
+  $("ipic-render-all").disabled = !engineOk() || !list.some(picReady);
   for (const ta of $("ipics").querySelectorAll("textarea")) fitText(ta);
 }
 
@@ -12789,7 +12851,8 @@ function renderIpreview() {
     <img class="ipreview-img" alt="${esc(r.filename)}" src="${esc(viewURL(r) + "&preview=webp;85")}" data-action="ires-view" style="cursor:${IMG.theater ? "zoom-out" : "zoom-in"}" title="Click: ${IMG.theater ? "normal" : "large"} view">
     <div class="ipreview-acts">
       <button class="ghost sm" data-action="ires-ref-here" title="Add this result to the References above (as a picture file)">＋ Reference here</button>
-      <button class="ghost sm" data-action="ires-ref-cast" title="Copy it into the project's input folder as a picture card in Cast &amp; Scenes, for video renders">＋ To Cast &amp; Scenes</button>
+      ${pic.plate ? `<button class="ghost sm up-btn" data-action="ipic-plate-cast" data-id="${esc(pic.id)}" title="Into Cast &amp; Scenes as the scene card ${esc(pic.plate.label)} (an empty plate of this place), switched on">＋ Plate to Cast &amp; Scenes</button>`
+        : `<button class="ghost sm" data-action="ires-ref-cast" title="Copy it into the project's input folder as a picture card in Cast &amp; Scenes, for video renders">＋ To Cast &amp; Scenes</button>`}
       <button class="ghost sm" data-action="ires-edit" title="A new Picture with this result as the picture to edit">✎ Edit this</button>
       <button class="ghost sm" data-action="ires-reroll" title="Render this Picture again with a new seed">↻ Re-roll</button>
       <button class="ghost sm up-btn" data-action="ires-upscale"${upOk() ? "" : ' disabled title="Needs RTX Video Super Resolution (ComfyUI-NVIDIA-RTX-VSR-Pro)"'}${upOk() ? ` title="RTX Super Resolution on this picture only (×${Number(imgSet().scale) || 2}, ${esc(imgSet().quality || "ULTRA")}: Image settings), saved next to it and added to this Picture's results"` : ""}>⇱ Upscale this</button>
@@ -12908,7 +12971,7 @@ function newPicture(after, props) {
 }
 function ipicRender(pic, n = null, reroll = false) {
   if (setupGuard()) return;
-  if (!pic.text.trim()) { toast("Write the Picture's prompt first."); return; }
+  if (!picReady(pic)) { toast("Write the Picture's prompt first."); return; }
   if (!engineOk()) { toast(stillEngine() ? "Update ComfyUI: it has no MiniMax H3 Reference to Video node." : "The H3-Image engine needs ComfyUI 0.44.0 or later."); return; }
   const count = n || pic.count || 1;
   const specs = [];
@@ -12920,11 +12983,159 @@ function ipicRender(pic, n = null, reroll = false) {
   IMG.pic = pic.id;
   renderIpics();
 }
+// ---------------------------------------------------------------------------
+// 0.25.0: Region edits. The picture being edited opens large; drag to draw boxes (move them,
+// pull the corner to resize, × to remove). Each box can carry a note. Paste back: the edit
+// renders whole and only the boxes are pasted onto the picture (soft edges). Zoom in: each box
+// is cut out with a margin, edited on its own at full size with its note, and pasted back.
+// ---------------------------------------------------------------------------
+
+const RG_MAX = 6;
+const RGN = { el: null, pic: null, drag: null, sel: -1, key: null };
+
+function openRegions(pic) {
+  closeRegions(true);
+  RGN.pic = pic.id; RGN.sel = -1;
+  const el = document.createElement("div");
+  el.className = "rgn-overlay";
+  el.setAttribute("role", "dialog");
+  el.setAttribute("aria-label", "Regions to edit");
+  document.body.appendChild(el);
+  RGN.el = el;
+  el.addEventListener("pointerdown", rgDown);
+  el.addEventListener("click", rgClick);
+  el.addEventListener("input", rgInput);
+  RGN.key = (e) => {
+    if (!RGN.el) return;
+    const typing = e.target && /^(INPUT|TEXTAREA)$/.test(e.target.tagName);
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeRegions(); return; }
+    if (typing) return;
+    e.stopPropagation();          // the page's own shortcuts wait while the boxes are open
+    if ((e.key === "Delete" || e.key === "Backspace") && RGN.sel >= 0) { e.preventDefault(); rgRemove(RGN.sel); }
+  };
+  window.addEventListener("keydown", RGN.key, true);
+  renderRegions();
+}
+function closeRegions(quiet) {
+  if (!RGN.el) return;
+  window.removeEventListener("keydown", RGN.key, true);
+  RGN.el.remove(); RGN.el = null; RGN.drag = null;
+  if (!quiet) commit();
+}
+const rgPic = () => (RGN.pic ? ipicById(RGN.pic) : null);
+function rgBoxStyle(r) { return `left:${r.x * 100}%;top:${r.y * 100}%;width:${r.w * 100}%;height:${r.h * 100}%`; }
+function renderRegions() {
+  const pic = rgPic();
+  if (!RGN.el) return;
+  if (!pic || !pic.edit) { closeRegions(); return; }
+  const e = pic.edit, regs = pic.regions;
+  const src = viewURL({ filename: e.image, subfolder: e.subfolder, type: e.type });
+  const where = (r) => { const cx = r.x + r.w / 2, cy = r.y + r.h / 2; const v = cy < 1 / 3 ? "upper" : cy > 2 / 3 ? "lower" : "", h = cx < 1 / 3 ? "left" : cx > 2 / 3 ? "right" : ""; return `${v} ${h}`.trim() || "centre"; };
+  RGN.el.innerHTML = `<div class="rgn-panel">
+    <div class="rgn-head"><b>Picture ${ipicNum(pic)} · Regions</b><span class="muted small">${esc(e.label || e.image)}${e.width ? ` · ${e.width} × ${e.height}` : ""}</span>
+      <span class="push"></span>
+      <span class="rgn-modes" role="group" aria-label="How the boxes are edited">
+        <button class="${pic.region_mode === "paste" ? "on" : ""}" data-rgn="mode" data-v="paste" title="The edit renders on the whole picture; only the boxes are pasted onto it, with soft edges. Everything outside them stays as it is.">Paste back</button>
+        <button class="${pic.region_mode === "zoom" ? "on" : ""}" data-rgn="mode" data-v="zoom" title="Each box is cut out (with a margin), edited on its own at full size with its note, and pasted back. Best for small details; one render per box.">Zoom in</button>
+      </span>
+      ${regs.length ? '<button class="ghost sm" data-rgn="clear">Clear all</button>' : ""}
+      <button class="primary sm-primary" data-rgn="done">Done</button></div>
+    <div class="rgn-stage"><div class="rgn-wrap"><img alt="The picture being edited" src="${esc(src)}" draggable="false">
+      ${regs.map((r, i) => `<div class="rgn-box${RGN.sel === i ? " sel" : ""}" data-rgn-box="${i}" style="${rgBoxStyle(r)}"><span class="rgn-num">${i + 1}</span><button class="rgn-x" data-rgn="del" data-i="${i}" title="Remove box ${i + 1}" aria-label="Remove box ${i + 1}">${CROSS}</button><span class="rgn-h" data-rgn-h="${i}"></span></div>`).join("")}
+    </div></div>
+    <div class="rgn-list">${regs.length ? regs.map((r, i) => `<label class="rgn-row${RGN.sel === i ? " sel" : ""}"><span class="rgn-num">${i + 1}</span>
+        <input data-rgn-note="${i}" value="${esc(r.note)}" placeholder="${pic.region_mode === "zoom" ? "what this box should become (else the Picture's prompt)" : "what changes here (optional; added to the prompt)"}" aria-label="Box ${i + 1} note">
+        <span class="muted small">${where(r)}</span></label>`).join("")
+      : `<div class="muted small">Drag on the picture to draw a box. Only the boxes get edited; the rest stays as it is. Up to ${RG_MAX} boxes.</div>`}</div>
+  </div>`;
+}
+function rgPoint(ev) {
+  const wrap = RGN.el && RGN.el.querySelector(".rgn-wrap");
+  if (!wrap) return null;
+  const b = wrap.getBoundingClientRect();
+  return { x: Math.min(1, Math.max(0, (ev.clientX - b.left) / b.width)), y: Math.min(1, Math.max(0, (ev.clientY - b.top) / b.height)) };
+}
+function rgDown(ev) {
+  const pic = rgPic();
+  if (!pic || ev.button !== 0) return;
+  if (ev.target.closest("button, input, .rgn-list, .rgn-head")) return;
+  if (ev.target === RGN.el) { closeRegions(); return; }      // outside the panel
+  if (!ev.target.closest(".rgn-wrap")) return;
+  const p = rgPoint(ev);
+  if (!p) return;
+  ev.preventDefault();
+  const h = ev.target.closest("[data-rgn-h]"), box = ev.target.closest("[data-rgn-box]");
+  if (h) { const i = +h.dataset.rgnH; RGN.drag = { kind: "size", i, r0: Object.assign({}, pic.regions[i]), p0: p }; RGN.sel = i; }
+  else if (box) { const i = +box.dataset.rgnBox; RGN.drag = { kind: "move", i, r0: Object.assign({}, pic.regions[i]), p0: p }; RGN.sel = i; }
+  else {
+    if (pic.regions.length >= RG_MAX) { toast(`Up to ${RG_MAX} boxes.`); return; }
+    pic.regions.push({ x: p.x, y: p.y, w: 0, h: 0, note: "" });
+    const i = pic.regions.length - 1;
+    RGN.drag = { kind: "new", i, p0: p }; RGN.sel = i;
+    renderRegions();
+  }
+  RGN.el.querySelectorAll(".rgn-box").forEach((b) => b.classList.toggle("sel", +b.dataset.rgnBox === RGN.sel));
+  const move = (e) => rgMove(e), up = () => {
+    window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up);
+    rgUp();
+  };
+  window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
+}
+function rgMove(ev) {
+  const pic = rgPic(), d = RGN.drag;
+  if (!pic || !d) return;
+  const p = rgPoint(ev), r = pic.regions[d.i];
+  if (!p || !r) return;
+  if (d.kind === "new") {
+    r.x = Math.min(d.p0.x, p.x); r.y = Math.min(d.p0.y, p.y); r.w = Math.abs(p.x - d.p0.x); r.h = Math.abs(p.y - d.p0.y);
+  } else if (d.kind === "move") {
+    r.x = Math.min(1 - d.r0.w, Math.max(0, d.r0.x + p.x - d.p0.x));
+    r.y = Math.min(1 - d.r0.h, Math.max(0, d.r0.y + p.y - d.p0.y));
+  } else {
+    r.w = Math.min(1 - d.r0.x, Math.max(0.01, d.r0.w + p.x - d.p0.x));
+    r.h = Math.min(1 - d.r0.y, Math.max(0.01, d.r0.h + p.y - d.p0.y));
+  }
+  const el = RGN.el.querySelector(`[data-rgn-box="${d.i}"]`);
+  if (el) el.setAttribute("style", rgBoxStyle(r));
+}
+function rgUp() {
+  const pic = rgPic(), d = RGN.drag;
+  RGN.drag = null;
+  if (!pic || !d) return;
+  const r = pic.regions[d.i];
+  if (d.kind === "new" && r && (r.w < 0.01 || r.h < 0.01)) { pic.regions.splice(d.i, 1); RGN.sel = -1; }
+  renderRegions();
+  scheduleSave();
+  if (d.kind === "new" && RGN.sel >= 0) { const inp = RGN.el && RGN.el.querySelector(`[data-rgn-note="${RGN.sel}"]`); if (inp) inp.focus(); }
+}
+function rgRemove(i) {
+  const pic = rgPic();
+  if (!pic) return;
+  pic.regions.splice(i, 1);
+  RGN.sel = -1;
+  renderRegions(); scheduleSave();
+}
+function rgClick(ev) {
+  const pic = rgPic(), b = ev.target.closest("[data-rgn]");
+  if (!pic || !b) return;
+  const what = b.dataset.rgn;
+  if (what === "done") closeRegions();
+  else if (what === "del") rgRemove(+b.dataset.i);
+  else if (what === "clear") { pic.regions = []; RGN.sel = -1; renderRegions(); scheduleSave(); }
+  else if (what === "mode") { pic.region_mode = b.dataset.v === "zoom" ? "zoom" : "paste"; renderRegions(); scheduleSave(); }
+}
+function rgInput(ev) {
+  const pic = rgPic(), inp = ev.target.closest("[data-rgn-note]");
+  if (!pic || !inp) return;
+  const r = pic.regions[+inp.dataset.rgnNote];
+  if (r) { r.note = inp.value.slice(0, 600); scheduleSave(); }
+}
+
 function imageOpts(sp, job) {
   const pic = ipicById(sp.target);
   if (!pic) { S.error = "That Picture was removed."; return null; }
-  if (!pic.text.trim()) { S.error = "The Picture has no prompt."; return null; }
-  const im = imgSet(), refs = irefsActive(), sz = ipicSize(pic);
+  if (!picReady(pic)) { S.error = "The Picture has no prompt."; return null; }
+  const im = imgSet(), refs = pic.norefs ? [] : irefsActive(), sz = ipicSize(pic);
   const seed = Number.isFinite(Number(sp.seed)) && sp.seed >= 0 ? Number(sp.seed) : Math.floor(Math.random() * (SEED_MAX + 1));
   const n = ipicNum(pic);
   const still = stillEngine();
@@ -12933,9 +13144,11 @@ function imageOpts(sp, job) {
     refs: refs.map((x) => ({ image: x.image, subfolder: x.subfolder, type: x.type, label: x.label, desc: x.desc || "" })),
     megapixels: sz.mp, aspect: sz.aspect || picAspect(pic), seed, steps: picSteps(pic),
     name: `pic${n}${pic.title ? "_" + slugTitle(pic.title) : ""}` };
+  if (picRegions(pic).length) Object.assign(item, { regions: picRegions(pic).map((r) => ({ x: r.x, y: r.y, w: r.w, h: r.h, note: r.note })), region_mode: pic.region_mode });
   if (still) Object.assign(item, { frames: Number(im.frames) || 22, upscale: !!im.upscale, scale: Number(im.scale) || 2, quality: im.quality || "ULTRA" },
     im.tail ? { tail: im.tail } : {});
-  const what = pic.edit ? `editing ${pic.edit.label || pic.edit.image}` : refs.length ? `${refs.length} reference${refs.length > 1 ? "s" : ""}` : "no references";
+  const nb = picRegions(pic).length;
+  const what = pic.edit ? `editing ${pic.edit.label || pic.edit.image}${nb ? ` · ${nb} box${nb > 1 ? "es" : ""} (${pic.region_mode === "zoom" ? "zoom in" : "paste back"})` : ""}` : refs.length ? `${refs.length} reference${refs.length > 1 ? "s" : ""}` : "no references";
   return { kind: "image", image: item, label: `Picture ${n}${pic.title ? " · " + pic.title : ""} · ${sz.mp} MP${sz.aspect ? " " + sz.aspect : ""}`,
     note: `${what} · seed ${seed}${item.expand ? " · expanded prompt" : ""}`,
     extra: { pic: pic.id, seed, text: pic.text, refs: refs.map((x) => x.label || x.image), edit: pic.edit ? (pic.edit.label || pic.edit.image) : "", expand: item.expand },
@@ -12955,7 +13168,8 @@ function imageDone(b, outputs) {
   pic.current = 0;
   IMG.pic = pic.id;
   scheduleSave();
-  toast(`Picture saved: ${file.filename}`, { label: "Show", fn: () => { setMode("images"); IMG.pic = pic.id; pic.current = 0; render(); } });
+  if (pic.plate) toast(`Clean plate made: ${file.filename}`, { label: `＋ To Cast & Scenes as ${pic.plate.label}`, fn: () => plateToCast(pic, pic.results[0]) });
+  else toast(`Picture saved: ${file.filename}`, { label: "Show", fn: () => { setMode("images"); IMG.pic = pic.id; pic.current = 0; render(); } });
 }
 
 /** A result or an output file (any {filename, subfolder}) as a reference on the Images side. */
@@ -12993,6 +13207,7 @@ async function ipicEditFiles(id, fileList) {
     const info = await uploadImage(f);
     const dims = await imageDims(viewURL({ filename: info.name, subfolder: info.subfolder, type: "input" }));
     pic.edit = { image: info.name, subfolder: info.subfolder, type: "input", label: f.name.replace(/\.[a-z0-9]+$/i, ""), width: dims[0], height: dims[1] };
+    pic.regions = [];                       // 0.25.0: boxes belong to the picture they were drawn on
     commit();
   } catch (e) { toast("Couldn't upload it: " + e.message); }
 }
@@ -13007,17 +13222,18 @@ function imageDims(url) {
 function ipicSetEdit(pic, item, label) {
   pic.edit = { image: item.filename, subfolder: item.subfolder || "", type: item.type || "output", label: label || item.filename.replace(/\.[a-z0-9]+$/i, ""),
     width: item.width || null, height: item.height || null };
+  pic.regions = [];                         // 0.25.0
   commit();
   if (!pic.edit.width) imageDims(viewURL({ filename: pic.edit.image, subfolder: pic.edit.subfolder, type: pic.edit.type }) + "&preview=webp;10").then(([w, h]) => {
     if (pic.edit && pic.edit.image === item.filename && w) { pic.edit.width = w; pic.edit.height = h; commit(); }
   });
 }
 /** An output file (a result, or one from the drawer) copied into the project's inputs as a Cast & Scenes picture card. */
-async function adoptIntoCast(item, targetId) {
+async function adoptIntoCast(item, targetId, opts = {}) {
   const p = P();
   if (setupGuard()) return;
   const target = targetId ? p.cast.find((x) => x.id === targetId) : null;
-  const c = target || { id: uid("c"), label: item.filename.replace(/\.[a-z0-9]+$/i, "").replace(/_\d{5}_?$/, ""), desc: "", role: "appearance", image: "", bypassed: false };
+  const c = target || { id: uid("c"), label: opts.label || item.filename.replace(/\.[a-z0-9]+$/i, "").replace(/_\d{5}_?$/, ""), desc: opts.desc || "", role: "appearance", image: "", bypassed: false };
   if (!target) p.cast.push(c);
   S.uploading[c.id] = true;
   render();
@@ -13050,6 +13266,8 @@ async function imagesAction(a, el, e) {
     case "outs-toggle": toggleOutputs(); return;
     case "outs-refresh": loadOutputs(true); return;
     case "iref-view": openRefView(el.dataset.id); return;          // 0.21.10
+    case "ipic-norefs": if (pic) { pic.norefs = !pic.norefs; commit(); } return;      // 0.23.4
+    case "ipic-plate-cast": { const pk = ipicById(el.dataset.id), r = pk && pk.results[pk.current]; if (r) plateToCast(pk, r); return; }
     case "ipic-fold": if (pic) { pic.folded = !pic.folded; commit(); } return;
     case "ipic-fold-all": { const all = ipics().length && ipics().every((x) => x.folded); ipics().forEach((x) => { x.folded = !all; }); commit(); return; }
     case "iset-sampler": imgSet().sampler_kind = el.dataset.v === "ksampler" ? "ksampler" : "lcm"; commit(); return;
@@ -13061,7 +13279,7 @@ async function imagesAction(a, el, e) {
     case "ipic-render-all": {
       if (setupGuard()) return;
       const specs = [];
-      for (const x of ipics()) if (x.text.trim()) for (let k = 0; k < (x.count || 1); k++)
+      for (const x of ipics()) if (picReady(x)) for (let k = 0; k < (x.count || 1); k++)
         specs.push({ type: "image", target: x.id, what: x.title || `Picture ${ipicNum(x)}`, seed: x.seed < 0 ? Math.floor(Math.random() * (SEED_MAX + 1)) : x.seed + k });
       if (!specs.length) { toast("No Picture has a prompt yet."); return; }
       enqueue(specs, 1, true);
@@ -13071,6 +13289,7 @@ async function imagesAction(a, el, e) {
     case "ipic-dup": {
       if (!pic || setupGuard()) return;
       newPicture(pic, { title: pic.title ? pic.title + " copy" : "", text: pic.text, edit: pic.edit ? Object.assign({}, pic.edit) : null,
+        regions: (pic.regions || []).map((r) => Object.assign({}, r)), region_mode: pic.region_mode,
         megapixels: pic.megapixels, aspect: pic.aspect, seed: pic.seed, steps: pic.steps, expand: pic.expand, count: pic.count });
       commit(); return;
     }
@@ -13083,7 +13302,8 @@ async function imagesAction(a, el, e) {
     }
     case "ipic-pick": if (pic) { pic.current = Number(el.dataset.i) || 0; IMG.pic = pic.id; commit(); } return;
     case "ipic-step": if (cur.pic) { cur.pic.current = Math.max(0, Math.min(cur.pic.results.length - 1, cur.pic.current + Number(el.dataset.dir))); commit(); } return;
-    case "ipic-edit-clear": if (pic) { pic.edit = null; commit(); } return;
+    case "ipic-edit-clear": if (pic) { pic.edit = null; pic.regions = []; commit(); } return;
+    case "ipic-regions": if (pic && pic.edit) openRegions(pic); return;     // 0.25.0
     case "ipic-edit-pick": if (pic) pickEditPicture(pic); return;
     case "iref-upload": {
       const inp = document.createElement("input");
@@ -13411,6 +13631,19 @@ function ipicProgress() {
 // Cast & Scenes card (bypassed, so no Shot's references change until it's turned on) or a
 // file in the Images References.
 // ---------------------------------------------------------------------------
+/** 0.23.4: the aspect preset closest to a picture's shape. */
+function nearestAspect(w, h) {
+  const list = ((S.opts || {}).aspects || ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "21:9"]);
+  const r = w / h;
+  return list.reduce((best, a) => { const [x, y] = a.split(":").map(Number); const d = Math.abs(Math.log(x / y / r));
+    return !best || d < best.d ? { a, d } : best; }, null).a;
+}
+/** 0.23.4: a clean plate result into Cast & Scenes as a scene card, on. */
+function plateToCast(pic, r) {
+  if (!pic || !r || !pic.plate) return;
+  adoptIntoCast(r, null, { label: pic.plate.label,
+    desc: `the empty place of ${pic.plate.what}: its layout, furniture, windows and lighting, with no people` });
+}
 function closeFrameMenu() { const m = document.getElementById("frame-menu"); if (m) m.remove(); }
 function frameRefMenu(btn) {
   if (document.getElementById("frame-menu")) { closeFrameMenu(); return; }
@@ -13418,7 +13651,8 @@ function frameRefMenu(btn) {
   m.id = "frame-menu";
   m.className = "frame-menu";
   m.innerHTML = `<button data-action="frame-ref-to" data-to="cast">Cast &amp; Scenes <span class="muted small">· a new card, bypassed</span></button>
-    <button data-action="frame-ref-to" data-to="images">Images References</button>`;
+    <button data-action="frame-ref-to" data-to="images">Images References</button>
+    <button data-action="frame-ref-to" data-to="plate">🧹 Clean plate <span class="muted small">· people removed, then to Cast &amp; Scenes</span></button>`;
   document.body.appendChild(m);
   const r = btn.getBoundingClientRect();
   m.style.left = Math.max(8, Math.min(window.innerWidth - m.offsetWidth - 8, r.left + window.scrollX)) + "px";
@@ -13451,6 +13685,20 @@ async function frameToRef(to) {
   catch (err) { toast("Couldn't save the frame: " + err.message); return; }
   const what = `Frame from ${sh ? titleOf(sh) : "the film"} at ${fmt(t)} on the timeline`;
   const label = `<${where}_frame>`;
+  if (to === "plate") {                          // 0.23.4: an empty plate of this place, made on the Images side
+    const plateLabel = `<${where}_plate>`;
+    const pic = newPicture(null, { title: `${where} plate`, norefs: true, count: 1,
+      plate: { shot: sh ? sh.id : null, label: plateLabel, what: `${sh ? titleOf(sh) : "the film"} at ${fmt(t)}` },
+      edit: { image: info.name, subfolder: info.subfolder, type: "input", label: `${where} frame`, width: c.width, height: c.height },
+      text: "Remove every person from <Picture 1>. Keep everything else exactly as it is: the place, its layout, " +
+        "furniture, windows, props, colours and lighting, seen from the same camera position. The empty scene, no people." });
+    if (stillEngine()) pic.aspect = nearestAspect(c.width, c.height);
+    commit();
+    ipicRender(pic, 1, true);
+    toast(`Making a clean plate of ${sh ? titleOf(sh) : "this frame"} on the Images side (it's in the Queue). When it's done: ＋ Plate to Cast & Scenes.`,
+      { label: "Show", fn: () => { setMode("images"); IMG.pic = pic.id; render(); } });
+    return;
+  }
   if (to === "images") {
     irefs().push({ id: uid("ir"), label, cast: null, image: info.name, subfolder: info.subfolder, type: "input",
       sha256: info.sha256 || null, bypassed: false, from: "file" });

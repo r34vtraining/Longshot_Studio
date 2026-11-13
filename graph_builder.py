@@ -410,6 +410,38 @@ def live_retention(project: dict, text, warnings=None) -> str:
     return "\n".join(out).strip()
 
 
+_PLACE_WORDS = re.compile(r"^(scene|location|place|room|set|background|bg|environment|env|interior|exterior|plate|"
+                          r"backdrop|landscape|street|house|castle|tower|hall|forest)", re.I)
+
+
+def people_in(text, cast):
+    """0.23.1: the Cast cards a Shot's text names that look like people (not a scene / location
+    card, by label or description): [(<Label>, <Picture N>)] in card order."""
+    low = str(text or "").lower()
+    out = []
+    for k, c in enumerate(cast):
+        name = re.sub(r"[<>]", "", str(c.get("label") or "")).strip()
+        if not name or f"<{name.lower()}>" not in low:
+            continue
+        desc = str(c.get("desc") or "").strip()
+        if _PLACE_WORDS.match(name) or re.match(r"^(a |an |the )?(interior|exterior|tower|room|castle|hall|street|"
+                                                r"courtyard|corridor|forest|landscape|view)\b", desc, re.I):
+            continue
+        out.append((f"<{name}>", picture_label(k)))
+    return out
+
+
+def context_line(pic, people):
+    """0.23.1: what a Context / Cutaway Shot takes from the frame before: the place and its light,
+    never a person; each person the Shot names tied to their own picture."""
+    who = (" and ".join(f"{tag} exactly as in {ref}" for tag, ref in people)
+           if people else "every character exactly as in their own reference pictures")
+    return (f"Location and light: <Picture {pic}> shows this same place; keep its setting, layout, props and "
+            f"lighting (direction, colour, time of day), seen from a new camera angle. No person's appearance "
+            f"comes from <Picture {pic}>: {who}. The shot does not begin from <Picture {pic}> and does not "
+            f"continue it.")
+
+
 def audio_copied(project: dict) -> bool:
     """Is an audio reference set to Copy (0.12.0)? Then the summary adds "audio reuse"."""
     return any(audio_role(v) != "voice" and v.get("use") == "copy" for v in active_voices(project))
@@ -1174,7 +1206,7 @@ def build_face_swap(project: dict, item: dict, env: Env | None = None) -> Build:
         raise BuildError(f"Face swap needs a ref2va model (it takes the new face as a reference picture); "
                          f"{sw['model']} isn't one.")
     if not env.longshot_at_least(1, 9, 0):
-        raise BuildError("Face swap needs H3 Long Shot 1.9.0 or later. Update it, then restart ComfyUI.")
+        raise BuildError("Face swap needs H3 Long Shot 1.9.1 or later. Update it, then restart ComfyUI.")
     for key in ("video_vae", "audio_vae", "clip"):
         if not s.get(key):
             raise BuildError(f"Settings: choose a {key.replace('_', ' ')} file.")
@@ -1214,14 +1246,16 @@ def build_face_swap(project: dict, item: dict, env: Env | None = None) -> Build:
         base = key
     elif src.get("kind") == "file":
         if not env.has("MiniMaxH3LoadVideo"):
-            raise BuildError("Face swap on a video file needs H3 Long Shot 1.9.0 (MiniMax H3 Load Video). Restart ComfyUI after updating.")
+            raise BuildError("Face swap on a video file needs H3 Long Shot 1.9.1 (MiniMax H3 Load Video). Restart ComfyUI after updating.")
         try:
             path = pj.input_path_value(str(src.get("file") or ""), str(src.get("subfolder") or ""))
         except ValueError as err:
             raise BuildError(f"Face swap video: {err}") from None
+        # 0.23.5: Long Shot 1.9.1's one Load Video (images, frame_count, audio)
         load = g.add("swapsrc", "MiniMaxH3LoadVideo", f"Video {src.get('file')}", video=path,
+                     skip_first_frames=0, frame_load_cap=0, width=0, height=0, force_rate=float(FPS),
                      max_seconds=_num(src.get("max_seconds", 60), "Face swap length", 1, 600))
-        images, audio, lat = _out(load, 0), _out(load, 1), None
+        images, audio, lat = _out(load, 0), _out(load, 2), None
         base = re.sub(r"[^A-Za-z0-9_-]+", "_", os.path.splitext(str(src.get("file")))[0])[:60] or "video"
     else:
         raise BuildError("Face swap: choose a Shot's take or a video file.")
@@ -1676,6 +1710,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         text = shot.get("text", "")
         anchor_inputs = {}
         own_retention = ""
+        ctx_tail = ""
         if not lock:
             # Frame anchors (Long Shot 1.6.7): the image at the join before this Shot and
             # the one after it. Each is this Shot's next <Picture N>, after the Cast.
@@ -1710,21 +1745,22 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                 # "open on this frame and carry on from it". 0.22.1: the location only: people in the
                 # frame drifted toward the model's own idea of them (a well-known IP) instead of the
                 # reference sheets, so no likeness is taken from it.
-                lead = (f"<Picture {pic}> is a reference for the location only: the setting, its layout, light "
-                        f"and props. No person's appearance comes from <Picture {pic}>: every character looks "
-                        "exactly as in their own reference pictures. "
-                        f"The shot does not begin from <Picture {pic}> and does not continue it: it opens "
-                        "on a new camera angle and composition. ") + lead
+                # 0.23.1: after the Shot's own text (it opens on its camera and action), each person
+                # the Shot names tied to their own picture, and the light kept
+                ctx_tail = context_line(pic, people_in(shot.get("text", ""), cast))
                 if not env.shot_takes("retention"):
                     msg = ("H3 Long Shot 1.6.9 or later marks a Context picture as weak_reference in the "
                            "retention section. Update it for Context Shots that don't open on that frame.")
                     if msg not in warnings:
                         warnings.append(msg)
                 else:
-                    own_retention = (f"<Picture {pic}> (reference for [Shot 1]): partially_preserved - the location "
-                                     "only (setting, layout, light, props), seen from a new camera angle; no "
-                                     "character appearance comes from it; not a frame anchor.")
+                    own_retention = (f"<Picture {pic}> (reference for [Shot 1]): partially_preserved - the same "
+                                     "location and lighting (setting, layout, props, light direction and colour), "
+                                     "seen from a new camera angle; no character appearance comes from it; not a "
+                                     "frame anchor.")
             text = (lead + text + tail).strip()
+            if ctx_tail:
+                text = f"{text}\n\n{ctx_tail}"
         inputs = dict(shot_id=str(shot.get("id") or f"shot{n}"), seconds=seconds,
                       text=text,
                       shot_seed=_seed(shot.get("shot_seed", -1), f"Shot {n} seed"),
@@ -2383,6 +2419,203 @@ def build_still(project: dict, item: dict, env: Env | None = None) -> Build:
     nodes = {"sampler": "sample", "save": "save", "longshot": "sample", "combine": "decode", "cond": "r2v"}
     return Build(prompt=g.nodes, width=int(width * scale), height=int(height * scale), chain=[], nodes=nodes,
                  filename_prefix=prefix, video_format="", warnings=warnings)
+
+
+# ---------------------------------------------------------------------------
+# 0.25.0: Region edits. Boxes drawn on the picture being edited (x, y, w, h as 0..1 of it, and
+# an optional note each). Paste back: the edit renders whole, and only the boxes are taken from
+# it (soft edges) onto the picture, which stays as it was everywhere else. Zoom in: each box,
+# with a margin around it, is cut out and edited on its own at the full render size with its own
+# note, then pasted back the same way (one generation per box).
+# ---------------------------------------------------------------------------
+
+REGION_MODES = ("paste", "zoom")
+REGION_MAX = 6
+REGION_MARGIN = 0.25          # Zoom in: context around each box, as a share of its size, per side
+# 0.25.1: a box with no note and no prompt: redrawn as it is, with clean detail
+REGION_REFINE = ("The same picture, redrawn exactly as it is with clean, sharp, natural detail; nothing in it "
+                 "changes, moves or is added.")
+REGION_NODES = ["LoadImage", "ImageScale", "ImageCrop", "SolidMask", "FeatherMask", "ImageCompositeMasked"]
+
+
+def clean_regions(raw) -> list:
+    out = []
+    for r in raw if isinstance(raw, list) else []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            x, y, w, h = (min(1.0, max(0.0, float(r.get(k) or 0))) for k in ("x", "y", "w", "h"))
+        except (TypeError, ValueError):
+            continue
+        w, h = min(w, 1 - x), min(h, 1 - y)
+        if w < 0.01 or h < 0.01:
+            continue
+        out.append({"x": x, "y": y, "w": w, "h": h, "note": re.sub(r"\s+", " ", str(r.get("note") or "")).strip()[:600]})
+    return out[:REGION_MAX]
+
+
+def region_where(r: dict) -> str:
+    """Where a box sits, in words: 'upper left', 'centre', 'lower right'…"""
+    cx, cy = r["x"] + r["w"] / 2, r["y"] + r["h"] / 2
+    v = "upper" if cy < 1 / 3 else "lower" if cy > 2 / 3 else ""
+    h = "left" if cx < 1 / 3 else "right" if cx > 2 / 3 else ""
+    return f"{v} {h}".strip() or "centre"
+
+
+def region_crops(regions: list, ew: int, eh: int) -> list:
+    """Zoom in: for each box, (x, y, w, h) in the picture's pixels with its margin, and the margin
+    actually taken on each side (left, top, right, bottom), clamped to the picture."""
+    out = []
+    for r in regions:
+        bx, by = round(r["x"] * ew), round(r["y"] * eh)
+        bw, bh = max(8, round(r["w"] * ew)), max(8, round(r["h"] * eh))
+        mx, my = round(bw * REGION_MARGIN), round(bh * REGION_MARGIN)
+        x0, y0 = max(0, bx - mx), max(0, by - my)
+        x1, y1 = min(ew, bx + bw + mx), min(eh, by + bh + my)
+        out.append({"rect": (x0, y0, x1 - x0, y1 - y0), "margin": (bx - x0, by - y0, x1 - (bx + bw), y1 - (by + bh))})
+    return out
+
+
+def nearest_aspect(w, h) -> str:
+    r = math.log(max(1, w) / max(1, h))
+    return min(ASPECTS, key=lambda a: abs(math.log(ASPECTS[a][0] / ASPECTS[a][1]) - r))
+
+
+def _link(v):
+    return isinstance(v, list) and len(v) == 2 and isinstance(v[0], str) and isinstance(v[1], int)
+
+
+def _merge(g: "_Graph", nodes: dict, prefix: str, skip=()) -> dict:
+    """Copy a built graph into g, its ids prefixed; a node identical to one already there (the
+    loaders) is shared. Returns old id -> new id."""
+    idmap = {}
+    seen = {json.dumps([n["class_type"], n["inputs"]], sort_keys=True): nid for nid, n in g.nodes.items()}
+    for nid, n in nodes.items():
+        if nid in skip:
+            continue
+        inputs = {k: ([idmap.get(v[0], v[0]), v[1]] if _link(v) else v) for k, v in n["inputs"].items()}
+        sig = json.dumps([n["class_type"], inputs], sort_keys=True)
+        if sig in seen:
+            idmap[nid] = seen[sig]
+            continue
+        new = f"{prefix}{nid}"
+        g.nodes[new] = dict(n, inputs=inputs)
+        seen[sig] = idmap[nid] = new
+    return idmap
+
+
+def _paste(g, nid, dest, src, x, y, w, h, feather):
+    """src (already w x h) onto dest at x, y under a box mask whose sides fade over feather
+    (left, top, right, bottom) pixels."""
+    m = g.add(f"{nid}_m", "SolidMask", "Region mask", value=1.0, width=w, height=h)
+    l, t, r, b = (max(0, int(f)) for f in feather)
+    if l or t or r or b:
+        m = g.add(f"{nid}_f", "FeatherMask", "Soft edges", mask=m, left=l, top=t, right=r, bottom=b)
+    return g.add(nid, "ImageCompositeMasked", "Paste region", destination=dest, source=src, x=x, y=y,
+                 resize_source=False, mask=m)
+
+
+def build_regions(project: dict, item: dict, builder, env: Env | None = None, crops: list | None = None) -> Build:
+    """item as build_still / build_image (builder), with regions [{x, y, w, h, note}] and region_mode
+    (paste | zoom). The edit needs its width and height. crops (Zoom in): an edit dict per box for
+    its cut-out (region_crops' rects), made by the server."""
+    env = env or Env()
+    item = dict(item or {})
+    regions = clean_regions(item.pop("regions", None))
+    mode = item.pop("region_mode", "paste")
+    mode = mode if mode in REGION_MODES else "paste"
+    edit = item.get("edit") if isinstance(item.get("edit"), dict) else None
+    if not regions or not edit:
+        return builder(project, item, env=env)
+    missing = [c for c in REGION_NODES if not env.has(c)]
+    if missing:
+        raise BuildError("Region edits need these ComfyUI core nodes: " + ", ".join(missing) + ". Update ComfyUI.")
+    ew, eh = int(edit.get("width") or 0), int(edit.get("height") or 0)
+    if not (ew and eh):
+        raise BuildError("Region edits need the size of the picture being edited. Choose it again.")
+    video = builder is build_still
+    st = still_settings(project)
+    want_up = video and bool(item.get("upscale", st.get("upscale")))
+    item["upscale"] = False
+    text = str(item.get("text") or "").strip()
+    notes = [r for r in regions if r["note"]]
+    warnings = []
+    if mode == "paste":
+        told = " ".join(f"In the {region_where(r)} area: {r['note'].rstrip('.')}." for r in notes)
+        item["text"] = (text + (" " if text and told else "") + told).strip() or REGION_REFINE
+        base = builder(project, item, env=env)
+    else:
+        base = builder(project, dict(item, text=text or (notes[0]["note"] if notes else REGION_REFINE)), env=env)
+    if not base.width or not base.height:
+        raise BuildError("Region edits need the render size; choose the picture being edited again.")
+    # the canvas: the edited picture's shape at the render's pixel count
+    px = base.width * base.height
+    dw = max(64, round(math.sqrt(px * ew / eh) / 8) * 8)
+    dh = max(64, round(math.sqrt(px * eh / ew) / 8) * 8)
+    sx, sy = dw / ew, dh / eh
+    save = base.prompt[base.nodes["save"]]
+    g = _Graph()
+    if mode == "paste":
+        idmap = _merge(g, base.prompt, "", skip=(base.nodes["save"],))
+        gen = [idmap[save["inputs"]["images"][0]], save["inputs"]["images"][1]]
+        gen = g.add("rg_gen", "ImageScale", "Edit at the picture's shape", image=gen, upscale_method="lanczos",
+                    width=dw, height=dh, crop="center")
+        nodes = {k: idmap.get(v, v) for k, v in base.nodes.items() if k != "save"}
+        if video:
+            warnings.append("The video model redraws the whole scene, so a box may not line up with what's "
+                            "around it. Zoom in, or the H3-Image engine, keeps closer to the picture.")
+    else:
+        nodes, gens = {}, []
+        crops = crops or []
+        if len(crops) != len(regions) or not all(isinstance(c, dict) for c in crops):
+            raise BuildError("Couldn't cut out the boxes from the picture being edited.")
+        for k, (r, c) in enumerate(zip(regions, crops), 1):
+            sub = dict(item, edit=c, text=r["note"] or text or REGION_REFINE, seed=item.get("seed", 0))
+            if video:
+                sub["aspect"] = nearest_aspect(c["width"], c["height"])
+            b = builder(project, sub, env=env)
+            idmap = _merge(g, b.prompt, f"z{k}_", skip=(b.nodes["save"],))
+            sv = b.prompt[b.nodes["save"]]["inputs"]["images"]
+            gens.append([idmap[sv[0]], sv[1]])
+            nodes = {kk: idmap.get(v, v) for kk, v in b.nodes.items() if kk != "save"}
+            warnings += [w for w in b.warnings if w not in warnings]
+    pic = g.add("rg_pic", "LoadImage", "The picture being edited", image=_picture_path(edit, "The picture to edit"))
+    dest = g.add("rg_dest", "ImageScale", "At the render size", image=pic, upscale_method="lanczos",
+                 width=dw, height=dh, crop="disabled")
+    if mode == "paste":
+        for k, r in enumerate(regions, 1):
+            x, y = round(r["x"] * dw), round(r["y"] * dh)
+            w, h = max(8, round(r["w"] * dw)), max(8, round(r["h"] * dh))
+            f = max(4, round(0.08 * min(w, h)))
+            # grown by the soft edge, so the box itself is all new
+            x0, y0, x1, y1 = max(0, x - f), max(0, y - f), min(dw, x + w + f), min(dh, y + h + f)
+            src = g.add(f"rg_crop{k}", "ImageCrop", f"Box {k}", image=gen, width=x1 - x0, height=y1 - y0, x=x0, y=y0)
+            dest = _paste(g, f"rg_paste{k}", dest, src, x0, y0, x1 - x0, y1 - y0,
+                          (f if x0 else 0, f if y0 else 0, f if x1 < dw else 0, f if y1 < dh else 0))
+    else:
+        for k, (r, c, gen) in enumerate(zip(regions, region_crops(regions, ew, eh), gens), 1):
+            cx, cy, cw, ch = c["rect"]
+            x0, y0 = round(cx * sx), round(cy * sy)
+            x1, y1 = min(dw, round((cx + cw) * sx)), min(dh, round((cy + ch) * sy))
+            src = g.add(f"rg_fit{k}", "ImageScale", f"Box {k} back to its place", image=gen, upscale_method="lanczos",
+                        width=x1 - x0, height=y1 - y0, crop="center")
+            ml, mt, mr, mb = c["margin"]
+            dest = _paste(g, f"rg_paste{k}", dest, src, x0, y0, x1 - x0, y1 - y0,
+                          (round(ml * sx), round(mt * sy), round(mr * sx), round(mb * sy)))
+    scale = 1.0
+    if want_up and env.has("RTXVideoSuperResolution"):
+        quality = str(item.get("quality", st.get("quality", "ULTRA")))
+        quality = quality if quality in VSR_QUALITIES else "ULTRA"
+        scale = _num(item.get("scale", st.get("scale", 2.0)), "RTX upscale factor", 1, 4)
+        dest = g.add("vsr", "RTXVideoSuperResolution", "RTX Video Super Resolution", images=dest,
+                     resize_type="scale by multiplier", **{"resize_type.scale": scale}, quality=quality)
+    elif want_up:
+        warnings.append("RTX Super Resolution isn't installed, so the still is saved at the render size.")
+    g.nodes["save"] = dict(save, inputs=dict(save["inputs"], images=dest))
+    nodes["save"] = "save"
+    warnings = [w for w in base.warnings if w not in warnings] + warnings
+    return Build(prompt=g.nodes, width=int(dw * scale), height=int(dh * scale), chain=[], nodes=nodes,
+                 filename_prefix=base.filename_prefix, video_format="", warnings=warnings)
 
 
 def build_image_upscale(project: dict, item: dict, env: Env | None = None) -> Build:

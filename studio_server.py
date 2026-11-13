@@ -608,6 +608,19 @@ def image_with_dims(item):
     return item
 
 
+def region_cuts(project, item):
+    """0.25.0, Zoom in: each box (with its margin) cut out of the picture being edited, as input
+    files. None for one that couldn't be made."""
+    import folder_paths
+    edit = item.get("edit") or {}
+    ew, eh = int(edit.get("width") or 0), int(edit.get("height") or 0)
+    if not (ew and eh):
+        return None
+    regions = gb.clean_regions(item.get("regions"))
+    return [pj.region_crop(folder_paths.get_input_directory(), folder_paths.get_output_directory(),
+                           gb.project_slug(project), edit, c["rect"]) for c in gb.region_crops(regions, ew, eh)]
+
+
 def model_listing(kind):
     import folder_paths
     saved = pj.load_model_folders(model_folders_path()).get(kind, [])
@@ -1469,7 +1482,15 @@ def register(routes=None):
                 built = gb.build_image_upscale(project, body["image_up"], env=current_env())
             elif isinstance(body.get("image"), dict):
                 # 0.21.0: the video model makes the still unless the H3-Image engine is chosen
-                if body["image"].get("engine") == "h3image":
+                builder = gb.build_image if body["image"].get("engine") == "h3image" else gb.build_still
+                if gb.clean_regions(body["image"].get("regions")) and isinstance(body["image"].get("edit"), dict):
+                    # 0.25.0: region edits (boxes drawn on the picture being edited)
+                    item = image_with_dims(body["image"])
+                    crops = None
+                    if item.get("region_mode") == "zoom":
+                        crops = await asyncio.get_running_loop().run_in_executor(None, region_cuts, project, item)
+                    built = gb.build_regions(project, item, builder, env=current_env(), crops=crops)
+                elif builder is gb.build_image:
                     built = gb.build_image(project, image_with_dims(body["image"]), env=current_env())
                 else:
                     built = gb.build_still(project, body["image"], env=current_env())
@@ -1492,6 +1513,11 @@ def register(routes=None):
         except gb.BuildError as err:
             return error(err)
         out = built.as_dict()
+        # 0.23.5: Long Shot 1.9.0's Face Refine replaced Load Video with a copy that only reads
+        # the input folder (a refined face clip, a Clip Shot's trims and size all fail)
+        if longshot_version() == (1, 9, 0) and '"MiniMaxH3LoadVideo"' in json.dumps(out.get("prompt") or out):
+            return error(gb.BuildError("This needs H3 Long Shot 1.9.1: 1.9.0's MiniMax H3 Load Video can't read "
+                                       "output-folder clips or trims. Update it, then restart ComfyUI."))
         if context_notes:
             out["warnings"] = list(out.get("warnings") or []) + context_notes
         return web.json_response(out)
@@ -1524,14 +1550,25 @@ def register(routes=None):
                 while k > 0 and shots[k].get("cutaway"):
                     k -= 1
             prev = shots[k]
-            if prev.get("cutaway") and not sh.get("cutaway"):
+            # 0.24.0: a 180° Shot takes its frame from the Shot the page names (2 back)
+            src = sh.get("context_src") if sh.get("alt") else None
+            if src:
+                found = next((x for x in project.get("shots") or [] if isinstance(x, dict) and x.get("id") == src), None)
+                if found is None:
+                    continue
+                prev = found
+            elif prev.get("cutaway") and not sh.get("cutaway"):
                 continue                    # only cutaways before it: nothing to take the place from
-            if k != i - 1:
+            elif k != i - 1:
                 sh["context_back"] = 0          # not overlapping the Shot it takes the frame from
+            # 0.23.2: what frame: small + soft (default), full, or none (a plain Cut)
+            mode = sh.get("context_frame") or (project.get("settings") or {}).get("context_frame") or "soft"
+            if mode == "off":
+                continue
             if prev.get("kind") != "clip" and (prev.get("status") == "queued" or not prev.get("take")):
                 if not dry_run:
-                    notes.append(f"Shot {i + 1} (Context): the Shot before it has no take yet, so it "
-                                 "renders without its last frame.")
+                    notes.append(f"Shot {i + 1} ({'180°' if src else 'Context'}): the Shot "
+                                 f"{'2 back' if src else 'before it'} has no take yet, so it renders without its last frame.")
                 continue
             ffmpeg = ffmpeg or _ffmpeg_path()
             if not ffmpeg:
@@ -1543,7 +1580,7 @@ def register(routes=None):
             except (TypeError, ValueError):
                 back = 0
             info = pj.context_frame(folder_paths.get_output_directory(), folder_paths.get_input_directory(),
-                                    slug, prev, ffmpeg=ffmpeg, back=back)
+                                    slug, prev, ffmpeg=ffmpeg, back=back, soft=mode != "full")
             if info:
                 sh["context_image"] = info
             elif not dry_run:

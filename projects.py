@@ -21,7 +21,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.23.0"
+STUDIO_VERSION = "0.25.1"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "avif"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -436,7 +436,7 @@ CONTEXT_DIR = "context"
 _TAKE_FILE_RE = re.compile(r"[A-Za-z0-9_-]{1,160}\.safetensors")
 
 
-def context_frame(output_dir, input_dir, slug, prev, ffmpeg="ffmpeg", run=None, back=0):
+def context_frame(output_dir, input_dir, slug, prev, ffmpeg="ffmpeg", run=None, back=0, soft=False):
     """Context Continuity: the last frame of the Shot before (its take's clip,
     or a Clip Shot's video at its trim) as a PNG in the project's input folder,
     made once per take. Returns {file, subfolder} or None when there's nothing
@@ -475,11 +475,16 @@ def context_frame(output_dir, input_dir, slug, prev, ffmpeg="ffmpeg", run=None, 
         else:
             cmd_in = ["-sseof", "-1", "-i", src, "-update", "1"]
     name = f"{key}_last.png" if not back or prev.get("kind") == "clip" else f"{key}_b{back}.png"
+    if soft:
+        # 0.23.2: half the width and height (a quarter of the area: fewer tokens next to the reference
+        # sheets) and blurred, so the place, its colour and light come through but no figure to copy
+        name = name[:-4] + "_soft.png"
     dest = os.path.join(folder, name)
     if not os.path.isfile(dest) or os.path.getmtime(dest) < os.path.getmtime(src):
         os.makedirs(folder, exist_ok=True)
         tmp = dest + ".part.png"
-        res = run([ffmpeg, "-y", "-v", "error", *cmd_in, tmp])
+        vf = ["-vf", "scale=trunc(iw/4)*2:trunc(ih/4)*2:flags=area,gblur=sigma=5"] if soft else []
+        res = run([ffmpeg, "-y", "-v", "error", *cmd_in, *vf, tmp])
         if getattr(res, "returncode", 1) != 0 or not os.path.isfile(tmp):
             return None
         os.replace(tmp, dest)
@@ -2154,6 +2159,47 @@ def image_dims(path):
             return im.size
     except Exception:
         return None
+
+
+REGIONS_DIR = "regions"
+
+
+def region_crop(input_dir, output_dir, slug, edit, rect):
+    """0.25.0, Zoom in: part of the picture being edited (rect: x, y, w, h in its pixels) as a PNG
+    in input/longshot/<slug>/regions, made once per picture and rect. Returns the edit dict for
+    it ({image, subfolder, type, width, height, label}) or None."""
+    if not is_slug(slug) or not isinstance(edit, dict):
+        return None
+    name = str(edit.get("image") or edit.get("filename") or "")
+    try:
+        if edit.get("type") == "output":
+            src = resolve_output(output_dir, name, edit.get("subfolder") or "")
+        else:
+            src = resolve_input(input_dir, name, edit.get("subfolder") or "")
+    except ValueError:
+        return None
+    if not src or not os.path.isfile(src):
+        return None
+    x, y, w, h = (int(v) for v in rect)
+    st = os.stat(src)
+    key = hashlib.sha256(f"{os.path.realpath(src)}|{st.st_size}|{st.st_mtime_ns}|{x},{y},{w},{h}".encode()).hexdigest()[:20]
+    sub = f"{project_input_subfolder(slug)}/{REGIONS_DIR}"
+    folder = os.path.join(input_dir, *sub.split("/"))
+    out = f"r_{key}.png"
+    dest = os.path.join(folder, out)
+    if not os.path.isfile(dest):
+        try:
+            from PIL import Image
+            os.makedirs(folder, exist_ok=True)
+            with Image.open(src) as im:
+                part = im.convert("RGB").crop((x, y, x + w, y + h))
+                tmp = dest + ".part.png"
+                part.save(tmp, "PNG")
+            os.replace(tmp, dest)
+        except Exception:
+            return None
+    return {"image": out, "subfolder": sub, "type": "input", "width": w, "height": h,
+            "label": f"{edit.get('label') or 'picture'} (region)"}
 
 
 def thumbnail(output_dir, name, subfolder="", size=256, ffmpeg="ffmpeg", run=None, src_dir=None):
