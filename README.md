@@ -21,7 +21,7 @@ thrown away.
 - Reference-to-video like the ComfyUI MiniMax H3 workflow: picture references for
   characters, outfits and places, plus audio references for character voices.
 - Join each Shot to its neighbours with **Continuous**, **Bridge**, **Lead in**, **Context**,
-  **Cutaway** or **Cut** (see [The join chip](#the-join-chip)).
+  **180°**, **Cutaway** or **Cut** (see [The join chip](#the-join-chip)).
 - Frame anchors: first or last-frame images at any join.
 - **Render all** renders every Shot in order as one flowing chain; **Render group** does the same
   for one group. Multi-take with seed control, a render queue across projects (pause, reorder by
@@ -29,6 +29,8 @@ thrown away.
 - Before a render, the `<tags>` in the prompts are checked against the reference cards, so a
   bypassed or misspelled reference is caught before it wastes a render.
 - A song as reference audio (`<Audio 1>`) for singing Shots.
+- **Images tab**: make stills in the same project with the H3 video model or the H3 Image model,
+  edit a picture (whole, or only inside boxes you draw), and send results to Cast & Scenes.
 
 **Edit**
 - A zoomable timeline with one block per Shot: switch takes instantly, loop the seam, approve or
@@ -51,11 +53,24 @@ thrown away.
 
 ## What's new in 0.25.1
 
-1. added region edit to H3 Image edit, draw a box, type an edit for that box, draw multiple boxes for multiedits
-2. edited region are pasted back with feather border to original pixels, so unedited parts aren't affected.
-3. Added new Shot Chip in the shot prompt boxes.  The 180 Chip will sample the last frame 2 shots back for conversational exchanges (look up 180deg rule in film making)
-4. Fixed bugs
-   
+1. **Region edit (Images tab).** Click the picture under To edit to open it large, draw up to 6
+   boxes and give each its own edit. Only the boxes change; they're pasted back onto the original
+   with soft edges.
+   - **Paste back**: one render of the whole picture, only the boxes kept.
+   - **Zoom in**: each box rendered on its own at full size, for small details. A box with no
+     note just gets cleaned up and sharpened.
+2. **⇄ 180° chip** for shot / reverse-shot conversations (the 180° rule). It's like Context, but takes
+   the last frame from **2 Shots back**, so each side of the conversation picks up from its own last
+   Shot: in A B C D E F, C uses A, D uses B, E uses C.
+3. **Context frame** setting (project or per Shot): **Small + soft** (default), **Full** or **Off**.
+   A small, blurred frame gives the place and light without pulling faces away from the reference
+   cards.
+4. **Clean plate**: a Picture can render without the References, for an empty set to use as a
+   location card.
+5. Fixed: exporting a refined face clip failed with "isn't in ComfyUI's input folder" (needs H3 Long
+   Shot 1.9.1).
+
+
 ## What's new in 0.23.0
 
 1. Notes on a take
@@ -101,7 +116,7 @@ The token check flagged only an unknown <Nope>.
    card for the new face, and the ref2va model redraws the face as that person, keeping the head
    movement, expression and mouth. One face swaps the largest face found; for up to four faces, draw
    a box around each and give each its own picture. Results go to `<project>/Face_Swap`.
-   Needs H3 Long Shot 1.9.0 and a ref2va model.
+   Needs H3 Long Shot 1.9.1 and a ref2va model.
 3. **Region refine.** For faces the detector can't see (cartoon characters, creatures), draw a box on
    the first and last frame and describe what's in it. The box follows a straight line between key
    frames.
@@ -135,7 +150,7 @@ The token check flagged only an unknown <Nope>.
 | Pack | Needed for |
 |---|---|
 | [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) | prompts (always) |
-| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.9.1+** | Face swap (with a ref2va model) |
+| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.9.1+** | rendering, Clip Shots, Face refine and Face swap (with a ref2va model) |
 
 ffmpeg is needed (on PATH, or `pip install imageio-ffmpeg` with ComfyUI's Python).
 
@@ -199,6 +214,7 @@ choices; which ones it offers depends on what's rendered next to it.
 |---|---|
 | **Cut** | A fresh shot from the references, a hard cut. |
 | **Context** | A new angle: a hard cut, with the last frame of the Shot before as a reference. |
+| **180°** | Shot / reverse shot: like Context, but the frame comes from 2 Shots back (the last Shot on that side of the conversation). |
 | **Cutaway** | A Context Shot the next Shot doesn't see: the Shot after it continues from the Shot before the cutaway (B-roll). |
 | **Continuous** | Flows on from the Shot before, one longer take. |
 | **Bridge** | Continuous between two rendered Shots: pinned at both ends. |
@@ -208,6 +224,7 @@ choices; which ones it offers depends on what's rendered next to it.
   Context splits the run there, Cut starts fresh.
 - **▶ on one Shot** (and every other render button) follows its chip and pins it to the rendered
   Shots next to it (approved or under review). The Shots around it keep their takes.
+- Context, 180° and Cutaway Shots use the **Context frame** setting: Small + soft (default), Full or Off.
 - Takes made at another resolution can't be joined: change the resolution back, or re-render
   those Shots at the new size, working forward from the first one.
 
