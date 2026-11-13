@@ -49,6 +49,13 @@ thrown away.
 - Dialogue and SFX stems as separate .wav files.
 - Export or import a whole project as one .zip.
 
+## What's new in 0.25.1
+
+1. added region edit to H3 Image edit, draw a box, type an edit for that box, draw multiple boxes for multiedits
+2. edited region are pasted back with feather border to original pixels, so unedited parts aren't affected.
+3. Added new Shot Chip in the shot prompt boxes.  The 180 Chip will sample the last frame 2 shots back for conversational exchanges (look up 180deg rule in film making)
+4. Fixed bugs
+   
 ## What's new in 0.23.0
 
 1. Notes on a take
