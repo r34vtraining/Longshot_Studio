@@ -1425,3 +1425,7 @@ select option, select optgroup { background-color: var(--field); color: var(--te
 .rgn-row { display: flex; align-items: center; gap: 8px; }
 .rgn-row input { flex: 1; min-width: 0; }
 .rgn-row.sel .rgn-num { background: #FFE2B0; }
+
+/* 0.26.1: the notes box flashes when a note is added or jumped to */
+.shot-notes { transition: background-color .4s, box-shadow .4s; border-radius: 6px; }
+.shot-notes.flash { background: rgba(255,208,138,.12); box-shadow: 0 0 0 1px rgba(255,208,138,.5); }

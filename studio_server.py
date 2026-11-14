@@ -1551,7 +1551,7 @@ def register(routes=None):
                     k -= 1
             prev = shots[k]
             # 0.24.0: a 180° Shot takes its frame from the Shot the page names (2 back)
-            src = sh.get("context_src") if sh.get("alt") else None
+            src = sh.get("context_src") or None       # 0.26.0: or one picked by hand
             if src:
                 found = next((x for x in project.get("shots") or [] if isinstance(x, dict) and x.get("id") == src), None)
                 if found is None:
@@ -1567,8 +1567,8 @@ def register(routes=None):
                 continue
             if prev.get("kind") != "clip" and (prev.get("status") == "queued" or not prev.get("take")):
                 if not dry_run:
-                    notes.append(f"Shot {i + 1} ({'180°' if src else 'Context'}): the Shot "
-                                 f"{'2 back' if src else 'before it'} has no take yet, so it renders without its last frame.")
+                    notes.append(f"Shot {i + 1} ({'180°' if sh.get('alt') else 'Context'}): the Shot it takes its frame "
+                                 "from has no take yet, so it renders without that frame.")
                 continue
             ffmpeg = ffmpeg or _ffmpeg_path()
             if not ffmpeg:

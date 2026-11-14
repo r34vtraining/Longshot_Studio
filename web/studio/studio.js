@@ -206,6 +206,7 @@ function normalize(p) {
     // 0.24.0: 180° (shot / reverse shot): a Context Shot whose frame comes from 2 Shots back, the
     // last Shot on its side of the line
     alt: !!s.alt && s.join === "context" && !s.cutaway,
+    context_pick: typeof s.context_pick === "string" && s.context_pick ? s.context_pick : null,   // 0.26.0: frame from a chosen Shot
     context_from: s.context_from || null,     // Context: the take of the Shot before it was rendered from
     context_at: Number.isFinite(Number(s.context_at)) && s.context_at !== null ? Number(s.context_at) : null,   // 0.17.11: its frame (back from the end)
     kind: s.kind === "clip" ? "clip" : "shot",
@@ -383,9 +384,30 @@ function mainNext(act, i) {
 function ctxSource(act, i) {
   const x = act[i];
   if (!x || x.join !== "context") return null;
+  // 0.26.0: a Shot picked by hand (any Shot before it), else the chip's own rule
+  if (x.context_pick) { const k = act.findIndex((y) => y.id === x.context_pick); if (k >= 0 && k < i) return act[k]; }
+  return ctxAuto(act, i);
+}
+/** The chip's own rule: Context / Cutaway the Shot before (past cutaways), 180° 2 back. */
+function ctxAuto(act, i) {
+  const x = act[i];
+  if (!x || x.join !== "context") return null;
   const p1 = mainPrev(act, i);
   if (!x.alt || !p1) return p1;
   return mainPrev(act, act.indexOf(p1));
+}
+/** 0.26.0: the "Frame from" picker on a Context / 180° / Cutaway Shot: Auto (the chip's rule) or any Shot before it. */
+function ctxPickHTML(s) {
+  const act = active(), i = act.indexOf(s);
+  if (i <= 0) return "";
+  const auto = ctxAuto(act, i);
+  const before = act.slice(0, i).filter((y) => y.kind === "clip" || !isEmptyShot(y));
+  const lost = s.context_pick && !before.some((y) => y.id === s.context_pick);
+  const short = (y) => { const t = String(y.text || (y.clip && y.clip.file) || "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim(); return t.length > 34 ? t.slice(0, 34) + "…" : t; };
+  return `<label class="lbl-row" title="Which Shot's last frame this Shot takes as its reference (the last frame the film shows of it). Auto follows the chip: Context the Shot before, 180° the Shot 2 back.">Frame from <select data-shot-ctxfrom aria-label="Frame from">
+    <option value=""${!s.context_pick || lost ? " selected" : ""}>Auto${auto ? ` (${esc(titleOf(auto))})` : ""}</option>
+    ${before.slice().reverse().map((y) => `<option value="${esc(y.id)}"${s.context_pick === y.id ? " selected" : ""}>${esc(titleOf(y))}${short(y) ? " · " + esc(short(y)) : ""}</option>`).join("")}
+  </select></label>${lost ? '<span class="flag cut" title="The Shot it was set to take its frame from was removed or moved after it, so it uses Auto.">frame Shot gone</span>' : ""}`;
 }
 /** The Shot after a cutaway (or a run of them): it picks up from the Shot before the cutaway. */
 const afterCutaway = (s) => { const act = active(), i = act.indexOf(s); return i > 0 && !s.cutaway && !!act[i - 1].cutaway; };
@@ -626,9 +648,10 @@ function contextBack(x) {
   if (!x || x.join !== "context" || x.kind === "clip") return 0;
   const act = active(), i = act.findIndex((y) => y.id === x.id);
   let pv = i > 0 ? act[i - 1] : null;
-  if (pv && pv.cutaway && !x.cutaway) return 0;     // 0.22.1: after a cutaway: the last frame of the Shot before it
-  // 0.24.0: 180°: the last frame the film shows of the Shot 2 back (where it cut away to the other side)
-  if (x.alt) pv = ctxSource(act, i);
+  const far = ctxSource(act, i);
+  // 0.24.0 / 0.26.0: 180° or a picked Shot: the last frame the film shows of it (where it cut away)
+  if (far && far !== pv) pv = far;
+  else if (pv && pv.cutaway && !x.cutaway) return 0;     // 0.22.1: after a cutaway: the last frame of the Shot before it
   const Lp = pv && LAYOUT.byId[pv.id], sp = pv && shownSpan(pv);
   if (!Lp || !sp) return 0;
   return Math.max(0, (Lp.we + effEdit(pv).shift) - sp.b);
@@ -2898,7 +2921,8 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, f
   project.shots.forEach((x) => { const b = contextBack(x); if (b) x.context_back = b; });
   // 0.24.0: which Shot a Context Shot takes its frame from (a 180° Shot: 2 back)
   { const act = active(); project.shots.forEach((x) => { const i = act.findIndex((y) => y.id === x.id);
-    const src = i > 0 && x.alt ? ctxSource(act, i) : null; if (src) x.context_src = src.id; }); }
+    const src = i > 0 && x.join === "context" && (x.alt || x.context_pick) ? ctxSource(act, i) : null;
+    if (src && (x.alt || src !== mainPrev(act, i))) x.context_src = src.id; }); }
   // 0.17.24: a Shot on Lead in pins its end into the rendered Shot after, even one that starts with a Cut
   project.shots.forEach((x, i) => {
     if (!x.lead_in || x.bypassed) return;
@@ -6874,6 +6898,7 @@ function renderShotsNow() {
         <div class="shot-opts">
           <label class="lbl-row">Seconds <input type="number" step="0.1" min="0.1" data-shot-field="seconds" value="${esc(s.seconds)}" style="width:72px"${ro}></label>
           ${s.join === "context" && s.kind !== "clip" ? `<label class="lbl-row" title="The frame this Shot gets from the Shot before it (0.23.2)">Context frame <select data-shot-ctx aria-label="Context frame">${[["", `Project (${({ soft: "small + soft", full: "full", off: "off" })[P().settings.context_frame || "soft"]})`], ["soft", "Small + soft"], ["full", "Full"], ["off", "Off"]].map(([v, t]) => `<option value="${v}"${(s.context_frame || "") === v ? " selected" : ""}>${t}</option>`).join("")}</select></label>` : ""}
+          ${s.join === "context" && s.kind !== "clip" ? ctxPickHTML(s) : ""}
           <label class="lbl-row">Seed <input class="mono" data-shot-field="shot_seed" value="${s.shot_seed < 0 ? "" : esc(s.shot_seed)}" placeholder="auto${isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used) ? ` · ${s.seed_used}` : ""}" style="width:120px"${ro}></label>${seedStepHTML("shot-seed-step", !!ro, isAuto(s) ? "On auto: gives this Shot its own seed, one from its last take's" : "")}
           <button class="ghost sm" data-action="wrap" data-before="&lt;d&gt;[English] " data-after="&lt;/d&gt;">Wrap &lt;d&gt; dialogue</button>
           <button class="ghost sm" data-action="wrap" data-before="&quot;" data-after="&quot;">Wrap "on-screen text"</button>
@@ -7048,6 +7073,8 @@ function renderViewer() {
   $("loop").disabled = !has || !L;
   $("frame-ref").disabled = !has;
   $("note-add").disabled = !has;
+  { const n = openNotes().length, b = $("note-next");       // 0.26.1: every open note on the film
+    if (b) { b.hidden = !n; b.textContent = `📝 ${n} open`; } }
   drawNoteMarks();
   const hasFile = !!(lo && lo.video);
   // Open output folder always works (local only): the latest video, else the clips folder
@@ -9336,6 +9363,7 @@ document.addEventListener("click", async (e) => {
     case "reroll-shot": rerollShot(shotOf(el)); break;
     case "frame-ref": frameRefMenu(el); break;                       // 0.21.2
     case "note-add": addNoteHere(); break;                           // 0.23.0
+    case "note-next": noteNext(); break;                             // 0.26.1
     case "note-seek": noteSeek(shotOf(el) || shotById(el.dataset.shot), el.dataset.note); break;
     case "note-done": { const sh = shotOf(el), n = sh && sh.notes.find((x) => x.id === el.dataset.note); if (n) { n.done = !n.done; commit(); } break; }
     case "note-del": { const sh = shotOf(el); if (sh && await askOK("Delete this note?", "Delete")) { sh.notes = sh.notes.filter((x) => x.id !== el.dataset.note); commit(); } break; }
@@ -9669,6 +9697,16 @@ document.addEventListener("change", async (e) => {
       applyRefChange(mode, "Style & Sound");
     } else p.style[k] = el.value;
     return commit();
+  }
+  if (el.dataset.shotCtxfrom !== undefined) {     // 0.26.0: which Shot the frame comes from
+    const s = shotOf(el);
+    if (s) {
+      s.context_pick = el.value || null;
+      P().preview_dirty = true;
+      if (s.status !== "queued" && s.take) toast(`${titleOf(s)} takes its frame from ${el.value ? titleOf(shotById(el.value)) : "the chip's own Shot"} on its next render.`);
+      commit();
+    }
+    return;
   }
   if (el.dataset.shotCtx !== undefined) {         // 0.23.2: this Shot's context frame
     const s = shotOf(el);
@@ -13833,8 +13871,42 @@ async function addNoteHere() {
   const v = await askText(`Note on ${titleOf(sh)} at ${fmt(t)}${sh.take ? "" : " (not rendered yet)"}`, "");
   if (v === null || !v.trim()) return;
   sh.notes.push({ id: uid("n"), take: sh.take || null, t: Math.round(t * 1000) / 1000, text: v.trim().slice(0, 2000), done: false, made: Date.now() });
+  // 0.26.1: open its Shot card, where the note is listed
+  S.open = sh.id; S.focus = sh.id;
   commit();
-  toast(`Note added to ${titleOf(sh)} at ${fmt(t)}.`);
+  revealNotes(sh.id);
+  toast(`Note added to ${titleOf(sh)} at ${fmt(t)}. It's listed on ${titleOf(sh)}'s card.`);
+}
+/** 0.26.1: open notes on the current takes, in film order: [{sh, n, at}] (at: seconds on the film). */
+function openNotes() {
+  if (!P()) return [];
+  const out = [];
+  for (const e of TL.entries || []) {
+    const sh = shotById(e.id);
+    if (!sh || !sh.notes) continue;
+    for (const n of sh.notes) if (!n.done && !(n.take && n.take !== sh.take)) out.push({ sh, n, at: e.start + Math.min(n.t, Math.max(0, (e.dur || 0) - 0.01)) });
+  }
+  return out.sort((a, b) => a.at - b.at);
+}
+function revealNotes(id) {
+  requestAnimationFrame(() => {
+    revealShotCard(id);
+    const box = document.querySelector(`.shot[data-shot="${CSS.escape(id)}"] .shot-notes`);
+    if (box) { box.classList.add("flash"); setTimeout(() => box.classList.remove("flash"), 1200); }
+  });
+}
+/** 0.26.1: 📝 n open: the next open note after the playhead (then back to the first), its card opened. */
+function noteNext() {
+  const all = openNotes();
+  if (!all.length) { toast("No open notes."); return; }
+  const now = tlTime();
+  const nx = all.find((x) => x.at > now + 0.05) || all[0];
+  if (PL.playing) pausePlayer();
+  S.open = nx.sh.id; S.focus = nx.sh.id;
+  tlSeek(nx.at);
+  commit();
+  revealNotes(nx.sh.id);
+  toast(`${titleOf(nx.sh)} at ${fmt(nx.n.t)}: ${nx.n.text.length > 90 ? nx.n.text.slice(0, 90) + "…" : nx.n.text}`);
 }
 function noteSeek(sh, id) {
   const n = sh && sh.notes.find((x) => x.id === id);
