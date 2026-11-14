@@ -51,7 +51,7 @@ thrown away.
 - Dialogue and SFX stems as separate .wav files.
 - Export or import a whole project as one .zip.
 
-## What's new in 0.25.1
+## What's new in 0.26.1
 
 1. **Region edit (Images tab).** Click the picture under To edit to open it large, draw up to 6
    boxes and give each its own edit. Only the boxes change; they're pasted back onto the original
@@ -61,7 +61,8 @@ thrown away.
      note just gets cleaned up and sharpened.
 2. **⇄ 180° chip** for shot / reverse-shot conversations (the 180° rule). It's like Context, but takes
    the last frame from **2 Shots back**, so each side of the conversation picks up from its own last
-   Shot: in A B C D E F, C uses A, D uses B, E uses C.
+   Shot: in A B C D E F, C uses A, D uses B, E uses C.  If the context frame is more than 2 shots back,
+   use the custom selector box to pick the right context shot 
 3. **Context frame** setting (project or per Shot): **Small + soft** (default), **Full** or **Off**.
    A small, blurred frame gives the place and light without pulling faces away from the reference
    cards.
@@ -69,6 +70,7 @@ thrown away.
    location card.
 5. Fixed: exporting a refined face clip failed with "isn't in ComfyUI's input folder" (needs H3 Long
    Shot 1.9.1).
+6. Added notes for commenting on the timeline
 
 
 ## What's new in 0.23.0
