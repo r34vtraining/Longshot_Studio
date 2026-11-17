@@ -121,6 +121,8 @@ const DEFAULT_SETTINGS = {
   steps: 8, megapixels: 0.6, aspect: "16:9", ref_image_size: "match", ref_resize_px: 1500,
   context_frame: "soft",            // 0.23.2: the frame a Context / Cutaway Shot gets: soft | full | off
   sampler: "er_sde", scheduler: "beta", overlap: 22, seed: 1722, seed_mode: "increment",
+  // 0.27.0 (Long Shot 1.10.0): handoff care on Continuous joins: colour lock 0-1, tail refresh denoise (0 off), its steps
+  handoff_colour: 1, handoff_refresh: 0.25, handoff_steps: 4,
   shift_video: 12, shift_audio: 3, sage_attention: "auto", save_segments: true,
   rtx_vsr: { on: false, scale: 2, quality: "ULTRA", chunk_s: 10 },   // chunk_s: upscale a chunk at a time
   save_png: false, save_noaudio: false,      // Video Combine's side files: deleted after each render
@@ -179,6 +181,12 @@ function normalize(p) {
     has_audio: v.has_audio !== false, sound: !!v.sound, bypassed: !!v.bypassed }));
   p.ref_sets = p.ref_sets && typeof p.ref_sets === "object" ? p.ref_sets : {};      // 0.8.13: restore references
   p.take_refs = p.take_refs && typeof p.take_refs === "object" ? p.take_refs : {};
+  // 0.27.13: the prompt each take was rendered with (take stem -> text), for Use prompt
+  p.take_texts = p.take_texts && typeof p.take_texts === "object" ? p.take_texts : {};
+  for (const x of Array.isArray(p.shots) ? p.shots : []) {
+    const st = x && x.take ? String(x.take).replace(/\.safetensors$/, "") : "";
+    if (st && !(st in p.take_texts) && x.rendered && typeof x.rendered.text === "string" && x.rendered.text.trim()) p.take_texts[st] = x.rendered.text;
+  }
   p.style = Object.assign({ summary: "", retention: "", style_line: "", soundscape: "", music: "N/A",
     task_types: ["reference generation"] }, p.style || {});
   p.shots = (p.shots || []).map((s) => ({ id: s.id || uid("s"), text: s.text || "",
@@ -206,7 +214,10 @@ function normalize(p) {
     // 0.24.0: 180° (shot / reverse shot): a Context Shot whose frame comes from 2 Shots back, the
     // last Shot on its side of the line
     alt: !!s.alt && s.join === "context" && !s.cutaway,
-    context_pick: typeof s.context_pick === "string" && s.context_pick ? s.context_pick : null,   // 0.26.0: frame from a chosen Shot
+    context_pick: typeof s.context_pick === "string" && s.context_pick ? s.context_pick : null,
+    colour_reset: !!s.colour_reset,           // 0.27.0: a Continuous Shot whose colour and light may change
+    tail_refresh: !!s.tail_refresh,           // 0.27.1: this Continuous Shot's handoff is redrawn before it's pinned
+    colour_lock: !!s.colour_lock,             // 0.27.8: its handoff is colour-matched to the start of the chain   // 0.26.0: frame from a chosen Shot
     context_from: s.context_from || null,     // Context: the take of the Shot before it was rendered from
     context_at: Number.isFinite(Number(s.context_at)) && s.context_at !== null ? Number(s.context_at) : null,   // 0.17.11: its frame (back from the end)
     kind: s.kind === "clip" ? "clip" : "shot",
@@ -3307,6 +3318,7 @@ function adoptRows(rows, sent, standalone = false) {
       sh.context_at = sh.context_from ? Number(((sent || {})[sh.id] || {}).back) || 0 : null;   // 0.17.11: which frame of it
     }
     const was = (sent || {})[sh.id] || { text: sh.text, seconds: Number(sh.seconds) };
+    if (r.status !== "locked" && typeof was.text === "string") P().take_texts[takeStem(r.take)] = was.text;   // 0.27.13
     sh.rendered = { text: was.text, seconds: was.seconds, seed: Number(was.seed ?? sh.shot_seed) };
     sh.edit_from = null;
     // a new take: standalone or continued (the first Shot has nothing before it either way)
@@ -6386,7 +6398,7 @@ function shotRowHTML(s) {
           <span class="smeta">${isEmptyShot(s) ? `${(Number(s.seconds) || 0).toFixed(2)}s · <span class="hold-tag" title="No prompt: it holds its time on the film and never renders. Moving the Shot next to it makes it longer or shorter.">holds time</span>`
             : `${esc(s.seconds)}s · seed ${esc(seed)}`}${songSpanHTML(s)}${editTag(s)}${overlapTag(s)}${alignedTag(s)}${sizeTag(s)}</span></span>
           <span class="sprev">${esc(s.text) || '<i class="muted">empty</i>'}</span></span>
-          <span class="snotes">${flag}${cut}${standaloneTag}${ctxFlag}${(() => { const n = (s.notes || []).filter((x) => !x.done).length; return n ? `<span class="flag" title="${n} open note${n === 1 ? "" : "s"} on this Shot (open the card to see them)">📝 ${n}</span>` : ""; })()}
+          <span class="snotes">${flag}${cut}${standaloneTag}${ctxFlag}${!isCut(s) && s.kind !== "clip" && lsAtLeast(1, 10, 0) && s.colour_lock ? '<span class="flag" title="Colour lock: the frames it continues from are colour-matched to the start of the chain">◐ lock</span>' : ""}${!isCut(s) && s.kind !== "clip" && lsAtLeast(1, 10, 0) && s.tail_refresh ? '<span class="flag" title="Refresh handoff: the frames it continues from are redrawn before it\'s pinned to them">⟲ refresh</span>' : ""}${(() => { const n = (s.notes || []).filter((x) => !x.done).length; return n ? `<span class="flag" title="${n} open note${n === 1 ? "" : "s"} on this Shot (open the card to see them)">📝 ${n}</span>` : ""; })()}
           <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span></span>
         </button>
         <div class="shot-tools">
@@ -6899,26 +6911,35 @@ function renderShotsNow() {
           <label class="lbl-row">Seconds <input type="number" step="0.1" min="0.1" data-shot-field="seconds" value="${esc(s.seconds)}" style="width:72px"${ro}></label>
           ${s.join === "context" && s.kind !== "clip" ? `<label class="lbl-row" title="The frame this Shot gets from the Shot before it (0.23.2)">Context frame <select data-shot-ctx aria-label="Context frame">${[["", `Project (${({ soft: "small + soft", full: "full", off: "off" })[P().settings.context_frame || "soft"]})`], ["soft", "Small + soft"], ["full", "Full"], ["off", "Off"]].map(([v, t]) => `<option value="${v}"${(s.context_frame || "") === v ? " selected" : ""}>${t}</option>`).join("")}</select></label>` : ""}
           ${s.join === "context" && s.kind !== "clip" ? ctxPickHTML(s) : ""}
-          <label class="lbl-row">Seed <input class="mono" data-shot-field="shot_seed" value="${s.shot_seed < 0 ? "" : esc(s.shot_seed)}" placeholder="auto${isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used) ? ` · ${s.seed_used}` : ""}" style="width:120px"${ro}></label>${seedStepHTML("shot-seed-step", !!ro, isAuto(s) ? "On auto: gives this Shot its own seed, one from its last take's" : "")}
-          <button class="ghost sm" data-action="wrap" data-before="&lt;d&gt;[English] " data-after="&lt;/d&gt;">Wrap &lt;d&gt; dialogue</button>
-          <button class="ghost sm" data-action="wrap" data-before="&quot;" data-after="&quot;">Wrap "on-screen text"</button>
-          ${canReroll ? '<button class="ghost sm" data-action="reroll-shot">⟳ Reroll this Shot</button>' : ""}
+          ${s.kind !== "clip" && !isCut(s) && chipNear(s).prev && lsAtLeast(1, 10, 0) ? `<label class="lbl-row" title="Before this Shot is pinned to the end of the Shot before it, those frames get their colour and brightness pulled back toward the start of the chain (Colour lock ${esc(P().settings.handoff_colour)} in Advanced). Stops colour and brightness burn on long chains of static Shots; costs nothing. Unticked, the Shot is pinned as it always was."><input type="checkbox" data-shot-lock${s.colour_lock ? " checked" : ""}> Colour lock</label>
+          <label class="lbl-row" title="Before this Shot is pinned to the end of the Shot before it, those frames are redrawn at the Tail refresh denoise (Advanced: ${esc(P().settings.handoff_refresh)}, ${esc(P().settings.handoff_steps)} steps), which cleans grain built up on long chains of static Shots. Adds a short pass (about a minute at 1.2 MP)."><input type="checkbox" data-shot-refresh${s.tail_refresh ? " checked" : ""}> Refresh handoff</label>` : ""}
+          ${s.kind !== "clip" && !isCut(s) && chipNear(s).prev && lsAtLeast(1, 10, 0) && s.colour_lock ? `<label class="lbl-row" title="Tick it where the light is meant to change (lights go off, going outside): this Shot isn't colour-locked, and the Shots after it lock to it instead."><input type="checkbox" data-shot-reset${s.colour_reset ? " checked" : ""}> Let colour change</label>` : ""}
+          <label class="lbl-row">Seed <input class="mono" data-shot-field="shot_seed" value="${s.shot_seed < 0 ? "" : esc(s.shot_seed)}" placeholder="auto${isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used) ? ` · ${s.seed_used}` : ""}" style="width:150px"${ro}></label>${seedStepHTML("shot-seed-step", !!ro, isAuto(s) ? "On auto: gives this Shot its own seed, one from its last take's" : "")}${
+            isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used) && !inRender(s) ? `<button class="ghost sm" data-action="shot-seed-keep" title="Fix this Shot's seed at ${esc(s.seed_used)}, the seed of its take, so a re-render after you change the prompt or references uses the same seed. The take stays as it is.">📌 Keep seed ${esc(s.seed_used)}</button>` : ""}
         </div>
         ${notesHTML(s)}
         <div class="shot-opts shot-more">
-          ${takes}
+          <button class="ghost sm" data-action="group-one" title="${s.group ? "Start a new group with this Shot (Shift-click Shot headers to choose several)" : "Put this Shot in a group of its own, or Shift-click Shot headers to choose several first"}">▣ Group</button>
+          <button class="ghost sm" data-action="wrap" data-before="&lt;d&gt;[English] " data-after="&lt;/d&gt;">Wrap &lt;d&gt; dialogue</button>
+          <button class="ghost sm" data-action="wrap" data-before="&quot;" data-after="&quot;">Wrap "on-screen text"</button>
+          ${canReroll ? '<button class="ghost sm" data-action="reroll-shot">⟳ Reroll this Shot</button>' : ""}
           <span class="push"></span>
-          ${!s.bypassed && s.status !== "queued" ? `<button class="ghost sm" data-action="clear-render"${inRender(s) ? " disabled" : ""}
-            title="Back to not rendered: keeps the prompt, length and seed. The take stays in Take history.">Clear render</button>` : ""}
+          ${takes}
+          ${s.take && typeof P().take_texts[takeStem(s.take)] === "string" && P().take_texts[takeStem(s.take)] !== s.text
+            ? `<button class="ghost sm" data-action="take-prompt" data-shot="${esc(s.id)}" data-name="${esc(s.take)}" title="Put back the prompt this take was rendered with (Takes lists every take's prompt)">↺ Take's prompt</button>` : ""}
           ${s.kind !== "clip" && s.take ? `<button class="ghost sm" data-action="restore-refs"
             title="${refSetFor(s) ? (refSetFor(s).style ? "Put the project back the way it was for this take: Cast & Scenes become its references (others bypassed) and Style & Sound its text."
                 : "Put back the references this take was made with (others bypassed). Its Style & Sound text wasn't recorded (made before 0.16.0).")
               : "This take was made before 0.8.13, so what it was made with wasn't recorded."}">Restore all</button>` : ""}
-          <button class="ghost sm" data-action="group-one" title="${s.group ? "Start a new group with this Shot (Shift-click Shot headers to choose several)" : "Put this Shot in a group of its own, or Shift-click Shot headers to choose several first"}">▣ Group</button>
+          ${!s.bypassed && s.status !== "queued" ? `<button class="ghost sm" data-action="clear-render"${inRender(s) ? " disabled" : ""}
+            title="Back to not rendered: keeps the prompt, length and seed. The take stays in Take history.">Clear render</button>` : ""}
+        </div>
+        <div class="shot-opts shot-adds">
+          <span class="push"></span>
+          <button class="ghost sm" data-action="replace-clip" title="Put a video clip in this Shot's place (the Shot is kept, bypassed)">Replace with clip</button>
+          <button class="ghost sm" data-action="insert-clip-after" title="Insert a video clip after this Shot">⊕ Clip after</button>
           <button class="ghost sm" data-action="insert-before" title="Insert a new Shot before this one">⊕ Shot before</button>
           <button class="ghost sm" data-action="insert-after" title="Insert a new Shot after this one">⊕ Shot after</button>
-          <button class="ghost sm" data-action="insert-clip-after" title="Insert a video clip after this Shot">⊕ Clip after</button>
-          <button class="ghost sm" data-action="replace-clip" title="Put a video clip in this Shot's place (the Shot is kept, bypassed)">Replace with clip</button>
         </div>
         </div>` : "";
     return mark + `<div class="shot${state === "review" ? " review" : ""}${s.bypassed ? " off" : ""}" data-shot="${esc(s.id)}">${tiles(s)}
@@ -8764,6 +8785,17 @@ document.addEventListener("click", (e) => {
 }, true);
 
 $("ab").addEventListener("click", (e) => { if (e.target === $("ab")) closeAB(); });
+// 0.27.5: a click anywhere on a Picture card makes it the active one (the Preview follows). Only the
+// highlight and the Preview redraw, so a click into its prompt keeps the cursor there.
+document.addEventListener("click", (e) => {
+  const card = e.target.closest && e.target.closest("[data-ipic-card]");
+  if (!card || !P() || !imagesOn()) return;
+  const id = card.dataset.ipicCard;
+  if (IMG.pic === id || !ipicById(id)) return;
+  IMG.pic = id;
+  document.querySelectorAll("[data-ipic-card]").forEach((c) => c.classList.toggle("sel", c.dataset.ipicCard === id));
+  renderIpreview();
+}, true);
 
 document.addEventListener("keydown", (e) => {
   if ($("ab").hidden) return;
@@ -8821,7 +8853,9 @@ function renderAdvanced() {
     aq.innerHTML = `<div class="seg seg-sm" role="group" aria-label="Model">${pair.map((m) =>
       `<button data-action="quick-model" data-model="${esc(m)}" aria-pressed="${m === s.model}" title="${esc(m)}">${esc(modelTag(m))}</button>`).join("")}</div>`;
   }
-  $("adv-summary").textContent = [S.advOpen || !pair ? modelShort : "", s.sampler, s.scheduler, `overlap ${s.overlap}`]
+  $("adv-summary").textContent = [S.advOpen || !pair ? modelShort : "", s.sampler, s.scheduler, `overlap ${s.overlap}`,
+    (Number(s.handoff_colour) > 0 || Number(s.handoff_refresh) > 0) && lsAtLeast(1, 10, 0)
+      ? `handoff (per Shot) ${Number(s.handoff_refresh) > 0 ? "refresh " + Number(s.handoff_refresh) : ""}${Number(s.handoff_colour) > 0 && Number(s.handoff_refresh) > 0 ? " · " : ""}${Number(s.handoff_colour) > 0 ? "lock " + Number(s.handoff_colour) : ""}` : ""]
     .filter(Boolean).join(" · ");
   $("adv-chev").textContent = S.advOpen ? "Hide ▴" : "Show ▾";
   $("adv-toggle").setAttribute("aria-expanded", String(!!S.advOpen));
@@ -8846,6 +8880,12 @@ function renderAdvanced() {
       <label class="lbl">Reference resize (px) <input data-set="ref_resize_px" data-num type="number" min="64" step="2" value="${esc(s.ref_resize_px)}"></label>
       <label class="lbl">Shift video <input data-set="shift_video" data-num type="number" step="0.5" value="${esc(s.shift_video)}"></label>
       <label class="lbl">Shift audio <input data-set="shift_audio" data-num type="number" step="0.5" value="${esc(s.shift_audio)}"></label>
+    </div>
+    <div class="adv-sub" title="Long Shot 1.10.0. A Continuous Shot is pinned to the last ${esc(s.overlap)} frames of the Shot before it; over a long chain of static Shots, colour, brightness and grain build up there. These set the strengths for Continuous Shots with Colour lock or Refresh handoff ticked.">Handoff care (per Shot: Colour lock, Refresh handoff)${lsAtLeast(1, 10, 0) ? "" : ' <span class="warn-tag">needs H3 Long Shot 1.10.0</span>'}</div>
+    <div class="grid2">
+      <label class="lbl" title="For Continuous Shots with Colour lock ticked: pulls the colour and brightness of the pinned frames back toward the start of the chain. 0: off, 1: full. Let colour change on a Shot lets it change (lights off, going outside).">Colour lock <input data-set="handoff_colour" data-num type="number" min="0" max="1" step="0.05" value="${esc(s.handoff_colour)}"></label>
+      <label class="lbl" title="For Continuous Shots with Refresh handoff ticked (on the Shot): the pinned frames are redrawn at this denoise before they're pinned, which cleans built-up grain. Start around 0.25; too high and the handoff wobbles.">Tail refresh (denoise) <input data-set="handoff_refresh" data-num type="number" min="0" max="0.9" step="0.05" value="${esc(s.handoff_refresh)}"></label>
+      <label class="lbl" title="Steps for the tail refresh">Refresh steps <input data-set="handoff_steps" data-num type="number" min="1" max="50" step="1" value="${esc(s.handoff_steps)}"></label>
     </div>`;
 }
 
@@ -9191,6 +9231,7 @@ document.addEventListener("click", async (e) => {
     }
     case "take-step": { const s = shotOf(el) || reviewShot(); stepTake(s, +el.dataset.dir); break; }
     case "takes": manageTakes(shotOf(el) || reviewShot()); break;
+    case "take-prompt": { $("modal").hidden = true; useTakePrompt(P().shots.find((x) => x.id === el.dataset.shot), el.dataset.name); break; }   // 0.27.13
     case "use-take": { $("modal").hidden = true; const s = P().shots.find((x) => x.id === el.dataset.shot); useTake(s, el.dataset.name); break; }
     case "delete-take": deleteTake(el.dataset.shot, el.dataset.name); break;
     case "refresh": refreshPreview(); break;
@@ -9377,6 +9418,7 @@ document.addEventListener("click", async (e) => {
     case "frame-ref-to": closeFrameMenu(); frameToRef(el.dataset.to); break;
     case "use-seed": useSeed(shotOf(el), Number(el.dataset.seed)); break;
     case "shot-seed-step": stepShotSeed(shotOf(el), Number(el.dataset.d) || 0); break;
+    case "shot-seed-keep": keepShotSeed(shotOf(el)); break;                 // 0.27.6
     case "quick-model": {                          // 0.17.12: the folded Advanced panel's model switch
       if (setupGuard()) return;
       const m = el.dataset.model;
@@ -9698,6 +9740,36 @@ document.addEventListener("change", async (e) => {
     } else p.style[k] = el.value;
     return commit();
   }
+  if (el.dataset.shotLock !== undefined) {        // 0.27.8: Colour lock, per Continuous Shot
+    const s = shotOf(el);
+    if (s) {
+      s.colour_lock = !!el.checked;
+      P().preview_dirty = true; S.dry = null;
+      if (s.status !== "queued" && s.take) toast(`${titleOf(s)} uses this on its next render.`);
+      commit();
+    }
+    return;
+  }
+  if (el.dataset.shotRefresh !== undefined) {     // 0.27.1: Refresh handoff, per Continuous Shot
+    const s = shotOf(el);
+    if (s) {
+      s.tail_refresh = !!el.checked;
+      P().preview_dirty = true; S.dry = null;
+      if (s.status !== "queued" && s.take) toast(`${titleOf(s)} uses this on its next render.`);
+      commit();
+    }
+    return;
+  }
+  if (el.dataset.shotReset !== undefined) {       // 0.27.0: Let colour change
+    const s = shotOf(el);
+    if (s) {
+      s.colour_reset = !!el.checked;
+      P().preview_dirty = true; S.dry = null;
+      if (s.status !== "queued" && s.take) toast(`${titleOf(s)} uses this on its next render.`);
+      commit();
+    }
+    return;
+  }
   if (el.dataset.shotCtxfrom !== undefined) {     // 0.26.0: which Shot the frame comes from
     const s = shotOf(el);
     if (s) {
@@ -9864,6 +9936,14 @@ document.addEventListener("change", async (e) => {
   if (el.dataset.set) {
     const k = el.dataset.set;
     const v = el.dataset.num !== undefined ? Number(el.value) : el.value;
+    if (k.startsWith("handoff_")) {  // 0.27.0: only Continuous Shots rendered from now on use it
+      const lim = { handoff_colour: [0, 1], handoff_refresh: [0, 0.9], handoff_steps: [1, 50] }[k] || [0, 1];
+      p.settings[k] = Math.min(lim[1], Math.max(lim[0], Number.isFinite(v) ? v : lim[0]));
+      if (k === "handoff_steps") p.settings[k] = Math.round(p.settings[k]);
+      S.dry = null;
+      if (changed) toast("Applies to Continuous Shots with the matching tick, rendered from now on.");
+      return commit();
+    }
     if (k === "seed_mode") {         // only decides the next seeds: nothing rendered changes
       p.settings.seed_mode = v;
       S.dry = null;
@@ -10918,6 +10998,17 @@ function seedStepHTML(action, disabled, note) {
 
 /** A Shot's seed ±1. On auto, it takes its own seed from the one its last take used
  *  (or the next it would get) and stops following Settings. */
+/** 0.27.6: fix a Shot on auto at the seed its take used. Nothing renders: the take was made with
+ *  that seed, so it still matches; a re-render after a prompt or reference change uses it. */
+function keepShotSeed(s) {
+  if (!s || s.kind === "clip" || shotGuard(s) || !hasSeed(s.seed_used)) return;
+  const v = Number(s.seed_used);
+  s.shot_seed = v;
+  if (s.rendered) s.rendered.seed = v;
+  S.dry = null;
+  commit();
+  toast(`${titleOf(s)} keeps seed ${v}. Change its prompt or references and re-render: it uses the same seed.`);
+}
 function stepShotSeed(s, d) {
   if (!s || s.kind === "clip") return;
   let cur = Number(s.shot_seed);
@@ -12147,12 +12238,26 @@ function manageTakes(s) {
       <span class="muted small">seed ${esc(t.seed)} · ${esc((t.created || "").replace("T", " ").slice(0, 16))} · ${t.seconds ? t.seconds.toFixed(2) + " s · " : ""}${(t.bytes / 1048576).toFixed(1)} MB</span>
       ${cur ? '<span class="chip">In use</span>' : `<button class="ghost sm" data-action="use-take" data-shot="${esc(s.id)}" data-name="${esc(t.name)}">Use</button>
         <button class="ghost sm local-only" data-action="delete-take" data-shot="${esc(s.id)}" data-name="${esc(t.name)}">Delete</button>`}
+      ${(() => { const tx = P().take_texts[takeStem(t.name)]; return typeof tx === "string" ? `<div class="take-prompt"><span class="small">${esc(tx.length > 260 ? tx.slice(0, 260) + "…" : tx)}</span>${tx !== s.text ? `<button class="ghost sm" data-action="take-prompt" data-shot="${esc(s.id)}" data-name="${esc(t.name)}" title="Put this take's prompt back in the Shot's prompt box">↺ Use this prompt</button>` : '<span class="muted small">(the prompt now)</span>'}</div>` : '<div class="take-prompt muted small">Its prompt wasn\'t recorded (rendered before 0.27.13).</div>'; })()}
     </div>`;
   }).join("") || '<div class="muted">No saved takes yet.</div>';
   showModal(`Takes · ${titleOf(s)}`, "", `<div class="take-list">${rows}</div>
     <p class="muted small">Switching takes samples nothing. Deleting frees disk space; the take in use can't be deleted.${S.local ? "" : " Deleting works only on the machine running ComfyUI."}</p>`);
 }
 
+/** 0.27.13: put the prompt a take was rendered with back in its Shot's prompt box. On the take
+ *  in use, the Shot then matches its take again (nothing re-renders). Undo puts the text back. */
+function useTakePrompt(s, name) {
+  const tx = s && P().take_texts[takeStem(name || s.take)];
+  if (!s || typeof tx !== "string") { toast("That take's prompt wasn't recorded."); return; }
+  if (s.text === tx) return;
+  const before = s.text;
+  s.text = tx;
+  if (name === s.take && s.rendered) s.rendered.text = tx;
+  liveEdit(s);
+  commit();
+  toast(`${titleOf(s)}'s prompt is back to ${name === s.take ? "its take's" : "that take's"}.`, { label: "Undo", fn: () => { s.text = before; liveEdit(s); commit(); } });
+}
 async function deleteTake(id, name) {
   try { S.segStats = await api(`/longshot/takes/${encodeURIComponent(P().slug)}/${encodeURIComponent(name)}`, { method: "DELETE" }); }
   catch (e) { toast(e.message); return; }
@@ -12846,7 +12951,9 @@ function ipicCard(pic) {
       <label>Size <select data-ipic="megapixels" data-id="${esc(pic.id)}" aria-label="Megapixels">${mpList().map((m) => `<option value="${m}"${picMp(pic) === m ? " selected" : ""}>${m} MP</option>`).join("")}</select></label>
       ${edit && !stillEngine() ? "" : `<label><select data-ipic="aspect" data-id="${esc(pic.id)}" aria-label="Aspect">${((S.opts || {}).aspects || ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9"]).map((a) => `<option value="${a}"${picAspect(pic) === a ? " selected" : ""}>${a}</option>`).join("")}</select></label>`}
       <span class="size" title="Multiples of 32, as ComfyUI's Resolution Selector">${esc(sizeTxt)}</span>
-      <label title="-1: a new seed every render">Seed <input class="seed" type="number" min="-1" step="1" data-ipic="seed" data-id="${esc(pic.id)}" value="${pic.seed}"> ${pic.seed < 0 ? '<span class="muted">auto</span>' : ""}</label>
+      <label title="-1: a new seed every render">Seed <input class="seed" type="number" min="-1" step="1" data-ipic="seed" data-id="${esc(pic.id)}" value="${pic.seed}"> ${pic.seed < 0 ? '<span class="muted">auto</span>' : ""}</label>${
+        (() => { const r = pic.results[pic.current]; const sd = r && r.seed !== null && r.seed !== undefined && r.seed !== "" ? Number(r.seed) : NaN;
+          return Number.isFinite(sd) && sd >= 0 && Number(pic.seed) !== sd ? `<button class="ghost sm" data-action="ipic-seed-keep" data-id="${esc(pic.id)}" title="Use the seed of the result shown (${sd}) for this Picture's next renders, so you can change the prompt or references and keep the same seed">📌 Keep seed ${sd}</button>` : ""; })()}
       <label>Steps <input type="number" min="1" max="100" step="1" data-ipic="steps" data-id="${esc(pic.id)}" value="${picSteps(pic)}"${stillEngine() && !pic.steps ? ' title="From Settings (Video side) until you change it here"' : ""}></label>
       ${stillEngine() ? "" : `<label title="Qwen3.5 rewrites the prompt into the long caption the model is tuned for, before the render (needs the prompt expander file in Image settings, and ComfyUI 0.44.0)"><input type="checkbox" data-ipic="expand" data-id="${esc(pic.id)}"${pic.expand ? " checked" : ""}${!textGenOk() ? " disabled" : ""}> Expand prompt${pic.expand && !matchModel(im.expander, (S.opts || {}).clips) ? ' <span class="missing small">· expander file missing</span>' : ""}</label>`}
     </div>
@@ -12872,12 +12979,27 @@ function ipicCurrent() {
   const r = pic.results[Math.min(pic.current, pic.results.length - 1)] || null;
   return { pic, r };
 }
+/** 0.27.11: the big Render for the active Picture, with how many, above Image settings (it stays
+ *  there in the large view, where the Preview moves to the top). */
+function renderIrender(pic) {
+  const el = $("irender");
+  if (!el) return;
+  if (!pic) { el.innerHTML = ""; el.hidden = true; return; }
+  el.hidden = false;
+  el.innerHTML = `<button class="primary irender-btn" data-action="ipic-render" data-id="${esc(pic.id)}"${!picReady(pic) || !engineOk() ? " disabled" : ""}
+      title="Render Picture ${ipicNum(pic)}${pic.title ? " (" + esc(pic.title) + ")" : ""}${pic.count > 1 ? `, ${pic.count} of it,` : ""} into the Queue">▶ Render</button>
+    <span class="irender-what muted small">Picture ${ipicNum(pic)}${pic.title ? " · " + esc(pic.title) : ""}</span>
+    <label class="irender-count" title="How many to render, each with its own seed">×<input class="count" type="number" min="1" max="16" step="1" data-ipic="count" data-id="${esc(pic.id)}" value="${pic.count}" aria-label="How many"></label>`;
+}
 function renderIpreview() {
   const { pic, r } = ipicCurrent();
   const el = $("ipreview");
+  renderIrender(pic);
   if (!pic || !r) {
     el.innerHTML = `<div class="panel-head"><div class="head-left"><h2>Preview</h2></div></div>
-      <div class="ipreview-empty">${pic ? "Nothing rendered yet for this Picture.<br>Write a prompt and press Render." : "Add a Picture to start."}</div>`;
+      <div class="ipreview-empty">${pic ? "Nothing rendered yet for this Picture.<br>Write a prompt and press Render." : "Add a Picture to start."}</div>
+`;
+    renderIrender(pic);
     return;
   }
   const i = pic.current, total = pic.results.length;
@@ -13337,6 +13459,13 @@ async function imagesAction(a, el, e) {
       ipics().splice(ipics().indexOf(pic), 1);
       if (IMG.pic === pic.id) IMG.pic = null;
       commit(); return;
+    }
+    case "ipic-seed-keep": {        // 0.27.10: the shown result's seed for the next renders
+      const r = pic && pic.results[pic.current];
+      if (!r || !Number.isFinite(Number(r.seed))) return;
+      pic.seed = Number(r.seed); IMG.pic = pic.id; commit();
+      toast(`Picture ${ipicNum(pic)} keeps seed ${pic.seed}. Change its prompt or references and render: it uses the same seed.`);
+      return;
     }
     case "ipic-pick": if (pic) { pic.current = Number(el.dataset.i) || 0; IMG.pic = pic.id; commit(); } return;
     case "ipic-step": if (cur.pic) { cur.pic.current = Math.max(0, Math.min(cur.pic.results.length - 1, cur.pic.current + Number(el.dataset.dir))); commit(); } return;

@@ -1429,3 +1429,36 @@ select option, select optgroup { background-color: var(--field); color: var(--te
 /* 0.26.1: the notes box flashes when a note is added or jumped to */
 .shot-notes { transition: background-color .4s, box-shadow .4s; border-radius: 6px; }
 .shot-notes.flash { background: rgba(255,208,138,.12); box-shadow: 0 0 0 1px rgba(255,208,138,.5); }
+
+/* 0.27.2: a folded Picture is one line like a Shot: its prompt fills the left (cut short), the
+   thumbnail, result count and Render stay on the right */
+.ipic.folded .ipic-head { flex-wrap: nowrap; }
+.ipic.folded .ipic-line { flex: 1 1 0; text-align: left; }
+.ipic.folded .ipic-head .push { display: none; }
+.ipic.folded .ipic-head > :not(.ipic-line) { flex: none; }
+
+/* 0.27.11: the big Render for the active Picture, above Image settings */
+.irender { display: flex; align-items: center; gap: 14px; padding: 4px 2px; }
+.irender[hidden] { display: none; }
+.irender-btn { font-size: 22px; font-weight: 700; padding: 12px 34px; border-radius: 10px; }
+.irender-what { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.irender-count { display: inline-flex; align-items: center; gap: 8px; font-size: 18px; color: var(--sub); }
+.irender-count input { width: 70px; font-size: 18px; padding: 6px 8px; background: var(--field); border: 1px solid var(--field-line); border-radius: 8px; color: var(--text); text-align: center; }
+
+/* 0.27.5: Picture cards are clickable */
+.ipic:not(.sel) { cursor: pointer; }
+.ipic:not(.sel) :is(input, textarea, select) { cursor: auto; }
+
+/* 0.27.9: the Shot card's rows: settings; group, wrap, takes, restore, clear; add / replace (right) */
+.shot-body .shot-adds { justify-content: flex-end; }
+.shot-body .shot-more .push, .shot-body .shot-adds .push { flex: 1 1 auto; }
+.shot-body .shot-adds { margin-top: 8px; }
+
+/* 0.27.12: Advanced's summary on its own line under the model switch */
+.fold-sum { margin-top: 8px; cursor: pointer; line-height: 1.5; }
+.fold-sum:empty { display: none; }
+
+/* 0.27.13: each take's prompt in the Takes list */
+.take-row .take-prompt { flex-basis: 100%; display: flex; gap: 10px; align-items: flex-start; margin-top: 4px; color: var(--sub); }
+.take-row .take-prompt .small { flex: 1 1 auto; white-space: pre-wrap; }
+.take-row { flex-wrap: wrap; }

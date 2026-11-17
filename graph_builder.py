@@ -1774,6 +1774,19 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             inputs["song_at"] = round(max(0.0, at), 4)
         if own_retention:
             inputs["retention"] = own_retention       # Long Shot 1.6.9: this Shot's own lines
+        # Long Shot 1.10.0: handoff care on a Continuous join (the film's settings on every such Shot)
+        # 0.27.8: per Shot: Colour lock and Refresh handoff are each a tick; unticked, nothing changes
+        if join == "bridge" and n > 1 and not lock and (shot.get("colour_lock") or shot.get("tail_refresh")) \
+                and env.shot_takes("colour_lock"):
+            hc = _num(s.get("handoff_colour", 1.0), "Colour lock", 0, 1)
+            hr = _num(s.get("handoff_refresh", 0.25), "Tail refresh", 0, 0.9)
+            if hc > 0 and shot.get("colour_lock"):
+                inputs["colour_lock"] = hc
+                if shot.get("colour_reset"):
+                    inputs["colour_reset"] = True
+            if hr > 0 and shot.get("tail_refresh"):
+                inputs["tail_refresh"] = hr
+                inputs["refresh_steps"] = int(_num(s.get("handoff_steps", 4), "Refresh steps", 1, 50, int))
         gap = _song_gap(shot, env)
         if gap:
             inputs["song_gap"] = gap                   # Long Shot 1.6.17: its place in the song

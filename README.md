@@ -1,19 +1,11 @@
 # H3 Long Shot Studio
 
-Music video made by this API
-https://www.youtube.com/watch?v=rPmv9dpM0P8
-Short films 
-https://youtu.be/2flxMiXXGL8
-https://youtu.be/gq6I-muf1AY
-
 A browser studio for making long AI videos with MiniMax H3, shot by shot. It runs inside
 ComfyUI at `/longshot`. Build a film from short Shots, review and approve each one, and the
 Studio stitches them into one continuous take or a cut sequence. Approved work is never
 thrown away.
 
-<img width="1696" height="1350" alt="image" src="https://github.com/user-attachments/assets/af2861fe-43ed-436d-a908-d954a6788a3d" />
-
-<img width="1637" height="1303" alt="image" src="https://github.com/user-attachments/assets/0e0ebd5d-686e-4bd3-9603-be88d82aeb01" />
+<img width="2166" height="1493" alt="H3 Long Shot Studio" src="https://github.com/user-attachments/assets/543bc5fd-05bf-45dd-9557-f36327e8c935" />
 
 ## Features
 
@@ -23,126 +15,53 @@ thrown away.
 - Join each Shot to its neighbours with **Continuous**, **Bridge**, **Lead in**, **Context**,
   **180°**, **Cutaway** or **Cut** (see [The join chip](#the-join-chip)).
 - Frame anchors: first or last-frame images at any join.
-- **Render all** renders every Shot in order as one flowing chain; **Render group** does the same
-  for one group. Multi-take with seed control, a render queue across projects (pause, reorder by
-  drag), and an automatic retry when ComfyUI runs out of memory.
-- Before a render, the `<tags>` in the prompts are checked against the reference cards, so a
-  bypassed or misspelled reference is caught before it wastes a render.
+- **Render all** renders every Shot in order as one flowing chain. Multi-take with seed
+  control, a render queue across projects, and an automatic retry when ComfyUI runs out of memory.
 - A song as reference audio (`<Audio 1>`) for singing Shots.
-- **Images tab**: make stills in the same project with the H3 video model or the H3 Image model,
-  edit a picture (whole, or only inside boxes you draw), and send results to Cast & Scenes.
 
 **Edit**
 - A zoomable timeline with one block per Shot: switch takes instantly, loop the seam, approve or
   reroll any Shot **in place** while its neighbours keep their takes.
-- Insert, bypass or remove Shots anywhere, including before Shot 1. Group them into folders by
-  scene or act.
-- **Line up Shots** for films without a song: every Shot end to end, no overlaps.
+- Insert, bypass or remove Shots anywhere, including before Shot 1.
 - Drop in real video clips as Shots, bridged into the generated footage or hard-cut.
 - Take history for every Shot. Nothing samples again unless it has to.
-- **Face refine** redraws small faces as close-ups; **Region refine** does the same for anything
-  you box by hand (cartoon characters, creatures); **Face swap** gives a face the identity of a
-  picture card.
 
 **Deliver**
 - Export approved clips, plain or upscaled with RTX Super Resolution.
-- Output the final film at its own size, or upscaled 2× in chunks with flat RAM, with an optional
-  ProRes 422 HQ master.
-- Dialogue and SFX stems as separate .wav files.
+- Output the final film at native size, or upscaled in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
+- **Face refine**: small faces redrawn by H3 as steady close-ups, Shot by Shot, compared A/B.
+- **Undo / redo** for every change you make (Ctrl+Z, Ctrl+Shift+Z).
 
-## What's new in 0.26.1
+**Images** (0.20.0)
+- An **Images** side of every project: stills with the H3 video model or MiniMax-H3-Image from
+  one shared set of references (`<Picture 1…N>`), text-to-image or editing a picture (whole, or
+  only inside boxes you draw), every result kept, and one click to make a result a Cast & Scenes
+  reference.
+- An **Outputs** drawer on both sides: browse the project's output folder and drag any
+  picture into the references.
 
-1. **Region edit (Images tab).** Click the picture under To edit to open it large, draw up to 6
-   boxes and give each its own edit. Only the boxes change; they're pasted back onto the original
-   with soft edges.
-   - **Paste back**: one render of the whole picture, only the boxes kept.
-   - **Zoom in**: each box rendered on its own at full size, for small details. A box with no
-     note just gets cleaned up and sharpened.
-2. **⇄ 180° chip** for shot / reverse-shot conversations (the 180° rule). It's like Context, but takes
-   the last frame from **2 Shots back**, so each side of the conversation picks up from its own last
-   Shot: in A B C D E F, C uses A, D uses B, E uses C.  If the context frame is more than 2 shots back,
-   use the custom selector box to pick the right context shot 
-3. **Context frame** setting (project or per Shot): **Small + soft** (default), **Full** or **Off**.
-   A small, blurred frame gives the place and light without pulling faces away from the reference
-   cards.
-4. **Clean plate**: a Picture can render without the References, for an empty set to use as a
-   location card.
-5. Fixed: exporting a refined face clip failed with "isn't in ComfyUI's input folder" (needs H3 Long
-   Shot 1.9.1).
-6. Added notes for commenting on the timeline
+## What's new since 0.26.1
 
-
-## What's new in 0.23.0
-
-1. Notes on a take
-
-📝 Note in the timeline controls, or N, adds a note at the frame on screen.
-Each note is saved on its Shot with the take it was written about, so it’s in the project file and readable through the API.
-On the Shot card:
-you tick a note when it’s fixed, click its time to jump there, or click its text to edit it;
-notes about an older take are marked earlier take;
-the header shows 📝 n open notes.
-The timeline shows a small marker at each open note on the current takes.
-
-2. Pinned references per group
-
-📌 Pin references on a group’s bar records which cards are switched on in Cast & Scenes, and their order.
-That group then always renders with that set. Your Cast & Scenes switches aren’t changed.
-Render all gives each pinned group its own run, in film order. Props stay in their own group, and each run counts only its own pictures toward the 9.
-The reference check before a render checks each group against its own set.
-Click 📌 References (n) to see the set, show it in Cast & Scenes, re-pin from what’s on now, or unpin.
-
-It matches cards by id or by image file, so a card you deleted and added again is found.
-Deleted cards come back from the record.
-Cards go back in the order they had, and the dialog says when it reorders them.
-Restore prompt & references on a group uses that group’s pinned set when it has one.
-Exact order only works for takes rendered from now on, because older takes didn’t record each card’s place. For those, cards are put back in the order of the ones that were switched on.
-
-Restore all with a deleted card, a re-added picture and a reshuffled order: it came back as A, B, C (off), with B matched by its file.
-Render all with two pinned groups: it queued two runs, each seeing only its own references.
-A note showed on its card and as a timeline marker.
-
-One limit: Re-render through Shot N and Dry run of the whole film use the pinned set of the last Shot’s group for the whole run. Single-Shot renders, Render group and Render all each use the right group’s set.
-
-3. Official tokens: <scenetrans>, <cutoff>, <d> and <Subject N> no longer trigger the “no reference card has this label” warning.
-
-The token check flagged only an unknown <Nope>.
-
-## What's new in 0.21.11
-
-1. H3 Image generation UI, in the same project folder, you can now generate image directly into the project
-   folder.  Or send them directly to reference images for the video side.  It works with both using the video
-   models or the new official H3 image model (download required)
-2. **Face swap.** In the Face refine panel, pick a Shot's take or any video file, choose the picture
-   card for the new face, and the ref2va model redraws the face as that person, keeping the head
-   movement, expression and mouth. One face swaps the largest face found; for up to four faces, draw
-   a box around each and give each its own picture. Results go to `<project>/Face_Swap`.
-   Needs H3 Long Shot 1.9.1 and a ref2va model.
-3. **Region refine.** For faces the detector can't see (cartoon characters, creatures), draw a box on
-   the first and last frame and describe what's in it. The box follows a straight line between key
-   frames.
-4. **Line up Shots.** When you're not syncing to music, placement on the timeline doesn't matter:
-   tick Line up Shots under the timeline and every Shot starts where the one before ends, with no
-   second track. It's on by itself in projects without a song.
-5. **Rearrange approved Shots.** Approved Cut, Context and Cutaway Shots can now be dragged to a new
-   place in the Shots list and keep their takes. Continuous and Lead in Shots stay put.
-6. **Reference check.** Before a render, Studio reads the `<tags>` in the prompts and checks them
-   against the reference cards. A bypassed card, a label no card has, or `<Picture 6>` with only five
-   pictures on gets flagged, with **Turn on and render**, **Render anyway** or **Cancel**.
-7. **Better queue.**
-- **Pause now** stops the running job and puts it back first in line; on Resume it picks up the
-  Shots it had already finished. **Pause after it** lets it finish first.
-- Drag waiting jobs to any place in line (▲ ▼ still work).
-- A page refresh in the middle of a render no longer loses it: Studio follows it again, or saves its
-  take if it finished during the refresh.
-8. **Easier references.** One drop bar in Cast & Scenes takes pictures, videos and audio together and
-  sorts each into its own row. Active reference cards have a thicker border, so it's easier to see
-  what's on.
-9. **Project window.** Sort by date or name, scroll, and drag projects into folders by project type.
-10. **Smaller things.** GPU temperature in the top bar, group bypass button, Settings stays folded
-  after a refresh, the page no longer jumps when you change a chip, and Alt + mouse wheel never goes
-  back a page.
+- **Handoff care for long Continuous chains** (needs H3 Long Shot 1.10.1). Two ticks on each
+  Continuous Shot, both off by default, for static Shots where colour, brightness and grain build
+  up from piece to piece:
+  - **Colour lock** eases the Shot back to the colour and brightness at the start of its chain
+    (no cost). **Let colour change** marks a Shot where the light is meant to change.
+  - **Refresh handoff** redraws the frames it's pinned to before pinning them, cleaning the grain
+    (about a minute extra per Shot). Strengths are in Advanced.
+- **⇄ 180° chip** for shot / reverse-shot conversations: like Context, with the frame from 2 Shots
+  back. **Frame from** on any Context, 180° or Cutaway Shot picks the Shot by hand.
+- **Region edit** on the Images side: draw boxes on the picture being edited, give each its own
+  edit; only the boxes change (**Paste back**, or **Zoom in** for small details).
+- **Take prompts**: every take records its prompt. **↺ Take's prompt** and the Takes list put an
+  earlier prompt back.
+- **📌 Keep seed** on Shots and Picture cards: re-render with the same seed after changing the
+  prompt or references.
+- **Notes**: adding one opens its Shot's card; **📝 n open** steps through every open note.
+- Smaller things: a big **▶ Render** above Image settings, clickable Picture cards, a tidier Shot
+  card, a shorter Advanced panel.
+- Fixed: exporting a refined face clip failed (needs H3 Long Shot 1.9.1 or later).
 
 ## Requirements
 
@@ -152,7 +71,17 @@ The token check flagged only an unknown <Nope>.
 | Pack | Needed for |
 |---|---|
 | [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) | prompts (always) |
-| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.9.1+** | rendering, Clip Shots, Face refine and Face swap (with a ref2va model) |
+| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.10.1+** | rendering, and saving / loading video (always) |
+
+For **Images** (0.20.0): ComfyUI **0.44.0+** (MiniMax H3 Image Conditioning, core) and these
+files, each linked from Image settings when it's missing:
+
+| File | Folder | From |
+|---|---|---|
+| `minimax_h3_image_pruned_int8_convrot.safetensors` (21 GB) | `models/diffusion_models` | [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image) |
+| `minimax_h3_image_vae_fp16.safetensors` | `models/vae` | [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image) |
+| `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (25 GB) — the video text encoder, shared | `models/text_encoders` | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) |
+| `qwen3.5_9b_w4a8_gptq.safetensors` (6 GB, optional: Expand prompt) | `models/text_encoders` | [Comfy-Org/Qwen3.5](https://huggingface.co/Comfy-Org/Qwen3.5) |
 
 ffmpeg is needed (on PATH, or `pip install imageio-ffmpeg` with ComfyUI's Python).
 
@@ -163,10 +92,6 @@ Optional, each with a **Click to install** button in the Studio where it's used:
 | [ComfyUI-MiniMax-H3-Turbo](https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo) | full Turbo support (without it, the Turbo LoRA loads through ComfyUI's stock loader) |
 | [ComfyUI-NVIDIA-RTX-VSR-Pro](https://github.com/whmc76/ComfyUI-NVIDIA-RTX-VSR-Pro) | RTX upscaling (RTX GPU) |
 | [ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod) | RefMods |
-
-Also optional: the MTCNN face detector for Face refine (a **Download face detector** button in the
-Face refine panel, about 2 MB), and Kijai's `MelBandRoformer_fp16.safetensors` in
-`models/diffusion_models` for dialogue / SFX stems.
 
 For SageAttention, start ComfyUI with `--use-sage-attention`.
 
@@ -209,26 +134,25 @@ hard-refresh the page (Ctrl+Shift+R).
 
 ## The join chip
 
-Every Shot has a chip that sets how it joins its neighbours. Click it to cycle through the
+Every Shot has a chip that sets how it joins the Shot before it. Click it to cycle through the
 choices; which ones it offers depends on what's rendered next to it.
 
 | Chip | What it does |
 |---|---|
-| **Cut** | A fresh shot from the references, a hard cut. |
-| **Context** | A new angle: a hard cut, with the last frame of the Shot before as a reference. |
-| **180°** | Shot / reverse shot: like Context, but the frame comes from 2 Shots back (the last Shot on that side of the conversation). |
-| **Cutaway** | A Context Shot the next Shot doesn't see: the Shot after it continues from the Shot before the cutaway (B-roll). |
 | **Continuous** | Flows on from the Shot before, one longer take. |
 | **Bridge** | Continuous between two rendered Shots: pinned at both ends. |
 | **Lead in** | Starts fresh and leads into the rendered Shot after it. |
+| **Context** | A new angle: a hard cut, with the last frame of the Shot before as a reference. |
+| **180°** | Shot / reverse shot: like Context, with the frame from 2 Shots back. |
+| **Cutaway** | B-roll: like Context, and the Shot after it continues from the Shot before the cutaway. |
+| **Cut** | A fresh shot from the references. |
 
-- **Render all** and **Render group** follow the chips: Continuous chains from the Shot before,
-  Context splits the run there, Cut starts fresh.
-- **▶ on one Shot** (and every other render button) follows its chip and pins it to the rendered
-  Shots next to it (approved or under review). The Shots around it keep their takes.
-- Context, 180° and Cutaway Shots use the **Context frame** setting: Small + soft (default), Full or Off.
-- Takes made at another resolution can't be joined: change the resolution back, or re-render
-  those Shots at the new size, working forward from the first one.
+- **Render all** follows the chips: Continuous chains from the Shot before; Context, 180° and
+  Cutaway split the run and wait for the Shot they take their frame from; Cut starts fresh.
+- **▶ on one Shot** pins it to the rendered Shots next to it (approved or under review). The
+  Shots around it keep their takes.
+- Context, 180° and Cutaway use the **Context frame** setting (Small + soft by default, Full or
+  Off) and **Frame from** (Auto, or any earlier Shot).
 
 ## Tips
 
@@ -237,7 +161,5 @@ choices; which ones it offers depends on what's rendered next to it.
 - To keep drift from building on long takes, use **▶ Render odd Shots** (each on its own),
   then **Render all** to bridge the gaps.
 - Write speaker IDs like (S1) in the Shot text yourself; the Studio only adds the voice lines.
-- Face swap: start at denoise 0.6. Raise it toward 0.7 if the old face shows through, lower it
-  toward 0.5 if the mouth drifts from the dialogue.
 - Everything about a project (references, takes, videos) lives in `input/longshot/<project>`
   and `output/longshot/<project>`, and moves with Rename and Export.

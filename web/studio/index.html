@@ -259,11 +259,12 @@
     <div class="panel" id="advanced-panel">
       <div class="fold-row">
         <button class="fold" data-action="toggle" data-key="advOpen" id="adv-toggle" aria-expanded="false" aria-controls="advanced">
-          <span class="head-left"><span class="h2">Advanced</span><span class="warn-tag">⚠ all shots</span><span class="muted small" id="adv-summary"></span></span>
+          <span class="head-left"><span class="h2">Advanced</span><span class="warn-tag">⚠ all shots</span></span>
         </button>
         <div class="fold-quick" id="adv-quick" hidden></div>
         <button class="fold chev-btn" data-action="toggle" data-key="advOpen" aria-controls="advanced" tabindex="-1"><span class="muted chev" id="adv-chev">Show ▾</span></button>
       </div>
+      <div class="muted small fold-sum" id="adv-summary" data-action="toggle" data-key="advOpen"></div>      <!-- 0.27.12: one line under the switch -->
       <div id="advanced" hidden></div>
     </div>
 
@@ -344,6 +345,7 @@
     <div class="panel" id="ipreview-panel">
       <div id="ipreview"></div>
     </div>
+    <div class="irender" id="irender"></div>      <!-- 0.27.11: Render the active Picture -->
     <div class="panel" id="iset-panel">
       <div class="panel-head fold-row">
         <button class="fold" data-action="toggle" data-key="isetOpen" id="iset-toggle" aria-expanded="true" aria-controls="iset">
