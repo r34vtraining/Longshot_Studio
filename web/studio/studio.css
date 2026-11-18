@@ -1462,3 +1462,28 @@ select option, select optgroup { background-color: var(--field); color: var(--te
 .take-row .take-prompt { flex-basis: 100%; display: flex; gap: 10px; align-items: flex-start; margin-top: 4px; color: var(--sub); }
 .take-row .take-prompt .small { flex: 1 1 auto; white-space: pre-wrap; }
 .take-row { flex-wrap: wrap; }
+
+/* 0.27.14: Shot card rows: Seconds + Seed; the join's own options; edit / takes; add (right) */
+.shot-body .shot-join { margin-top: 8px; }
+.shot-body .shot-join:not(:has(label, select, input)) { display: none; }
+.shot-body .shot-opts .lbl-row select { max-width: 260px; }
+
+/* 0.27.15: every row reaches the right edge: left group, then the right group */
+.shot-body .shot-opts .push { flex: 1 1 auto; }
+.shot-body .opt-group { display: inline-flex; align-items: center; gap: 8px; }
+.shot-body .opt-group .seed-step { margin-left: 0; }
+
+/* 0.27.17 / 0.27.18: Frame from kept short so the first row (Seconds, Context frame, Frame from,
+   Seed) fits on one line */
+.shot-body .shot-opts .lbl-row select[data-shot-ctxfrom] { width: 160px; max-width: 160px; }
+.shot-body .shot-opts:first-of-type { gap: 10px 12px; }
+
+/* 0.28.2 */
+.export-up[hidden] { display: none; }
+.export-relay-detail input { background: var(--field); border: 1px solid var(--field-line); border-radius: 6px; color: var(--text); padding: 2px 6px; font-size: 12px; }
+
+/* 0.28.3: RTX scale and quality in the export bar */
+.export-up select { background: var(--field); border: 1px solid var(--field-line); border-radius: 6px; color: var(--text); padding: 2px 4px; font-size: 12px; }
+
+/* 0.28.4: the reroll dot on a Shot under review */
+.sdot.sdot-reroll { font-size: 15px; line-height: 1; }

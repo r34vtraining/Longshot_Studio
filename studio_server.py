@@ -2096,6 +2096,7 @@ def register(routes=None):
         if not slug or body is None:
             return error("Send {mode, items}.")
         out_dir, mode = folder_paths.get_output_directory(), body.get("mode")
+        variant = body.get("variant") if body.get("variant") in pj.EXPORT_VARIANTS else ""   # 0.28.1
         try:
             if mode == "copy":
                 song = body.get("song") if isinstance(body.get("song"), dict) else None
@@ -2108,24 +2109,26 @@ def register(routes=None):
                     return error("ffmpeg isn't available.", 500)
                 names = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: pj.mux_approved(out_dir, slug, body.get("items"), ffmpeg=ffmpeg,
-                                                  sig=body.get("sig")))
+                                                  sig=body.get("sig"), variant=variant,
+                                                  cleanup=body.get("cleanup") is not False))
             elif mode == "keep":
                 res = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: pj.keep_upscaled(out_dir, slug, body.get("items"), str(body.get("sig") or ""),
                                                    prores=bool(body.get("prores")), ffmpeg=_ffmpeg_path(),
                                                    input_dir=folder_paths.get_input_directory(),
-                                                   song=body.get("song") if isinstance(body.get("song"), dict) else None))
-                return web.json_response({**res, "subfolder": pj.approved_subfolder(slug)})
+                                                   song=body.get("song") if isinstance(body.get("song"), dict) else None,
+                                                   variant=variant))
+                return web.json_response({**res, "subfolder": pj.approved_subfolder(slug, variant)})
             elif mode == "clear":
                 names = []
-                pj.clear_approved(out_dir, slug)
+                pj.clear_approved(out_dir, slug, variant=variant)
             else:
                 return error("mode must be copy, mux, keep or clear.")
         except ValueError as err:
             return error(err)
         except Exception as err:
             return error(str(err), 500)
-        return web.json_response({"files": names, "subfolder": pj.approved_subfolder(slug)})
+        return web.json_response({"files": names, "subfolder": pj.approved_subfolder(slug, variant)})
 
     @routes.post("/longshot/stems/{slug}")
     async def stems_route(request):

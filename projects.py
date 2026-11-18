@@ -21,7 +21,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.27.13"
+STUDIO_VERSION = "0.28.8"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "avif"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -855,12 +855,28 @@ _WORK_DIR = "_work"
 _CLIP_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,160}")
 
 
-def approved_folder(output_dir, slug):
-    return os.path.join(output_dir, "longshot", slug, APPROVED_DIR)
+# 0.28.1: upscaled exports go in their own folder under Approved_Clips, named with the upscaler, so
+# an RTX and a RelayVSR export of the same clips are both kept
+EXPORT_VARIANTS = {"RTX": "-RTX", "VSR": "-VSR"}
 
 
-def approved_subfolder(slug):
-    return f"longshot/{slug}/{APPROVED_DIR}"
+def _variant(v):
+    return v if v in EXPORT_VARIANTS else ""
+
+
+def approved_folder(output_dir, slug, variant=""):
+    root = os.path.join(output_dir, "longshot", slug, APPROVED_DIR)
+    return os.path.join(root, _variant(variant)) if _variant(variant) else root
+
+
+def approved_subfolder(slug, variant=""):
+    root = f"longshot/{slug}/{APPROVED_DIR}"
+    return f"{root}/{_variant(variant)}" if _variant(variant) else root
+
+
+def _variant_name(name, variant):
+    suf = EXPORT_VARIANTS.get(_variant(variant), "")
+    return name if not suf or name.endswith(suf) else name + suf
 
 
 _MANIFEST = ".export.json"
@@ -890,7 +906,8 @@ def _write_manifest(folder, data):
     os.replace(tmp, path)
 
 
-def keep_upscaled(output_dir, slug, items, sig, prores=False, ffmpeg=None, input_dir=None, song=None, run=None):
+def keep_upscaled(output_dir, slug, items, sig, prores=False, ffmpeg=None, input_dir=None, song=None, run=None,
+                  variant=""):
     """Before an upscaled export: [{key, name, sig, asig, cut?, song_at?, song_len?}]
     wanted. A clip already upscaled from the same take with the same picture `sig`
     stays (renamed when its number changed); when only its sound changed (`asig`:
@@ -909,8 +926,9 @@ def keep_upscaled(output_dir, slug, items, sig, prores=False, ffmpeg=None, input
             raise ValueError(f"Not a clip: {key!r}")
         # 0.12.8: each clip's own sig, so approving or moving another Shot doesn't make
         # every clip "changed"; 0.13.3: the picture's sig, the sound apart (asig)
-        want.append((key, _export_name(str(it.get("name") or ""), ".mp4"), str(it.get("sig") or sig), it))
-    folder = approved_folder(output_dir, slug)
+        want.append((key, _export_name(_variant_name(str(it.get("name") or ""), variant), ".mp4"),
+                     str(it.get("sig") or sig), it))
+    folder = approved_folder(output_dir, slug, variant)
     if not os.path.isdir(folder):
         return {"kept": [], "todo": [k for k, _, _, _ in want], "remixed": []}
     song_path = None
@@ -957,7 +975,7 @@ def keep_upscaled(output_dir, slug, items, sig, prores=False, ffmpeg=None, input
                 tmp = os.path.join(folder, f".keep{i}{ext}.part")   # not a video: clearing leaves it
                 os.replace(src, tmp)
                 moves.append((tmp, os.path.join(folder, new[:-4] + ext)))
-    clear_approved(output_dir, slug, keep_work=False)
+    clear_approved(output_dir, slug, keep_work=False, variant=variant)
     for tmp, dest in moves:
         os.replace(tmp, dest)
     new_man, remixed = {}, []
@@ -1177,9 +1195,9 @@ def stems_done(output_dir, slug, items):
     return n
 
 
-def clear_approved(output_dir, slug, keep_work=False):
-    """Empty Approved_Clips of its videos (and the upscale's work files)."""
-    folder = approved_folder(output_dir, slug)
+def clear_approved(output_dir, slug, keep_work=False, variant=""):
+    """Empty Approved_Clips (or its RTX / VSR folder) of its videos (and the upscale's work files)."""
+    folder = approved_folder(output_dir, slug, variant)
     if not is_slug(slug) or not os.path.isdir(folder):
         return 0
     _write_manifest(folder, {})
@@ -1191,7 +1209,7 @@ def clear_approved(output_dir, slug, keep_work=False):
             os.remove(path)
             n += 1
     if not keep_work:
-        shutil.rmtree(os.path.join(folder, _WORK_DIR), ignore_errors=True)
+        shutil.rmtree(os.path.join(approved_folder(output_dir, slug), _WORK_DIR), ignore_errors=True)
     return n
 
 
@@ -1273,7 +1291,7 @@ def _work_path(output_dir, slug, entry):
     return path
 
 
-def mux_approved(output_dir, slug, items, ffmpeg="ffmpeg", run=None, sig=None):
+def mux_approved(output_dir, slug, items, ffmpeg="ffmpeg", run=None, sig=None, variant="", cleanup=True):
     """The upscaled export: [{name, video, audio, master, key}] (work files the
     Upscale Chunk / Save Audio nodes wrote) -> Approved_Clips/<name>.mp4 (and
     <name>.mov with the ProRes copy), pictures copied, sound added. With `sig`
@@ -1286,20 +1304,26 @@ def mux_approved(output_dir, slug, items, ffmpeg="ffmpeg", run=None, sig=None):
         raise ValueError("Not a project slug.")
     plan = []
     for it in items or []:
-        name = str((it or {}).get("name") or "")
+        name = _variant_name(str((it or {}).get("name") or ""), variant)
         _export_name(name, ".mp4")
         plan.append((name, _work_path(output_dir, slug, it.get("video")),
                      _work_path(output_dir, slug, it["audio"]) if it.get("audio") else None,
                      _work_path(output_dir, slug, it["master"]) if it.get("master") else None))
     if not plan:
+        if cleanup and sig is not None:
+            # 0.28.6: every clip was finished during the run: only the work files are left
+            shutil.rmtree(os.path.join(approved_folder(output_dir, slug), _WORK_DIR), ignore_errors=True)
+            return []
         raise ValueError("No approved clips to export.")
-    folder = approved_folder(output_dir, slug)
+    folder = approved_folder(output_dir, slug, variant)
+    os.makedirs(folder, exist_ok=True)
     if sig is None:
-        clear_approved(output_dir, slug, keep_work=True)
+        clear_approved(output_dir, slug, keep_work=True, variant=variant)
     man = _read_manifest(folder) if sig is not None else {}
-    keys = {str((it or {}).get("name") or ""): str((it or {}).get("key") or "") for it in items or []}
-    sigs = {str((it or {}).get("name") or ""): str((it or {}).get("sig") or sig or "") for it in items or []}
-    asigs = {str((it or {}).get("name") or ""): str((it or {}).get("asig") or "") for it in items or []}
+    nm = lambda it: _variant_name(str((it or {}).get("name") or ""), variant)   # noqa: E731
+    keys = {nm(it): str((it or {}).get("key") or "") for it in items or []}
+    sigs = {nm(it): str((it or {}).get("sig") or sig or "") for it in items or []}
+    asigs = {nm(it): str((it or {}).get("asig") or "") for it in items or []}
     out = []
     for name, video, wav, master in plan:
         for src, ext, acodec, extra in ((video, ".mp4", ["aac", "-b:a", "256k"], ["-movflags", "+faststart"]),
@@ -1322,7 +1346,17 @@ def mux_approved(output_dir, slug, items, ffmpeg="ffmpeg", run=None, sig=None):
                                   "prores": bool(master)}
     if sig is not None:
         _write_manifest(folder, man)
-    shutil.rmtree(os.path.join(folder, _WORK_DIR), ignore_errors=True)
+    if cleanup:
+        shutil.rmtree(os.path.join(approved_folder(output_dir, slug), _WORK_DIR), ignore_errors=True)
+    else:
+        # 0.28.6: one clip finished mid-run: only its own work files go (the others are still coming)
+        for _name, video, wav, master in plan:
+            for f in (video, wav, master):
+                if f and os.path.isfile(f):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
     return out
 
 

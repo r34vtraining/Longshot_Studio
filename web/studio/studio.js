@@ -171,7 +171,8 @@ function normalize(p) {
     // 0.12.0: what the audio is for. "voice" (a timbre, linked from pictures / RefMods), or a
     // sound of its own (<sfx> of cars driving by): sfx, ambience, music or your own words
     role: AUDIO_ROLES.some(([k]) => k === v.role) ? v.role : "voice", role_text: v.role_text || "",
-    desc: v.desc || "", use: v.use === "copy" ? "copy" : "reference" }));
+    desc: v.desc || "", use: v.use === "copy" ? "copy" : "reference",
+    voice_desc: v.voice_desc || "" }));     // 0.28.5: added to each linked picture's description while it's on
   // 0.17.1: video references: <Video N> cards in Cast & Scenes, their soundtrack optional
   p.videos = (p.videos || []).map((v) => ({ id: v.id || uid("w"), label: v.label || "", desc: v.desc || "",
     role: REFMOD_ROLES.includes(v.role) ? v.role : "motion", file: v.file || "", subfolder: v.subfolder || "", type: "input",
@@ -282,7 +283,8 @@ function normalize(p) {
   s.face_swap.faces = (Array.isArray(s.face_swap.faces) && s.face_swap.faces.length ? s.face_swap.faces : [{}]).slice(0, 4)
     .map((x) => ({ cast: (x && x.cast) || null, keys: (Array.isArray(x && x.keys) ? x.keys : []).filter((k) => Array.isArray(k) && k.length >= 5).slice(0, 64) }));
   s.face_swap.results = (Array.isArray(s.face_swap.results) ? s.face_swap.results : []).filter((r) => r && r.filename).slice(0, 20);
-  if (![1.5, 2].includes(Number(s.rtx_vsr.scale))) s.rtx_vsr.scale = 2;   // 1.5× or 2× only
+  if (![1.5, 2, 3, 4].includes(Number(s.rtx_vsr.scale))) s.rtx_vsr.scale = 2;   // 0.28.3: up to 4×
+  s.rtx_vsr.on = false;            // 0.28.3: previews are never upscaled (the switch is gone)
   s.loras = [0, 1, 2].map((i) => Object.assign({ on: false, name: null, strength: 1.0 }, (s.loras || [])[i] || {}));
   s.image = Object.assign({}, DEFAULT_SETTINGS.image, s.image || {});       // 0.20.0
   p.settings = s;
@@ -2364,9 +2366,9 @@ function jobOpts(job) {
     const skipped = active().filter((x) => x.kind !== "clip" && x.status !== "approved").length;
     return { kind: "export", exportClips: items.map((x) => Object.assign({ take: x.take },
         refChosen(x.s) ? { refine: x.s.refined.key } : faceRefined(x.s) ? { face_clip: faceKey(x.s), frames: Number(x.s.window) || 0 } : {}, exportCut(x.s))),
-      label: `Exporting ${items.length} approved clip${items.length === 1 ? "" : "s"} · upscaled ${v.scale || 2}× ${v.quality || "ULTRA"}`,
+      label: `Exporting ${items.length} approved clip${items.length === 1 ? "" : "s"} · ${P().settings.export_relay ? "upscaled with RelayVSR" : P().settings.export_upscale ? `upscaled ${v.scale || 2}× ${v.quality || "ULTRA"}` : "refined"}`,
       note: "Each approved take decoded on its own, whole, and upscaled a frame at a time",
-      extra: { items: items.map((x) => ({ name: x.name, key: x.key, sig: itemSig(x), asig: itemAsig(x) })), skipped, kept: job.exportKept || 0, sig: upSig() },
+      extra: { items: items.map((x) => ({ name: x.name, key: x.key, sig: itemSig(x), asig: itemAsig(x) })), skipped, kept: job.exportKept || 0, sig: upSig(), variant: expVariant() },
       onDone: () => {} };
   }
   return null;
@@ -2448,7 +2450,20 @@ function renderQueue() {
   const time = (t) => t ? new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
   const offline = S.conn !== "ok";
   const peek = Q.jobs.find((j) => j.state === "running") || Q.jobs.find((j) => j.state === "waiting") || Q.jobs[Q.jobs.length - 1];
-  const list = flip ? [...Q.jobs].reverse() : Q.jobs;
+  // 0.28.8: an export split in parts shows as one row: the part running (else the next, else the last)
+  const exRep = {};
+  for (const j of Q.jobs) {
+    if (!j.exGroup) continue;
+    const g = Q.jobs.filter((x) => x.exGroup === j.exGroup);
+    exRep[j.exGroup] = g.find((x) => x.state === "running") || g.find((x) => x.state === "waiting") || g[g.length - 1];
+  }
+  const exTitle = (j) => {
+    const g = Q.jobs.filter((x) => x.exGroup === j.exGroup), done = g.filter((x) => !liveJob(x)).length;
+    const live = g.some(liveJob), word = j.exWord || "part";
+    return live ? `Export approved clips · ${word} ${Math.min(done + 1, j.exTotal || g.length)} of ${j.exTotal || g.length}`
+      : `Export approved clips · ${j.exTotal || g.length} ${word}s`;
+  };
+  const list = (flip ? [...Q.jobs].reverse() : Q.jobs).filter((j) => !j.exGroup || exRep[j.exGroup] === j);
   $("queue").innerHTML = list.map((j) => {
     const here = P() && j.slug === P().slug;
     let sub = "", bar = "";
@@ -2474,7 +2489,7 @@ function renderQueue() {
     return `<div class="q-row st-${j.state}${j === peek ? " peek" : ""}${w ? " q-drag" : ""}" data-job="${esc(j.id)}"${w ? ' draggable="true" title="Drag to change its place in line"' : ""}>
       <span class="q-icon" aria-hidden="true">${Q_ICON[j.state] || "·"}</span>
       <span class="q-main"><button class="q-name${here ? " here" : ""}" data-action="queue-open" title="${here ? "The open project" : "Open this project"}">${esc(j.name)}</button>
-        · ${esc(j.title)}<div class="q-sub">${esc(sub)}</div>${bar}</span>
+        · ${esc(j.exGroup ? exTitle(j) : j.title)}<div class="q-sub">${esc(sub)}</div>${bar}</span>
       <span class="q-act">${acts}</span></div>`;
   }).join("") + otherRows;
 }
@@ -2583,11 +2598,16 @@ async function queueAction(action, el) {
   }
   if (!job) return;
   if (action === "queue-open") { if (job.slug !== P().slug) switchProject(job.slug); return; }
-  if (action === "queue-stop") { if (S.busy && S.busy.jobId === job.id) stop(); else if (S.chunking && S.chunking.jobId === job.id) stop(); return; }
+  if (action === "queue-stop") {
+    // 0.28.8: on an export in parts, the parts still waiting stop too
+    if (job.exGroup) for (const x of Q.jobs) if (x !== job && x.exGroup === job.exGroup && x.state === "waiting") endJob(x, "stopped");
+    if (S.busy && S.busy.jobId === job.id) stop(); else if (S.chunking && S.chunking.jobId === job.id) stop();
+    renderQueue(); return;
+  }
   if (action === "queue-retry") { job.state = "waiting"; job.error = null; job.attempts = 0; saveQueue(); renderQueue(); queueNext(); return; }
   if (action === "queue-remove") {
     if (job.state === "running") return;
-    Q.jobs = Q.jobs.filter((j) => j !== job);
+    Q.jobs = Q.jobs.filter((j) => j !== job && !(job.exGroup && j.exGroup === job.exGroup && j.state !== "running"));
     const g = job.group;
     saveQueue(); renderQueue(); render();
     if (g && Q.groups[g] && !Q.jobs.some((j) => j.group === g && liveJob(j))) finishGroup(g);
@@ -2817,19 +2837,23 @@ async function queueNext() {
       preparePass(job);
       splitAtContext(job);
       if (job.spec.type === "export") {
-        if (!job.spec.part) await exportPrepare(job);          // a later part is prepared already
+        if (!job.spec.part) { await exportPrepare(job); S.relayClips = 0; }   // a later part is prepared already
         // 0.17.32: 16 clips a run (one ComfyUI run holds every decoded take until it ends); the
         // rest go in parts right after this one
-        const EXP_PER = 16;
+        // 0.28.7: RelayVSR holds each clip's 2× frames until its run ends, so it runs one clip a run
+        const EXP_PER = P().settings.export_relay ? 1 : 16;
         if (job.exportTodo.length > EXP_PER) {
           const rest = job.exportTodo.slice(EXP_PER), parts = Math.ceil(job.exportTodo.length / EXP_PER);
           job.exportTodo = job.exportTodo.slice(0, EXP_PER);
           job.title = `Export approved clips · part 1 of ${parts}`;
+          // 0.28.8: the parts show as one row in the Queue
+          job.exGroup = job.id; job.exTotal = parts; job.exWord = EXP_PER === 1 ? "clip" : "part";
           const add = [];
           for (let k = 0; k < rest.length; k += EXP_PER) {
             add.push({ id: uid("j"), slug: job.slug, name: job.name, spec: Object.assign({}, job.spec, { part: true }), ids: [],
               pass: 1, of: 1, title: `Export approved clips · part ${k / EXP_PER + 2} of ${parts}`, state: "waiting", added: Date.now(),
-              exportTodo: rest.slice(k, k + EXP_PER), exportKept: 0, exportRemixed: 0 });
+              exportTodo: rest.slice(k, k + EXP_PER), exportKept: 0, exportRemixed: 0,
+              exGroup: job.id, exTotal: parts, exWord: job.exWord });
           }
           Q.jobs.splice(Q.jobs.indexOf(job) + 1, 0, ...add);
           saveQueue();
@@ -3625,6 +3649,7 @@ function onMessage(type, d) {
       }
       break;
     case "mmh3.longshot": onSegment(b, d); if (b.slug === (P() && P().slug)) refreshRunRows(b); break;
+    case "executed": if (b.kind === "export") exportClipLanded(b, d); return;     // 0.28.6
     case "execution_success": case "execution_error": case "execution_interrupted":
       finish(b.promptId); return;
     default: return;
@@ -4558,7 +4583,7 @@ function itemSig(x) {
   const str = cut + "|" + ref + face;
   let h = 0;
   for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
-  return `${Number(v.scale || 2)}x ${v.quality || "ULTRA"}` + (str !== "|" ? ` · ${(h >>> 0).toString(36)}` : "");
+  return upHead() + (str !== "|" ? ` · ${(h >>> 0).toString(36)}` : "");
 }
 function itemAsig(x) {
   const c = exportCut(x.s), a = P().audio;
@@ -4571,6 +4596,14 @@ function exportItem(x) {
   if (c.song_len) Object.assign(it, { song_at: c.song_at, song_len: c.song_len });
   return it;
 }
+/** 0.28.1: the folder (and name suffix) of an upscaled export: Approved_Clips/RTX (-RTX), /VSR (-VSR). */
+const relayDetail = () => (Number.isFinite(Number(P().settings.relay_detail)) && P().settings.relay_detail !== null && P().settings.relay_detail !== "" ? Number(P().settings.relay_detail) : 0.4);
+const expVariant = () => (P().settings.export_relay ? "VSR" : P().settings.export_upscale ? "RTX" : "");
+/** 0.28.0: what an upscaled export was upscaled with (RTX scale and quality, or RelayVSR). */
+function upHead() {
+  const s = P().settings, v = s.rtx_vsr || {};
+  return s.export_relay ? `RelayVSR ${s.relay_model || "x2"} d${relayDetail()}` : `${Number(v.scale || 2)}x ${v.quality || "ULTRA"}`;
+}
 /** What an upscaled export file was made with: same take + same settings = reuse it. */
 const upSig = () => {
   const v = P().settings.rtx_vsr || {};
@@ -4578,7 +4611,7 @@ const upSig = () => {
   const cuts = approvedForExport().map((x) => JSON.stringify(exportCut(x.s))).join("|");
   let h = 0;
   for (let i = 0; i < cuts.length; i++) h = (h * 31 + cuts.charCodeAt(i)) | 0;
-  return `${Number(v.scale || 2)}x ${v.quality || "ULTRA"}` + (cuts.replace(/\{\}|\|/g, "") ? ` · ${(h >>> 0).toString(36)}` : "");
+  return upHead() + (cuts.replace(/\{\}|\|/g, "") ? ` · ${(h >>> 0).toString(36)}` : "");
 };
 
 /** Before an upscaled export: clips already upscaled from the same take stay
@@ -4587,7 +4620,7 @@ async function exportPrepare(job) {
   await layoutReady();                           // 0.15.0: the records need this project's layout
   const items = approvedForExport();
   const r = await api(`/longshot/approved/${encodeURIComponent(P().slug)}`, { method: "POST",
-    body: { mode: "keep", sig: upSig(), prores: !!P().settings.prores_master, items: items.map(exportItem),
+    body: { mode: "keep", variant: expVariant(), sig: upSig(), prores: !!P().settings.prores_master, items: items.map(exportItem),
       song: songMode() ? { file: P().audio.file, subfolder: P().audio.subfolder || "" } : null } });
   job.exportTodo = r.todo || [];
   job.exportKept = (r.kept || []).length;
@@ -4598,7 +4631,7 @@ async function exportPrepare(job) {
 function exportedToast(r, skipped, kept = 0) {
   const n = (r.files || []).filter((f) => /\.mp4$/i.test(f)).length;
   const mov = (r.files || []).length - n;
-  toast(`Exported ${n} ${kept ? "new " : ""}approved clip${n === 1 ? "" : "s"}${mov ? ` (+${mov} ProRes)` : ""} to Approved_Clips.` +
+  toast(`Exported ${n} ${kept ? "new " : ""}approved clip${n === 1 ? "" : "s"}${mov ? ` (+${mov} ProRes)` : ""} to ${String(r.subfolder || "").split("/").slice(2).join("/") || "Approved_Clips"}.` +
     (kept ? ` ${kept} already upscaled ${kept === 1 ? "was" : "were"} kept.` : "") +
     (skipped ? ` ${skipped} Shot${skipped === 1 ? " isn't" : "s aren't"} approved yet and ${skipped === 1 ? "was" : "were"} left out.` : ""),
     S.local ? { label: "Open folder", fn: () => api("/longshot/open-folder", { method: "POST",
@@ -4611,7 +4644,7 @@ async function exportApproved() {
   const items = approvedForExport();
   if (!items.length) { toast("No approved Shots to export yet."); return; }
   const skipped = active().filter((s) => s.kind !== "clip" && s.status !== "approved").length;
-  if (P().settings.export_upscale || refineActive()) {
+  if (P().settings.export_upscale || P().settings.export_relay || refineActive()) {
     if (refineActive() && mixedSizeGuard("Refine on export")) return;
     enqueue({ type: "export" });                 // 0.10.0: with Refine, the export refines first
     return;
@@ -4640,20 +4673,57 @@ async function exportApproved() {
   } catch (e) { toast("Export failed: " + e.message); }
 }
 
-async function exportDone(b, outputs) {
+/** One export item as the server's mux needs it, from the nodes' outputs. */
+function exportMuxItem(b, i, outputs) {
+  const it = (b.extra.items || [])[i], nd = (b.built.nodes.export || {})[String(i + 1)] || {};
+  const ui = outputs[nd.video] || {};
+  return { name: it.name, key: it.key, sig: it.sig || null, asig: it.asig || "", video: (ui.chunk_video || [])[0] || null, master: (ui.chunk_master || [])[0] || null,
+    audio: ((outputs[nd.audio] || {}).longshot_audio || [])[0] || null };
+}
+/** 0.28.6: each exported clip is finished (sound added, named, into its folder) as soon as its
+ *  picture and sound are saved, so the folder fills up during the run and a stopped run keeps
+ *  the clips it finished. */
+function exportClipLanded(b, d) {
+  if (!d || !d.node || !d.output) return;
+  (b.exOut = b.exOut || {})[d.node] = d.output;
   const ex = b.built.nodes.export || {};
-  const items = (b.extra.items || []).map((it, i) => {
+  b.muxed = b.muxed || new Set();
+  (b.extra.items || []).forEach((it, i) => {
     const nd = ex[String(i + 1)] || {};
-    const ui = outputs[nd.video] || {};
-    return { name: it.name, key: it.key, sig: it.sig || null, asig: it.asig || "", video: (ui.chunk_video || [])[0] || null, master: (ui.chunk_master || [])[0] || null,
-      audio: ((outputs[nd.audio] || {}).longshot_audio || [])[0] || null };
+    if (b.muxed.has(i) || !b.exOut[nd.video] || (nd.audio && !b.exOut[nd.audio])) return;
+    const item = exportMuxItem(b, i, b.exOut);
+    if (!item.video) return;
+    b.muxed.add(i);
+    b.muxChain = (b.muxChain || Promise.resolve()).then(() => api(`/longshot/approved/${encodeURIComponent(b.slug)}`, { method: "POST",
+      body: { mode: "mux", items: [item], sig: b.extra.sig || null, variant: b.extra.variant || "", cleanup: false } })
+      .then((r) => { (b.muxFiles = b.muxFiles || []).push(...(r.files || [])); b.muxSub = r.subfolder; })
+      .catch((e) => { b.muxed.delete(i); console.warn("export clip", e); }));
   });
+}
+/** 0.28.8: RelayVSR exports: every N clips, ComfyUI drops its cached outputs and frees RAM
+ *  (models stay loaded; the RelayVSR model is read again for the next clip). */
+async function relayFreeRam(n) {
+  const every = Math.max(0, Math.round(Number(P().settings.relay_free_every ?? 4)));
+  S.relayClips = (S.relayClips || 0) + n;
+  if (!every || S.relayClips < every) return;
+  S.relayClips = 0;
+  try {
+    await fetch("/free", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ unload_models: false, free_memory: true }) });
+    await new Promise((r) => setTimeout(r, 2500));      // ComfyUI frees it between runs
+  } catch (e) { /* the export goes on */ }
+}
+async function exportDone(b, outputs) {
+  if (b.muxChain) await b.muxChain;              // 0.28.6: clips finished during the run
+  const done = b.muxed || new Set();
+  const items = (b.extra.items || []).map((it, i) => exportMuxItem(b, i, outputs)).filter((x, i) => !done.has(i));
   if (items.some((x) => !x.video)) { S.error = "The export saved no file. Update H3 Long Shot to 1.6.6 or later."; return; }
   try {
-    const r = await api(`/longshot/approved/${encodeURIComponent(P().slug)}`, { method: "POST", body: { mode: "mux", items, sig: b.extra.sig || null } });
+    const r0 = await api(`/longshot/approved/${encodeURIComponent(P().slug)}`, { method: "POST", body: { mode: "mux", items, sig: b.extra.sig || null, variant: b.extra.variant || "" } });
+    const r = Object.assign({}, r0, { files: [...(b.muxFiles || []), ...(r0.files || [])], subfolder: r0.subfolder || b.muxSub });
     exportedToast(r, b.extra.skipped, b.extra.kept);
     stemsForExport();
   } catch (e) { S.error = "Finishing the export failed: " + e.message; }
+  if (b.extra.variant === "VSR") await relayFreeRam((b.extra.items || []).length);
 }
 
 /** Takes in Take history without a clip (made before 0.6.5). */
@@ -5935,7 +6005,8 @@ function voiceCard(v) {
         <div class="card-top"><span class="pic">${esc(v.bypassed ? "bypassed" : a || "—")}</span>
           <button class="label-view" data-action="edit-voice" title="Edit this audio reference">${esc(v.label) || '<i class="muted">no label</i>'}</button></div>
         <div class="muted small">${over ? '<span class="warn">Long Shot takes 3 reference audios: bypass one.</span>' : what}</div>
-        ${v.desc ? `<button class="desc-view" data-action="edit-voice" title="Edit this audio reference">${esc(v.desc)}</button>` : ""}
+        ${role !== "voice" && v.desc ? `<button class="desc-view" data-action="edit-voice" title="Edit this audio reference">${esc(v.desc)}</button>` : ""}
+        ${role === "voice" && v.voice_desc ? `<button class="desc-view" data-action="edit-voice" title="Added to the linked picture's description while this voice is on">${esc(v.voice_desc)}</button>` : ""}
         ${missing ? `<div class="missing">Missing: ${esc(v.original_name || v.file)}</div>`
           : src ? `<audio class="voice-play" controls preload="none" src="${esc(src)}"></audio>` : ""}
         <div class="muted small voice-file" title="${esc((v.subfolder ? v.subfolder + "/" : "") + v.file)}">${esc(v.original_name || v.file)}${v.start || v.length ? ` · from ${Number(v.start || 0).toFixed(2)} s${v.length ? ` for ${Number(v.length).toFixed(2)} s` : ""}` : ""}</div>
@@ -6367,7 +6438,11 @@ function shotRowHTML(s) {
   const live = !s.bypassed && s.kind !== "clip" && (s.id === rid || inRender(s) || !!jobFor(s.id));
   const canAlone = (state === "queued" || live) && s.kind !== "clip" && !s.bypassed;
   const aloneOff = S.conn !== "ok" || missingRefs().length > 0;
-  const play = !canAlone ? "" : live
+  // 0.28.4: a Shot under review (rendered, not approved): its dot rerolls it
+  const rrDot = !canAlone && state === "review" && s.kind !== "clip" && !s.bypassed;
+  const play = rrDot ? `<button class="sdot sdot-play sdot-reroll" data-action="reroll-shot"${aloneOff ? " disabled" : ""}
+      title="Reroll ${title}: a new take with a new seed (${chipName(s)})" aria-label="Reroll ${title}">⟳</button>`
+    : !canAlone ? "" : live
     ? `<button class="sdot sdot-play again" data-action="render-alone"${aloneOff ? " disabled" : ""}
       title="${s.id === rid ? "Rendering now" : "In the queue"}. Click to queue another take of ${title} after it (next seed)." aria-label="Queue another take of ${title}">▶</button>`
     : `<button class="sdot sdot-play" data-action="render-alone"${aloneOff ? " disabled" : ""}
@@ -6907,22 +6982,18 @@ function renderShotsNow() {
     const ro = "";      // 0.17.23: length and seed can change mid-render (the render keeps what it started with)
     const body = open ? `<div class="shot-body">
         <textarea class="field fit" data-shot-field="text" rows="3" aria-label="${title} text">${esc(s.text)}</textarea>
-        <div class="shot-opts">
+        <div class="shot-opts">      <!-- 0.27.17: Seconds, the join's own options, Seed (right) -->
           <label class="lbl-row">Seconds <input type="number" step="0.1" min="0.1" data-shot-field="seconds" value="${esc(s.seconds)}" style="width:72px"${ro}></label>
           ${s.join === "context" && s.kind !== "clip" ? `<label class="lbl-row" title="The frame this Shot gets from the Shot before it (0.23.2)">Context frame <select data-shot-ctx aria-label="Context frame">${[["", `Project (${({ soft: "small + soft", full: "full", off: "off" })[P().settings.context_frame || "soft"]})`], ["soft", "Small + soft"], ["full", "Full"], ["off", "Off"]].map(([v, t]) => `<option value="${v}"${(s.context_frame || "") === v ? " selected" : ""}>${t}</option>`).join("")}</select></label>` : ""}
           ${s.join === "context" && s.kind !== "clip" ? ctxPickHTML(s) : ""}
           ${s.kind !== "clip" && !isCut(s) && chipNear(s).prev && lsAtLeast(1, 10, 0) ? `<label class="lbl-row" title="Before this Shot is pinned to the end of the Shot before it, those frames get their colour and brightness pulled back toward the start of the chain (Colour lock ${esc(P().settings.handoff_colour)} in Advanced). Stops colour and brightness burn on long chains of static Shots; costs nothing. Unticked, the Shot is pinned as it always was."><input type="checkbox" data-shot-lock${s.colour_lock ? " checked" : ""}> Colour lock</label>
           <label class="lbl-row" title="Before this Shot is pinned to the end of the Shot before it, those frames are redrawn at the Tail refresh denoise (Advanced: ${esc(P().settings.handoff_refresh)}, ${esc(P().settings.handoff_steps)} steps), which cleans grain built up on long chains of static Shots. Adds a short pass (about a minute at 1.2 MP)."><input type="checkbox" data-shot-refresh${s.tail_refresh ? " checked" : ""}> Refresh handoff</label>` : ""}
           ${s.kind !== "clip" && !isCut(s) && chipNear(s).prev && lsAtLeast(1, 10, 0) && s.colour_lock ? `<label class="lbl-row" title="Tick it where the light is meant to change (lights go off, going outside): this Shot isn't colour-locked, and the Shots after it lock to it instead."><input type="checkbox" data-shot-reset${s.colour_reset ? " checked" : ""}> Let colour change</label>` : ""}
-          <label class="lbl-row">Seed <input class="mono" data-shot-field="shot_seed" value="${s.shot_seed < 0 ? "" : esc(s.shot_seed)}" placeholder="auto${isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used) ? ` · ${s.seed_used}` : ""}" style="width:150px"${ro}></label>${seedStepHTML("shot-seed-step", !!ro, isAuto(s) ? "On auto: gives this Shot its own seed, one from its last take's" : "")}${
-            isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used) && !inRender(s) ? `<button class="ghost sm" data-action="shot-seed-keep" title="Fix this Shot's seed at ${esc(s.seed_used)}, the seed of its take, so a re-render after you change the prompt or references uses the same seed. The take stays as it is.">📌 Keep seed ${esc(s.seed_used)}</button>` : ""}
+          <span class="push"></span>
+          <span class="opt-group"><label class="lbl-row">Seed <input class="mono" data-shot-field="shot_seed" value="${s.shot_seed < 0 ? "" : esc(s.shot_seed)}" placeholder="auto${isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used) ? ` · ${s.seed_used}` : ""}" style="width:132px"${ro}></label>${seedStepHTML("shot-seed-step", !!ro, isAuto(s) ? "On auto: gives this Shot its own seed, one from its last take's" : "")}</span>
         </div>
         ${notesHTML(s)}
         <div class="shot-opts shot-more">
-          <button class="ghost sm" data-action="group-one" title="${s.group ? "Start a new group with this Shot (Shift-click Shot headers to choose several)" : "Put this Shot in a group of its own, or Shift-click Shot headers to choose several first"}">▣ Group</button>
-          <button class="ghost sm" data-action="wrap" data-before="&lt;d&gt;[English] " data-after="&lt;/d&gt;">Wrap &lt;d&gt; dialogue</button>
-          <button class="ghost sm" data-action="wrap" data-before="&quot;" data-after="&quot;">Wrap "on-screen text"</button>
-          ${canReroll ? '<button class="ghost sm" data-action="reroll-shot">⟳ Reroll this Shot</button>' : ""}
           <span class="push"></span>
           ${takes}
           ${s.take && typeof P().take_texts[takeStem(s.take)] === "string" && P().take_texts[takeStem(s.take)] !== s.text
@@ -6933,8 +7004,11 @@ function renderShotsNow() {
               : "This take was made before 0.8.13, so what it was made with wasn't recorded."}">Restore all</button>` : ""}
           ${!s.bypassed && s.status !== "queued" ? `<button class="ghost sm" data-action="clear-render"${inRender(s) ? " disabled" : ""}
             title="Back to not rendered: keeps the prompt, length and seed. The take stays in Take history.">Clear render</button>` : ""}
+          ${isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used) && !inRender(s) ? `<button class="ghost sm" data-action="shot-seed-keep" title="Fix this Shot's seed at ${esc(s.seed_used)}, the seed of its take, so a re-render after you change the prompt or references uses the same seed. The take stays as it is.">📌 Keep seed ${esc(s.seed_used)}</button>` : ""}
         </div>
         <div class="shot-opts shot-adds">
+          <button class="ghost sm" data-action="wrap" data-before="&lt;d&gt;[English] " data-after="&lt;/d&gt;">Wrap &lt;d&gt; dialogue</button>
+          <button class="ghost sm" data-action="wrap" data-before="&quot;" data-after="&quot;">Wrap "on-screen text"</button>
           <span class="push"></span>
           <button class="ghost sm" data-action="replace-clip" title="Put a video clip in this Shot's place (the Shot is kept, bypassed)">Replace with clip</button>
           <button class="ghost sm" data-action="insert-clip-after" title="Insert a video clip after this Shot">⊕ Clip after</button>
@@ -7067,7 +7141,16 @@ function renderViewer() {
   $("tl-export-btn").textContent = `Export ${nApproved} approved clip${nApproved === 1 ? "" : "s"}`;
   $("tl-export-btn").disabled = S.conn !== "ok";
   const vsrOk = !S.opts || !S.opts.nodes || S.opts.nodes.RTXVideoSuperResolution !== false;
-  $("tl-export-up").checked = vsrOk && !!P().settings.export_upscale;
+  $("tl-export-up").checked = vsrOk && !!P().settings.export_upscale && !P().settings.export_relay;
+  { const v = P().settings.rtx_vsr || {}, sc = $("tl-export-scale"), q = $("tl-export-quality");   // 0.28.3
+    if (sc) { sc.value = String(Number(v.scale) || 2); sc.closest("label").hidden = !$("tl-export-up").checked; }
+    if (q) { q.value = v.quality || "ULTRA"; q.closest("label").hidden = !$("tl-export-up").checked; } }
+  { const rOk = !S.opts || !S.opts.nodes || S.opts.nodes.RelayVSRConditioning !== false;     // 0.28.0
+    $("tl-export-relay").checked = rOk && !!P().settings.export_relay; $("tl-export-relay").disabled = !rOk;
+    const fr = $("tl-export-relay-free");        // 0.28.8
+    if (fr) { if (document.activeElement !== fr) fr.value = String(P().settings.relay_free_every ?? 4); fr.closest("label").hidden = !P().settings.export_relay; }
+    const dt = $("tl-export-relay-detail");      // 0.28.2
+    if (dt) { if (document.activeElement !== dt) dt.value = String(relayDetail()); dt.closest("label").hidden = !P().settings.export_relay; } }
   $("tl-export-up").disabled = !vsrOk;
   // 0.17.28: Stems (dialogue + SFX) with the export and the final
   const stOk = stemsReady();
@@ -7680,8 +7763,7 @@ function renderSettings() {
   const size = sizeOf(s);
   const t = s.turbo;
   $("settings-summary").textContent = S.settingsOpen ? "" : [
-    `${s.steps} steps`, size ? `${size[0]}×${size[1]}` : `${s.megapixels} MP ${s.aspect}`,
-    vsr.on && vsrOk ? `RTX ${vsr.scale}×` : ""].filter(Boolean).join(" · ");
+    `${s.steps} steps`, size ? `${size[0]}×${size[1]}` : `${s.megapixels} MP ${s.aspect}`].filter(Boolean).join(" · ");
   $("settings-chev").textContent = S.settingsOpen ? "Hide ▴" : "Show ▾";
   $("settings-toggle").setAttribute("aria-expanded", String(!!S.settingsOpen));
   $("settings").hidden = !S.settingsOpen;
@@ -7719,23 +7801,7 @@ function renderSettings() {
       <label class="lbl">Resolution <select data-set="megapixels" data-num>${mp}</select></label>
       <label class="lbl">Aspect <select data-set="aspect">${asp}</select></label>
     </div>${warn}
-    <div class="size-out">${size ? `→ ${size[0]} × ${size[1]} output` : "→ size unknown"}${size && vsr.on && vsrOk
-      ? ` · <span class="vsr-size">${even(size[0] * vsr.scale)} × ${even(size[1] * vsr.scale)} after RTX Super Resolution</span>` : ""}</div>
-    <div class="vsr-row vsr-zone${vsr.on && vsrOk ? "" : " off"}${vsrFold ? " folded" : ""}">
-      ${switchHTML(vsr.on && vsrOk, `data-action="vsr-on" aria-label="RTX Super Resolution"${vsrOk ? "" : " disabled"}`, true)}
-      <button class="fold vsr-fold" data-action="fold" data-fold="vsr" aria-expanded="${!vsrFold}"
-        title="${vsrFold ? "Show the upscale settings" : "Show only the switch"}"><span class="fold-ch" aria-hidden="true">▾</span>RTX Super Resolution${vsrFold && vsr.on && vsrOk ? ` <span class="muted small">· ${vsr.scale}× ${esc(vsr.quality)}</span>` : ""}</button>
-      <div class="vsr-text"><div>Upscale previews</div>
-        <div class="muted small">${!vsrOk ? installBtn("rtx", "(needs an RTX GPU)")
-          : vsr.on ? "Every render is upscaled (slower as the chain grows). Never re-renders Shots."
-            : "Off: previews stay fast. Upscale final video (when every Shot is approved) always upscales with this scale and quality."}</div>
-        ${vsrOk && size ? `<div class="muted small">${vsrRamNote(size, vsr.scale)}</div>` : ""}</div>
-      <label class="lbl-row">Scale <select data-vsr="scale"${vsrOk ? "" : " disabled"}>${[1.5, 2].map((x) =>
-        `<option value="${x}"${Number(vsr.scale) === x ? " selected" : ""}>${x}×</option>`).join("")}</select></label>
-      <label class="lbl-row">Quality <select data-vsr="quality"${vsrOk ? "" : " disabled"}>${["LOW", "MEDIUM", "HIGH", "ULTRA"].map((q) =>
-        `<option${vsr.quality === q ? " selected" : ""}>${q}</option>`).join("")}</select></label>
-      <label class="lbl-row" title="The upscale is saved in pieces of this many seconds, counted in the status line, then joined. RAM use doesn't depend on it.">Chunks <input type="number" min="2" max="600" step="1" data-vsr="chunk_s" value="${esc(vsrChunkS())}"${vsrOk ? "" : " disabled"} style="width:64px"> s</label>
-    </div>
+    <div class="size-out">${size ? `→ ${size[0]} × ${size[1]} output` : "→ size unknown"}</div>
     <label class="check-row prores-row${vsrOk ? "" : " off"}"><input type="checkbox" data-outfile="prores_master"${s.prores_master ? " checked" : ""}${vsrOk ? "" : " disabled"}>
       <span>Final video: also save a ProRes master <span class="muted small">· 10-bit ProRes 422 HQ .mov with sound, next to the upscaled MP4 (large files)</span></span></label>
     <div class="live-q-row"><span>Live preview quality <span class="muted small">· ${o.preview_decoder
@@ -9684,7 +9750,19 @@ document.addEventListener("change", async (e) => {
     if (!v.bypassed) applyRefChange((await askRefChange()) || "keep", "Voice references");
     return commit();
   }
-  if (el.id === "tl-export-up") { p.settings.export_upscale = el.checked; return commit(); }
+  if (el.id === "tl-export-up") { p.settings.export_upscale = el.checked; if (el.checked) p.settings.export_relay = false; return commit(); }
+  if (el.id === "tl-export-relay-free") {       // 0.28.8: free RAM every N clips (0: never)
+    p.settings.relay_free_every = Math.max(0, Math.min(100, Math.round(Number(el.value)) || 0));
+    el.value = String(p.settings.relay_free_every);
+    return commit();
+  }
+  if (el.id === "tl-export-relay-detail") {     // 0.28.2
+    const v = Number(el.value);
+    p.settings.relay_detail = Number.isFinite(v) ? Math.max(0, Math.min(2, v)) : 0.4;
+    el.value = String(p.settings.relay_detail);
+    return commit();
+  }
+  if (el.id === "tl-export-relay") { p.settings.export_relay = el.checked; if (el.checked) p.settings.export_upscale = false; return commit(); }   // 0.28.0
   if (el.id === "tl-export-stems" || el.dataset.stems !== undefined) { p.settings.stems = el.checked; return commit(); }   // 0.17.28
   if (el.id === "live-preview") { setLive(el.checked); return; }
   if (el.id === "line-up") {                                       // 0.17.44
@@ -11114,6 +11192,8 @@ function openVoiceEditor(v) {
         <button class="ghost sm" data-action="ed-set-end" title="End where the player is">Set end</button>
       </div>
       <div class="muted small">${esc(v.original_name || v.file || "No file")} <button class="ghost sm" data-action="voice-replace" data-voice="${esc(v.id)}">Replace file…</button></div>
+      <label class="lbl ed-voice">Voice description <span class="muted small">· added to each linked picture's description while this voice is on (e.g. (s4) refined upper-class British voice)</span>
+        <textarea class="field" data-ed="voice_desc" rows="2" placeholder="(s1) warm, low voice with a soft Irish lilt">${esc(v.voice_desc)}</textarea></label>
       <div class="ed-voice">
         <div class="lbl">Voice timbre of</div>
         ${pics.length ? `<div class="ed-links">${pics.map((x) => `<label class="lbl-row"><input type="checkbox" data-ed-link="${esc(x.key)}"${x.on ? " checked" : ""}> ${esc(x.name)}</label>`).join("")}</div>`
@@ -11235,7 +11315,7 @@ function editorAltChanges() {
   if (editing.kind === "voice") {
     const v = voiceById(editing.id);
     if (!v) return [];
-    for (const k of ["label", "role", "role_text", "desc", "use"]) if ((val[k] ?? "") !== (v[k] ?? "")) ch.push([v, k, val[k]]);
+    for (const k of ["label", "role", "role_text", "desc", "use", "voice_desc"]) if ((val[k] ?? "") !== (v[k] ?? "")) ch.push([v, k, val[k]]);
     for (const k of ["start", "length"]) {
       const n = Math.max(0, Number(val[k]) || 0);
       if (n !== Number(v[k] || 0)) ch.push([v, k, n]);
@@ -12386,7 +12466,8 @@ function stemsForExport() {
   if (!P() || !P().settings.stems) return;
   // 0.17.30: into Approved_Audio/Dialogue and Approved_Audio/SFX, named like their clips
   const root = `longshot/${P().slug}`;
-  queueStems(approvedForExport().map((x) => ({ source: `${root}/Approved_Clips/${x.name}.mp4`,
+  const vr = expVariant(), dir = vr ? `Approved_Clips/${vr}` : "Approved_Clips", suf = vr ? `-${vr}` : "";   // 0.28.1
+  queueStems(approvedForExport().map((x) => ({ source: `${root}/${dir}/${x.name}${suf}.mp4`,
     dx: `${root}/Approved_Audio/Dialogue/${x.name}_dialogue`, fx: `${root}/Approved_Audio/SFX/${x.name}_sfx` })), "approved clips");
 }
 

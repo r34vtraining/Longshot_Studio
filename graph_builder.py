@@ -329,6 +329,18 @@ def sound_word(v: dict) -> str:
     return AUDIO_ROLE_WORD.get(r) or (str(v.get("role_text") or "").strip() or "sound")
 
 
+def with_voice_desc(project: dict, desc, voice_key) -> str:
+    """0.28.5: a picture's description, plus its voice card's own voice description (e.g.
+    '(s4) refined upper-class British voice') while that voice is on, so it follows the switch."""
+    desc = str(desc or "").strip()
+    v = next((x for x in active_voices(project) if str(x.get("id")) == str(voice_key or "")
+              and audio_role(x) == "voice"), None)
+    extra = str((v or {}).get("voice_desc") or "").strip()
+    if not extra:
+        return desc
+    return f"{desc.rstrip('.;, ')}, {extra}" if desc else extra
+
+
 def voice_keys(project: dict) -> dict:
     """{voice key: '<Audio N>'}: the voices a picture or RefMod can take (0.12.0): voice
     references (by id) and audio RefMods ("refmod:<id>")."""
@@ -787,6 +799,28 @@ def build_stems(project: dict, stems: dict, env: Env | None = None) -> Build:
                  filename_prefix=root, video_format="", warnings=[])
 
 
+# 0.28.0: RelayVSR (ComfyUI 0.45.0+, core): a one-step Wan 2.2 5B pass on every 15th frame and the
+# Flash decoder for the rest, as Comfy's "RelayVSR video x2 upscale" template wires it.
+RELAY_MODEL = "relayvsr_x2_lightx2v_int8_convrot.safetensors"
+RELAY_VAE = "relayvsr_flash_vae_x2_fp32.safetensors"
+RELAY_NODES = ["UNETLoader", "VAELoader", "RelayVSRConditioning", "KSampler", "VSRDecode", "MiniMaxH3FrameRange"]
+
+
+def _relay_up(g, images, s, tag):
+    """images upscaled by RelayVSR (2x or 4x, from the files). The loaders are shared."""
+    model = str(s.get("relay_model") or RELAY_MODEL)
+    vae = str(s.get("relay_vae") or RELAY_VAE)
+    unet = ["relay_unet", 0] if "relay_unet" in g.nodes else \
+        g.add("relay_unet", "UNETLoader", "RelayVSR model", unet_name=model, weight_dtype="default")
+    rvae = ["relay_vae", 0] if "relay_vae" in g.nodes else g.add("relay_vae", "VAELoader", "RelayVSR Flash VAE", vae_name=vae)
+    cond = g.add(f"relay_cond{tag}", "RelayVSRConditioning", f"RelayVSR {tag}", model=unet, images=images)
+    smp = g.add(f"relay_ks{tag}", "KSampler", f"RelayVSR keyframes {tag}", model=unet, positive=_out(cond, 0),
+                negative=_out(cond, 0), latent_image=_out(cond, 1), seed=42, steps=1, cfg=1.0,
+                sampler_name="euler", scheduler="simple", denoise=1.0)
+    return g.add(f"relay_dec{tag}", "VSRDecode", f"RelayVSR decode {tag}", vae=rvae, samples=smp, images=images,
+                 detail=_num(s.get("relay_detail", 0.4), "RelayVSR detail", 0, 4))   # 0.28.2: 0.4 hides the keyframe beat
+
+
 def build_clip_export(project: dict, items: list, env: Env | None = None) -> Build:
     """Export approved clips, upscaled: [{take, n}] -> one branch each. The take
     is decoded on its own, whole (MiniMax H3 Take -> VAE Decode), upscaled a
@@ -798,10 +832,12 @@ def build_clip_export(project: dict, items: list, env: Env | None = None) -> Bui
     # 0.10.0: with the refine pass, the takes are refined first (Long Shot, in film order;
     # kept and reused), and the export is made from the refined takes, upscaled or not
     rc = refine_settings(project, env)
-    upscale = bool(s.get("export_upscale")) or rc is None
+    relay = bool(s.get("export_relay"))           # 0.28.0: RelayVSR instead of RTX
+    upscale = (bool(s.get("export_upscale")) or rc is None) and not relay
     faced = any((it or {}).get("face_clip") for it in items or [])
     need = ["MiniMaxH3Take", "VAELoader", "VAEDecode", "VAEDecodeAudio", "MiniMaxH3UpscaleChunk",
             "MiniMaxH3SaveAudio"] + (["RTXVideoSuperResolution"] if upscale else []) + \
+        (RELAY_NODES if relay else []) + \
         (["MiniMaxH3LoadVideo"] if faced else [])
     missing = [c for c in need if not env.has(c)]
     if missing:
@@ -866,6 +902,12 @@ def build_clip_export(project: dict, items: list, env: Env | None = None) -> Bui
             if start or length < 10_000_000:
                 audio = g.add(f"audtrim{n}", "TrimAudioDuration", f"Sound of clip {n}, trimmed", audio=audio,
                               start_index=start / FPS, duration=length / FPS if length < 10_000_000 else 1e7)
+        if relay:
+            # 0.28.0: the Shot's own frames, RelayVSR, then only encoded (scale 1)
+            images = g.add(f"range{n}", "MiniMaxH3FrameRange", f"Frames of clip {n}", images=images,
+                           start=start, length=min(length, 10_000_000))
+            images = _relay_up(g, images, s, str(n))
+            start, length = 0, 10_000_000
         g.add(f"up{n}", "MiniMaxH3UpscaleChunk", f"Upscale clip {n}", images=images, start=start,
               length=length, scale=scale, quality=quality, filename_prefix=f"{work}/c{n:03d}",
               codec="h264_nvenc" if fmt == NVENC else "libx264",
@@ -1602,7 +1644,8 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             f"resize{k + 1}", "ImageScaleToMaxDimension", f"Resize {pic}", image=img,
             upscale_method="lanczos", largest_size=resize_px)
         voice = voice_of.get(str(c.get("voice") or ""))
-        inputs = dict(label=c.get("label") or pic, description=c.get("desc", ""),
+        inputs = dict(label=c.get("label") or pic,
+                      description=with_voice_desc(project, c.get("desc", ""), c.get("voice")) if voice else c.get("desc", ""),
                       role=c.get("role") or "appearance", reference=pic,
                       role_2="voice timbre" if voice else "-", reference_2=voice or "")
         if subjects is not None:
@@ -1664,7 +1707,8 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         for m, label in zip(mods, refmod_labels(project)):
             role = refmod_role(m)
             voice = voice_of.get(str(m.get("voice") or "")) if m.get("kind") != "audio" else None
-            inputs = dict(label=m.get("label") or label, description=m.get("desc", ""), role=role,
+            inputs = dict(label=m.get("label") or label,
+                          description=with_voice_desc(project, m.get("desc", ""), m.get("voice")) if voice else m.get("desc", ""), role=role,
                           reference=label, role_2="voice timbre" if voice else "-", reference_2=voice or "")
             if subjects is not None:
                 inputs["subjects"] = subjects
