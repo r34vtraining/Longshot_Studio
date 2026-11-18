@@ -5,7 +5,7 @@ ComfyUI at `/longshot`. Build a film from short Shots, review and approve each o
 Studio stitches them into one continuous take or a cut sequence. Approved work is never
 thrown away.
 
-<img width="1678" height="1347" alt="image" src="https://github.com/user-attachments/assets/bee0c423-921e-45ad-bfc8-3e415c9d7655" />
+<img width="1660" height="1336" alt="image" src="https://github.com/user-attachments/assets/d59db782-36b3-4adc-b23f-f0abbb4125d1" />
 
 **Video UI**
 
