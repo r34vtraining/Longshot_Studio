@@ -47,7 +47,7 @@ thrown away.
 - An **Outputs** drawer on both sides: browse the project's output folder and drag any
   picture into the references.
 
-## What's new since 0.26.1
+## What's new since 0.28.8
 
 - **Handoff care for long Continuous chains** (needs H3 Long Shot 1.10.1). Two ticks on each
   Continuous Shot, both off by default, for static Shots where colour, brightness and grain build
@@ -68,6 +68,7 @@ thrown away.
 - Smaller things: a big **▶ Render** above Image settings, clickable Picture cards, a tidier Shot
   card, a shorter Advanced panel.
 - Fixed: exporting a refined face clip failed (needs H3 Long Shot 1.9.1 or later).
+- **Added RelayVSR Upscale next to export clip button
 
 ## Requirements
 
