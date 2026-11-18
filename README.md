@@ -6,10 +6,10 @@ Studio stitches them into one continuous take or a cut sequence. Approved work i
 thrown away.
 
 <img width="1678" height="1347" alt="image" src="https://github.com/user-attachments/assets/bee0c423-921e-45ad-bfc8-3e415c9d7655" />
-**Video_UI**
+**Generate**
 
 <img width="3402" height="1332" alt="image" src="https://github.com/user-attachments/assets/466e77fe-7f4f-4543-afa0-e803ddfb6338" />
-**Image_UI**
+**Generate**
 
 ## Features
 
