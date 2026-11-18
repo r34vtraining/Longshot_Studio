@@ -7,11 +7,11 @@ thrown away.
 
 <img width="1678" height="1347" alt="image" src="https://github.com/user-attachments/assets/bee0c423-921e-45ad-bfc8-3e415c9d7655" />
 
-**Generate**
+**Video UI**
 
 <img width="3402" height="1332" alt="image" src="https://github.com/user-attachments/assets/466e77fe-7f4f-4543-afa0-e803ddfb6338" />
 
-**Generate**
+**Image UI**
 
 ## Features
 
