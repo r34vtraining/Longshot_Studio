@@ -68,7 +68,7 @@ thrown away.
 - Smaller things: a big **▶ Render** above Image settings, clickable Picture cards, a tidier Shot
   card, a shorter Advanced panel.
 - Fixed: exporting a refined face clip failed (needs H3 Long Shot 1.9.1 or later).
-- **Added RelayVSR Upscale next to export clip button
+- **Added RelayVSR Upscale next to export clip button**
 
 ## Requirements
 
